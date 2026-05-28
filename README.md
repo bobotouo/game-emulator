@@ -1,8 +1,6 @@
 # Game Emulator
 
-基于 Flutter 与 [mGBA](https://mgba.io/) libretro 核心的 GBA 模拟器，支持本地游戏库、自动存档、变速游玩与局域网联机骨架。
-
-**仓库地址：** https://github.com/bobotouo/game-emulator
+基于 Flutter 与 [mGBA](https://mgba.io/) libretro 核心，支持 GBA,FC/NES, 街机游戏的模拟器,支持本地游戏库、自动存档、变速游玩与局域网联机。
 
 ---
 
@@ -40,9 +38,7 @@
 | 模块 | 说明 |
 |------|------|
 | **局域网联机** | mDNS 发现、房间 UI 已有，核心同步逻辑待完善 |
-| **性能优化** | 持续调优渲染与音频缓冲，目标稳定 60 FPS、降低发热 |
-| **iOS 适配** | 核心编译与 UI 联调，随下一版本发布 |
-
+| **性能优化** | 持续调优渲染与音频缓冲，降低发热 |
 ### 尚未实现
 
 - 蓝牙 / MFi 外接手柄
@@ -51,6 +47,7 @@
 - 联机输入与状态同步
 - GB / GBC 专属 UI 与调色板选项
 - 画面滤镜（扫描线、CRT、像素平滑等 Shader 扩展）
+- FC/NES 街机游戏的支持
 
 ---
 
@@ -60,19 +57,9 @@
 2. **外设支持** — 蓝牙手柄、键盘映射
 3. **增强体验** — 金手指、作弊码、ROM 信息展示
 4. **画面增强** — Shader 滤镜链（HQ2X / Scanlines / Color correction）
-5. **跨平台发布** — iOS 优先，随后 macOS / Windows 桌面端与核心自动构建 CI
-6. **云存档**（可选）— 与本地存档并存
-
----
-
-## 技术栈
-
-- **UI 框架：** Flutter 3.x（Impeller 渲染引擎）
-- **状态管理：** Riverpod
-- **模拟核心：** [mGBA](https://github.com/mgba-emu/mgba) libretro（C / FFI）
-- **音频：** [flutter_soloud](https://pub.dev/packages/flutter_soloud)
-- **网络：** multicast_dns、network_info_plus
-- **存储：** shared_preferences、path_provider
+5. **跨平台发布** — 跨平台自动构建 CI
+6. **云存档**（可选）— 自定义配置云存档存放位置
+7. **其他游戏支持** 支持红白机,街机等游戏
 
 ---
 
@@ -88,7 +75,7 @@ lib/
 │   ├── settings/        # 应用设置
 │   └── storage/         # 存档路径
 ├── features/
-│   └── game_library/    # 游戏库（含 MD5 去重）
+│   └── game_library/    # 游戏库
 ├── presentation/
 │   ├── screens/         # 各页面
 │   ├── widgets/         # 虚拟手柄、游戏卡片
