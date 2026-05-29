@@ -117,6 +117,7 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      extendBodyBehindAppBar: true,
       appBar: AppBar(
         title: const Text('联机大厅'),
         actions: [
@@ -128,6 +129,7 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
       ),
       body: Column(
         children: [
+          SizedBox(height: MediaQuery.paddingOf(context).top + kToolbarHeight),
           // Online Status
           Container(
             padding: const EdgeInsets.all(16),

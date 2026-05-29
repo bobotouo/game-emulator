@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import '../theme/app_theme.dart';
+import '../../core/libretro/emulator_core_resolver.dart';
 import '../../features/game_library/game_library_service.dart';
 
 class GameCard extends StatelessWidget {
@@ -73,7 +74,7 @@ class GameCard extends StatelessWidget {
                           border: Border.all(color: AppColors.outlineVariant),
                         ),
                         child: Text(
-                          'GBA',
+                          _systemLabel(game.extension),
                           style: Theme.of(context).textTheme.labelLarge
                               ?.copyWith(
                                 fontSize: 10,
@@ -170,6 +171,14 @@ class GameCard extends StatelessWidget {
     );
   }
 
+  String _systemLabel(String extension) {
+    try {
+      return EmulatorCoreResolver.resolve('game$extension').system.shortName;
+    } catch (_) {
+      return extension.replaceAll('.', '').toUpperCase();
+    }
+  }
+
   IconData _getExtensionIcon(String extension) {
     switch (extension.toLowerCase()) {
       case '.gba':
@@ -178,6 +187,9 @@ class GameCard extends StatelessWidget {
         return Icons.gamepad_outlined;
       case '.gb':
         return Icons.gamepad_outlined;
+      case '.nes':
+      case '.fds':
+        return Icons.videogame_asset;
       default:
         return Icons.insert_drive_file;
     }

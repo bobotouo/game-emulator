@@ -1,6 +1,8 @@
 # Game Emulator
 
-基于 Flutter 与 [mGBA](https://mgba.io/) libretro 核心，支持 GBA,FC/NES, 街机游戏的模拟器,支持本地游戏库、自动存档、变速游玩与局域网联机。
+基于 Flutter 与 libretro 核心的多系统模拟器，当前支持 **GBA / GB / GBC**（[mGBA](https://mgba.io/)）与 **FC / NES**（[FCEUmm](https://github.com/libretro/libretro-fceumm)），具备本地游戏库、自动存档、变速游玩与局域网联机骨架。
+
+**仓库地址：** https://github.com/bobotouo/game-emulator
 
 ---
 
@@ -23,7 +25,8 @@
 
 | 模块 | 说明 |
 |------|------|
-| **模拟器核心** | 通过 Dart FFI 加载 mGBA libretro，支持 `.gba` / `.gb` / `.gbc` ROM |
+| **模拟器核心** | 按 ROM 后缀自动选择核心：`.gba`/`.gb`/`.gbc` → mGBA；`.nes`/`.fds` 等 → FCEUmm |
+| **支持格式** | `.gba` `.gb` `.gbc` `.nes` `.fds` `.unf` `.unif` |
 | **画面渲染** | Impeller 片元着色器（`FragmentProgram`）+ 同步像素解码，GPU 直绘 |
 | **音频** | `flutter_soloud` 低延迟 PCM 流输出，支持倍速同步播放 |
 | **虚拟手柄** | 触控按键映射，支持触觉反馈与 libretro 震动回调 |
@@ -39,6 +42,8 @@
 |------|------|
 | **局域网联机** | mDNS 发现、房间 UI 已有，核心同步逻辑待完善 |
 | **性能优化** | 持续调优渲染与音频缓冲，降低发热 |
+| **NES 实机验证** | FCEUmm 核心集成完成，待 Android 真机测试 |
+
 ### 尚未实现
 
 - 蓝牙 / MFi 外接手柄
@@ -47,7 +52,7 @@
 - 联机输入与状态同步
 - GB / GBC 专属 UI 与调色板选项
 - 画面滤镜（扫描线、CRT、像素平滑等 Shader 扩展）
-- FC/NES 街机游戏的支持
+- 街机（Arcade）与其他 libretro 核心
 
 ---
 
@@ -59,7 +64,7 @@
 4. **画面增强** — Shader 滤镜链（HQ2X / Scanlines / Color correction）
 5. **跨平台发布** — 跨平台自动构建 CI
 6. **云存档**（可选）— 自定义配置云存档存放位置
-7. **其他游戏支持** 支持红白机,街机等游戏
+7. **更多平台** — 街机与其他 libretro 核心扩展
 
 ---
 
@@ -83,36 +88,61 @@ lib/
 shaders/
 └── gba_display.frag     # 画面片元着色器
 scripts/
-└── build_mgba_libretro.sh  # 编译 libretro 核心
+├── build_mgba_libretro.sh    # 编译 mGBA 核心
+├── build_fceumm_libretro.sh  # 编译 FCEUmm 核心
+└── build_all_cores.sh        # 一键编译全部核心
 ```
+
+### 编译 libretro 核心
+
+```bash
+chmod +x scripts/*.sh
+
+# 全部核心（推荐）
+./scripts/build_all_cores.sh android
+
+# 或单独编译
+./scripts/build_mgba_libretro.sh android
+./scripts/build_fceumm_libretro.sh android
+```
+
+产物输出至各平台原生目录（**不会**进入 Flutter assets）：
+
+| 平台 | 输出路径 |
+|------|----------|
+| Android | `android/app/src/main/jniLibs/arm64-v8a/`（仅 arm64） |
+| iOS | `ios/Runner/Frameworks/` |
+| macOS（本地调试） | `build/libretro/macos/` |
+
+| 核心 | Android 库名 | iOS 库名 |
+|------|----------------|----------|
+| mGBA | `libmgba_libretro.so` | `mgba_libretro_ios.dylib` |
+| FCEUmm | `libfceumm_libretro.so` | `fceumm_libretro_ios.dylib` |
+
+iOS 需在 Xcode 中将 `Frameworks` 下的 dylib 设为 **Embed & Sign**。
+
+---
+
+## 技术栈
+
+- **UI 框架：** Flutter 3.x（Impeller）
+- **状态管理：** Riverpod
+- **模拟核心：** [mGBA](https://github.com/mgba-emu/mgba)（GBA/GB/GBC）、[FCEUmm](https://github.com/libretro/libretro-fceumm)（NES/FC）
+- **音频：** [flutter_soloud](https://pub.dev/packages/flutter_soloud)
+- **网络：** multicast_dns、network_info_plus
 
 ---
 
 ## 快速开始
 
-### 环境要求
-
-- Flutter SDK ≥ 3.12
-- **Android（已验证）：** Android SDK + NDK（编译核心时需要）
-- **iOS（即将支持）：** Xcode + Apple 开发者签名
-- **macOS / Windows（计划中）：** 对应平台 SDK + cmake
-- cmake（运行 `build_mgba_libretro.sh` 编译核心时需要）
-
-### 运行应用
-
 ```bash
 flutter pub get
+chmod +x scripts/*.sh
+./scripts/build_all_cores.sh android   # 首次需编译核心
 flutter run
 ```
 
-### 编译 mGBA libretro 核心
-
-```bash
-chmod +x scripts/build_mgba_libretro.sh
-./scripts/build_mgba_libretro.sh
-```
-
-产物输出至 `assets/cores/`，Android 侧同步至 `android/app/src/main/jniLibs/`。
+环境要求：Flutter SDK ≥ 3.12、Android SDK + NDK（编译核心时）。
 
 ---
 
@@ -120,7 +150,8 @@ chmod +x scripts/build_mgba_libretro.sh
 
 本项目站在巨人的肩膀上，特别感谢：
 
-- **[mGBA](https://mgba.io/)** — 高质量 GBA / GB / GBC 模拟器核心，本项目通过 libretro 接口集成。详见 [mgba-emu/mgba](https://github.com/mgba-emu/mgba)（MPL 2.0）
+- **[mGBA](https://mgba.io/)** — GBA / GB / GBC 模拟核心（MPL 2.0）
+- **[FCEUmm](https://github.com/libretro/libretro-fceumm)** — FC / NES 模拟核心（GPL-2.0）
 - **[libretro](https://www.libretro.com/)** — 统一的模拟器 API 规范
 - **[Flutter](https://flutter.dev/)** — 跨平台 UI 与 Impeller 渲染引擎
 - 以及其他开源依赖的作者与社区贡献者
@@ -131,4 +162,4 @@ chmod +x scripts/build_mgba_libretro.sh
 
 本项目应用层代码采用 **MIT** 许可证。
 
-mGBA 核心遵循其自身的 **[MPL 2.0](https://github.com/mgba-emu/mgba/blob/master/LICENSE)** 许可证。分发包含 mGBA 核心的构建产物时，请遵守相应开源协议。
+mGBA 核心遵循 **[MPL 2.0](https://github.com/mgba-emu/mgba/blob/master/LICENSE)**；FCEUmm 核心遵循 **[GPL-2.0](https://github.com/libretro/libretro-fceumm/blob/master/COPYING)**。分发包含上述核心的构建产物时，请遵守相应开源协议。

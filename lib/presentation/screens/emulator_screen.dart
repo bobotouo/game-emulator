@@ -3,12 +3,18 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../theme/app_theme.dart';
+import '../theme/system_ui.dart';
 import '../widgets/virtual_gamepad.dart';
+import '../../core/libretro/emulator_core_resolver.dart';
+import '../../core/game_texture/game_texture_controller.dart';
 import '../../core/libretro/video_renderer.dart';
 import '../../core/libretro/emulator_service.dart';
+import '../../core/audio/audio_debug.dart';
 import '../../core/audio/audio_output_service.dart';
 import '../../core/settings/app_settings_service.dart';
 import '../../core/storage/storage_paths_service.dart';
+import '../../core/haptics/haptic_service.dart';
+import '../../core/emulator_loop/emulator_loop_ffi.dart' as emu_loop;
 
 class EmulatorScreen extends StatefulWidget {
   final String romPath;
@@ -28,6 +34,11 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
 
   // Frame buffer manager
   late FrameBufferManager _frameBufferManager;
+  final GameTextureController _gameTexture = GameTextureController();
+  final bool _useNativeTexture = GameTextureController.isSupported;
+  late EmulatorCoreConfig _coreConfig;
+  int _frameWidth = 240;
+  int _frameHeight = 160;
 
   // State
   bool _isRunning = false;
@@ -36,7 +47,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   bool _isFullscreen = false;
   bool _showFullscreenNavigation = false;
   String? _errorMessage;
-  double _fps = 0;
+  final ValueNotifier<double> _fps = ValueNotifier(0);
   String _gameName = '';
   String _displayAspectRatio = AppSettingsService.aspectOriginal;
   double _displayBrightness = 1;
@@ -44,6 +55,10 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
 
   // FPS overlay refresh timer
   Timer? _fpsTimer;
+  // Audio drain: reads C ring buffer → SoLoud
+  Timer? _audioDrainTimer;
+  Timer? _rumblePollTimer;
+  int _lastRumbleSequence = 0;
 
   // Input state
   final Map<int, bool> _inputState = {};
@@ -59,11 +74,17 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       _gameName = _gameName.substring(0, dotIndex);
     }
 
-    // Initialize frame buffer manager (GBA resolution)
-    _frameBufferManager = FrameBufferManager(width: 240, height: 160);
-    unawaited(GbaDisplayShader.ensureLoaded());
+    _coreConfig = EmulatorCoreResolver.resolve(widget.romPath);
+    _frameWidth = _coreConfig.defaultWidth;
+    _frameHeight = _coreConfig.defaultHeight;
+    _frameBufferManager = FrameBufferManager(
+      width: _frameWidth,
+      height: _frameHeight,
+      nativeAllocation: _useNativeTexture,
+    );
     _syncSettings();
     _settings.addListener(_syncSettings);
+    AppSystemUi.apply();
 
     // Initialize emulator
     _initializeEmulator();
@@ -72,6 +93,12 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   @override
   void dispose() {
     _fpsTimer?.cancel();
+    _audioDrainTimer?.cancel();
+    _rumblePollTimer?.cancel();
+    _fps.dispose();
+    _emulatorService.core?.unbindDisplayBuffer();
+    _frameBufferManager.disposeBuffer();
+    _gameTexture.dispose();
     _restorePortraitMode();
     _settings.removeListener(_syncSettings);
     _audioOutputService.dispose();
@@ -98,20 +125,23 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
         return;
       }
 
-      // Get the libretro core path
-      // For now, we'll use a placeholder path
-      // In production, this should be bundled with the app
-      final corePath = await _getCorePath();
+      final corePath = await EmulatorCoreResolver.resolveCorePath(
+        widget.romPath,
+      );
       if (corePath == null) {
         setState(() {
-          _errorMessage = '找不到模拟器核心文件';
+          final hint = Platform.isIOS
+              ? '请先执行 ./scripts/build_all_cores.sh ios 并重新安装 App'
+              : '请确认已编译并打包 libretro 核心';
+          _errorMessage =
+              '找不到 ${_coreConfig.system.label} 模拟器核心（${_coreConfig.nativeLibraryLabel}）。$hint';
           _isLoading = false;
         });
         return;
       }
 
       // Initialize emulator core
-      print('Initializing emulator core: $corePath');
+      print('Initializing ${_coreConfig.system.label} core: $corePath');
       final initialized = await _emulatorService.initialize(corePath);
       if (!initialized) {
         setState(() {
@@ -121,16 +151,6 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
         return;
       }
       print('Core initialized successfully');
-
-      // Set up video callback
-      _emulatorService.setVideoCallback((framebuffer, width, height, pitch) {
-        _frameBufferManager.updateFrom(framebuffer);
-      });
-
-      // Set up audio callback
-      _emulatorService.setAudioCallback((samples, frames) {
-        _audioOutputService.addSamples(samples);
-      });
 
       // Load ROM
       print('Loading ROM: ${widget.romPath}');
@@ -148,12 +168,54 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       }
       print('ROM loaded successfully');
 
-      await _audioOutputService.initialize(
-        sampleRate: _emulatorService.core?.sampleRate ?? 32768,
-        fps: _emulatorService.core?.fps ?? 59.73,
+      _syncFrameDimensionsFromCore();
+      _emulatorService.core?.bindDisplayBuffer(_frameBufferManager.pixels);
+
+      if (_useNativeTexture) {
+        await _gameTexture.create(_frameWidth, _frameHeight);
+      }
+
+      final coreRate = _emulatorService.core?.sampleRate ?? 0.0;
+      final reported = Platform.isIOS ? emu_loop.getReportedSampleRate() : coreRate;
+      if (Platform.isIOS) {
+        emu_loop.flushAudioRing();
+      }
+      final audioRate = Platform.isIOS
+          ? (reported > 0 ? reported : 32768.0).clamp(8000.0, 192000.0)
+          : (coreRate > 0 ? coreRate : 32768.0);
+      logAudio(
+        'emulator_screen init audio: av_info.sampleRate=$coreRate '
+        'reported=$reported -> startNativeAudio($audioRate) ring=${emu_loop.audioAvailable()}',
       );
+      await _audioOutputService.initialize(sampleRate: audioRate);
 
       _emulatorService.startGameLoop();
+
+      // iOS: AVAudioEngine pulls PCM on a real-time thread (no Dart drain).
+      if (!_audioOutputService.usesNativeAudio) {
+        _audioDrainTimer?.cancel();
+        _audioDrainTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
+          final samples = emu_loop.drainAudio(maxSamples: 8192);
+          if (samples != null && samples.isNotEmpty) {
+            _audioOutputService.addSamples(samples);
+          }
+        });
+      }
+
+      _lastRumbleSequence = emu_loop.rumbleSequence();
+      _rumblePollTimer?.cancel();
+      _rumblePollTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
+        final sequence = emu_loop.rumbleSequence();
+        if (sequence == _lastRumbleSequence) {
+          return;
+        }
+        _lastRumbleSequence = sequence;
+
+        final strong = emu_loop.rumbleStrong();
+        final weak = emu_loop.rumbleWeak();
+        final strength = strong >= weak ? strong : weak;
+        HapticService.instance.gameRumble(strength, strong: strong >= weak);
+      });
 
       setState(() {
         _isRunning = true;
@@ -165,9 +227,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       _fpsTimer?.cancel();
       _fpsTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
         if (mounted) {
-          setState(() {
-            _fps = _emulatorService.currentFps;
-          });
+          _fps.value = _emulatorService.currentFps;
         } else {
           timer.cancel();
         }
@@ -180,38 +240,30 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     }
   }
 
-  Future<String?> _getCorePath() async {
-    // On Android, .so files in jniLibs can be loaded by name directly
-    if (Platform.isAndroid) {
-      return 'libmgba_libretro.so';
+  void _syncFrameDimensionsFromCore() {
+    final w = _emulatorService.baseWidth;
+    final h = _emulatorService.baseHeight;
+    if (w <= 0 || h <= 0) {
+      return;
     }
-
-    // Try to find the core file in common locations
-    final possiblePaths = [
-      // macOS
-      '${Directory.current.path}/assets/cores/mgba_libretro.dylib',
-      '${Directory.current.path}/build/libretro/macos/mgba_libretro.dylib',
-      // Linux
-      '${Directory.current.path}/assets/cores/mgba_libretro.so',
-      '${Directory.current.path}/build/libretro/linux/mgba_libretro.so',
-      // iOS (bundled)
-      'mgba_libretro.dylib',
-    ];
-
-    for (final path in possiblePaths) {
-      if (await File(path).exists()) {
-        return path;
-      }
+    _frameBufferManager.ensureSize(w, h);
+    if (_frameWidth != w || _frameHeight != h) {
+      setState(() {
+        _frameWidth = w;
+        _frameHeight = h;
+      });
     }
-
-    return null;
   }
 
   void _onInputUpdate(Map<int, bool> state) {
     _inputState
       ..clear()
       ..addAll(state);
-    _emulatorService.updateInput(state);
+    // Update the C-side atomic input bitmask directly (avoids Dart map lookup
+    // during retro_run on the native thread).
+    for (final entry in state.entries) {
+      emu_loop.setInputBit(entry.key, entry.value);
+    }
   }
 
   void _togglePause() {
@@ -289,10 +341,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   }
 
   Future<void> _restorePortraitMode() async {
-    await SystemChrome.setEnabledSystemUIMode(
-      SystemUiMode.manual,
-      overlays: SystemUiOverlay.values,
-    );
+    AppSystemUi.apply();
     await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
   }
 
@@ -310,27 +359,27 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
         }
       },
       child: Scaffold(
-        backgroundColor: AppColors.surfaceContainerLowest,
+        backgroundColor: AppColors.background,
         body: _isFullscreen ? _buildFullscreenBody() : _buildPortraitBody(),
       ),
     );
   }
 
   Widget _buildPortraitBody() {
-    return SafeArea(
-      child: Column(
-        children: [
-          _buildTopBar(context),
-          Expanded(
-            child: _isLoading
-                ? _buildLoadingScreen()
-                : _errorMessage != null
-                ? _buildErrorScreen()
-                : _buildGameScreen(),
-          ),
-          if (_isRunning) VirtualGamepad(onInputUpdate: _onInputUpdate),
-        ],
-      ),
+    final topInset = MediaQuery.paddingOf(context).top;
+
+    return Column(
+      children: [
+        _buildTopBar(context, topInset: topInset),
+        Expanded(
+          child: _isLoading
+              ? _buildLoadingScreen()
+              : _errorMessage != null
+              ? _buildErrorScreen()
+              : _buildGameScreen(),
+        ),
+        if (_isRunning) VirtualGamepad(onInputUpdate: _onInputUpdate),
+      ],
     );
   }
 
@@ -439,11 +488,13 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     );
   }
 
-  Widget _buildTopBar(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-      color: AppColors.surfaceContainerLow,
-      child: Row(
+  Widget _buildTopBar(BuildContext context, {required double topInset}) {
+    return Padding(
+      padding: EdgeInsets.only(top: topInset),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        color: Colors.transparent,
+        child: Row(
         children: [
           IconButton(
             icon: const Icon(Icons.arrow_back),
@@ -489,6 +540,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
             ],
           ),
         ],
+        ),
       ),
     );
   }
@@ -556,22 +608,27 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     if (!_isRunning) return const SizedBox.shrink();
 
     return IgnorePointer(
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-        decoration: BoxDecoration(
-          color: Colors.black.withValues(alpha: 0.38),
-          borderRadius: BorderRadius.circular(4),
-        ),
-        child: Text(
-          '${_fps.toStringAsFixed(0)} FPS${_speed > 1 ? ' · ${_speed}x' : ''}',
-          style: TextStyle(
-            fontSize: 10,
-            fontFamily: 'monospace',
-            fontWeight: FontWeight.w500,
-            color: Colors.white.withValues(alpha: 0.82),
-            height: 1.2,
-          ),
-        ),
+      child: ValueListenableBuilder<double>(
+        valueListenable: _fps,
+        builder: (context, fps, _) {
+          return Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: 0.38),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Text(
+              '${fps.toStringAsFixed(0)} FPS${_speed > 1 ? ' · ${_speed}x' : ''}',
+              style: TextStyle(
+                fontSize: 10,
+                fontFamily: 'monospace',
+                fontWeight: FontWeight.w500,
+                color: Colors.white.withValues(alpha: 0.82),
+                height: 1.2,
+              ),
+            ),
+          );
+        },
       ),
     );
   }
@@ -679,10 +736,20 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   }
 
   Widget _buildDisplay() {
+    if (_useNativeTexture && _gameTexture.isReady) {
+      return NativeGameDisplay(
+        texture: _gameTexture,
+        width: _frameWidth,
+        height: _frameHeight,
+        displayAspectRatio: _targetAspectRatio,
+        stretch: _isDisplayStretched,
+        brightness: _displayBrightness,
+      );
+    }
     return GBADisplay(
       frameBuffer: _frameBufferManager,
-      width: 240,
-      height: 160,
+      width: _frameWidth,
+      height: _frameHeight,
       displayAspectRatio: _targetAspectRatio,
       stretch: _isDisplayStretched,
       brightness: _displayBrightness,
@@ -699,7 +766,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       case AppSettingsService.aspectStretch:
       case AppSettingsService.aspectOriginal:
       default:
-        return 240 / 160;
+        return _frameWidth / _frameHeight;
     }
   }
 }

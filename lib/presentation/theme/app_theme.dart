@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'system_ui.dart';
+
 class AppColors {
   // Primary - Indigo
   static const primary = Color(0xFF6150B1);
@@ -127,9 +129,12 @@ class AppTheme {
       scaffoldBackgroundColor: AppColors.background,
       textTheme: AppTypography.textTheme,
       appBarTheme: const AppBarTheme(
-        backgroundColor: AppColors.surface,
+        backgroundColor: Colors.transparent,
         foregroundColor: AppColors.onSurface,
         elevation: 0,
+        scrolledUnderElevation: 0,
+        surfaceTintColor: Colors.transparent,
+        systemOverlayStyle: AppSystemUi.overlayStyle,
       ),
       cardTheme: CardThemeData(
         color: AppColors.surfaceContainer,

@@ -59,9 +59,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      extendBodyBehindAppBar: true,
       appBar: AppBar(title: const Text('设置')),
       body: ListView(
-        padding: const EdgeInsets.all(16),
+        padding: EdgeInsets.fromLTRB(
+          16,
+          MediaQuery.paddingOf(context).top + kToolbarHeight + 16,
+          16,
+          16,
+        ),
         children: [
           _buildSectionHeader(context, '模拟器设置'),
           _buildSettingsCard(
@@ -69,9 +75,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
               _buildSwitchTile(
                 icon: Icons.vibration,
                 title: '触觉反馈',
-                subtitle: '虚拟按键震动；支持震动的游戏会触发手机震动',
+                subtitle: '支持震动的游戏触发震动时，允许手机震动',
                 value: _settings.hapticFeedbackEnabled,
                 onChanged: _settings.setHapticFeedbackEnabled,
+              ),
+              _buildDivider(),
+              _buildSwitchTile(
+                icon: Icons.touch_app,
+                title: '按键反馈',
+                subtitle: '点击虚拟按键时轻微震动',
+                value: _settings.buttonFeedbackEnabled,
+                onChanged: _settings.setButtonFeedbackEnabled,
               ),
               _buildDivider(),
               _buildAspectRatioTile(),
@@ -148,7 +162,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               _buildStaticTile(
                 icon: Icons.description_outlined,
                 title: '介绍说明',
-                subtitle: '本应用用于管理和运行本地 GBA 游戏，支持游戏库、存档、局域网联机和虚拟手柄。',
+                subtitle: '本应用用于管理和运行本地游戏（GBA / NES 等），支持游戏库、存档、局域网联机和虚拟手柄。',
               ),
             ],
           ),

@@ -4,9 +4,11 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:path_provider/path_provider.dart';
+import '../emulator_loop/emulator_loop_ffi.dart' as emu_loop;
+import 'emulator_core_resolver.dart';
 import 'libretro_core.dart';
 
-/// Generates thumbnail images for GBA ROMs by running the emulator briefly
+/// Generates thumbnail images for ROMs by running the emulator briefly.
 class ThumbnailGenerator {
   /// Generate a thumbnail for a ROM file
   /// Returns the path to the saved thumbnail image
@@ -18,9 +20,13 @@ class ThumbnailGenerator {
       print('Generating thumbnail for: $romPath');
 
       // Get the core path
-      final corePath = await _getCorePath();
+      final corePath = await EmulatorCoreResolver.resolveCorePath(romPath);
       if (corePath == null) {
-        print('Core not found');
+        final config = EmulatorCoreResolver.resolve(romPath);
+        print(
+          'Core not found (${config.nativeLibraryLabel}). '
+          'On iOS run: ./scripts/build_all_cores.sh ios',
+        );
         return null;
       }
 
@@ -38,35 +44,29 @@ class ThumbnailGenerator {
         return null;
       }
 
-      // Set up frame capture
+      // Run long enough to get past boot logos. Frames are captured from the
+      // C ring buffer (gConvBuf) after each retro_run call.
       Uint8List? bestFrame;
       Uint8List? latestFrame;
       int frameWidth = 0;
       int frameHeight = 0;
-      int frameIndex = 0;
       double bestScore = -1;
 
-      core.videoCallback = (framebuffer, width, height, pitch) {
-        if (width > 0 && height > 0) {
-          latestFrame = Uint8List.fromList(framebuffer);
-          frameWidth = width;
-          frameHeight = height;
-
-          if (frameIndex >= 90) {
-            final score = _scoreFrame(framebuffer, width, height);
+      for (int i = 0; i < 600; i++) {
+        core.runFrame();
+        final capture = emu_loop.captureLastFrame();
+        if (capture != null) {
+          latestFrame = capture.rgba;
+          frameWidth = capture.width;
+          frameHeight = capture.height;
+          if (i >= 90) {
+            final score = _scoreFrame(capture.rgba, capture.width, capture.height);
             if (score > bestScore) {
               bestScore = score;
-              bestFrame = Uint8List.fromList(framebuffer);
+              bestFrame = capture.rgba;
             }
           }
         }
-      };
-
-      // Run long enough to get past boot logos, then keep the frame with the
-      // most visible image content so transient black frames are ignored.
-      for (int i = 0; i < 600; i++) {
-        frameIndex = i;
-        core.runFrame();
       }
 
       // Dispose core
@@ -178,28 +178,6 @@ class ThumbnailGenerator {
       print('Error saving thumbnail: $e');
       return null;
     }
-  }
-
-  /// Get the libretro core path
-  static Future<String?> _getCorePath() async {
-    if (Platform.isAndroid) {
-      return 'libmgba_libretro.so';
-    }
-
-    final possiblePaths = [
-      '${Directory.current.path}/assets/cores/mgba_libretro.dylib',
-      '${Directory.current.path}/build/libretro/macos/mgba_libretro.dylib',
-      '${Directory.current.path}/assets/cores/mgba_libretro.so',
-      'mgba_libretro.dylib',
-    ];
-
-    for (final path in possiblePaths) {
-      if (await File(path).exists()) {
-        return path;
-      }
-    }
-
-    return null;
   }
 
   /// Delete a thumbnail

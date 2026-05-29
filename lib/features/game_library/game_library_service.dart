@@ -6,10 +6,13 @@ import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../../core/libretro/emulator_core_resolver.dart';
 import '../../core/libretro/thumbnail_generator.dart';
+import '../../core/storage/storage_paths_service.dart';
 
-/// Supported GBA ROM file extensions
-const List<String> supportedRomExtensions = ['.gba', '.gbc', '.gb'];
+/// Supported ROM file extensions (re-exported for UI).
+List<String> get supportedRomExtensions =>
+    EmulatorCoreResolver.supportedRomExtensions;
 
 /// Result of adding a game to the library.
 class AddGameResult {
@@ -83,6 +86,7 @@ class GameLibraryService {
   /// Initialize and load saved games
   Future<void> init() async {
     await _loadGames();
+    await _repairStoredRomPaths();
     await _backfillMissingMd5();
     final before = _games.length;
     _dedupeGames();
@@ -96,20 +100,26 @@ class GameLibraryService {
   /// Pick and add a ROM file
   Future<AddGameResult?> addGame() async {
     try {
+      // iOS cannot map .gba/.nes to stable UTIs (file_picker skips dyn.* types),
+      // so use FileType.any and validate the extension in Dart instead.
+      final romExtensions = supportedRomExtensions
+          .map((e) => e.replaceFirst('.', ''))
+          .toList();
       final result = await FilePicker.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: supportedRomExtensions
-            .map((e) => e.replaceFirst('.', ''))
-            .toList(),
+        type: Platform.isIOS ? FileType.any : FileType.custom,
+        allowedExtensions: Platform.isIOS ? null : romExtensions,
         allowMultiple: false,
       );
 
       if (result == null || result.files.isEmpty) return null;
 
       final file = result.files.first;
-      if (file.path == null) return null;
+      final path = file.path;
+      if (path == null) {
+        throw Exception('无法读取所选文件');
+      }
 
-      return addGameFromPath(file.path!);
+      return addGameFromPath(path);
     } catch (e) {
       print('Error adding game: $e');
       rethrow;
@@ -119,6 +129,7 @@ class GameLibraryService {
   /// Add game from file path
   Future<AddGameResult?> addGameFromPath(String path) async {
     try {
+      path = await _persistImportedRom(path);
       final file = File(path);
       if (!await file.exists()) {
         throw Exception('文件不存在: $path');
@@ -134,10 +145,12 @@ class GameLibraryService {
       final md5Hash = await _computeFileMd5(path);
       final duplicate = await _findDuplicateByMd5(md5Hash);
       if (duplicate != null) {
-        if (!_hasValidThumbnail(duplicate)) {
-          _queueGenerateThumbnail(duplicate);
+        await _ensureGamePathPersisted(duplicate.id, path);
+        final updated = getGame(duplicate.id) ?? duplicate;
+        if (!_hasValidThumbnail(updated)) {
+          _queueGenerateThumbnail(updated);
         }
-        return AddGameResult(game: duplicate, isDuplicate: true);
+        return AddGameResult(game: updated, isDuplicate: true);
       }
 
       final game = GameRom(
@@ -200,8 +213,36 @@ class GameLibraryService {
   }
 
   /// Check if ROM file exists
-  Future<bool> isRomExists(String path) async {
-    return File(path).exists();
+  Future<bool> isRomExists(String path, {String? md5}) async {
+    return resolvePlayableRomPath(path, md5: md5) != null;
+  }
+
+  /// Returns a path that exists on disk, repairing the library entry when possible.
+  Future<String?> resolvePlayableRomPath(String path, {String? md5}) async {
+    if (await File(path).exists()) {
+      return path;
+    }
+
+    if (!Platform.isIOS) {
+      return null;
+    }
+
+    final resolved = await _findRomInLibrary(
+      fileName: path.split('/').last,
+      md5: md5,
+    );
+    if (resolved == null) {
+      return null;
+    }
+
+    final index = _games.indexWhere((g) => g.path == path);
+    if (index >= 0 && _games[index].path != resolved) {
+      _games[index] = _gameWithPath(_games[index], resolved);
+      await _saveGames();
+      _notifyGamesChanged();
+    }
+
+    return resolved;
   }
 
   Future<String> _computeFileMd5(String path) async {
@@ -328,6 +369,152 @@ class GameLibraryService {
     } catch (e) {
       print('Error generating thumbnail: $e');
     }
+  }
+
+  /// On iOS, copy imports into Documents/ROMs (tmp/Inbox is cleared on restart).
+  Future<String> _persistImportedRom(String path) async {
+    if (!Platform.isIOS) {
+      return path;
+    }
+    return _copyRomToLibrary(path);
+  }
+
+  /// Fix library entries that still point at ephemeral iOS paths.
+  Future<void> _repairStoredRomPaths() async {
+    if (!Platform.isIOS) {
+      return;
+    }
+
+    var changed = false;
+    final romsDir = await StoragePathsService.getRomsDirectory();
+
+    for (var i = 0; i < _games.length; i++) {
+      final game = _games[i];
+      final file = File(game.path);
+
+      if (await file.exists()) {
+        if (!game.path.startsWith(romsDir.path)) {
+          try {
+            final stablePath = await _copyRomToLibrary(game.path);
+            if (stablePath != game.path) {
+              _games[i] = _gameWithPath(game, stablePath);
+              changed = true;
+            }
+          } catch (_) {}
+        }
+        continue;
+      }
+
+      final resolved = await _findRomInLibrary(
+        fileName: game.path.split('/').last,
+        md5: game.md5,
+      );
+      if (resolved != null) {
+        _games[i] = _gameWithPath(game, resolved);
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      await _saveGames();
+    }
+  }
+
+  Future<void> _ensureGamePathPersisted(String gameId, String sourcePath) async {
+    if (!Platform.isIOS) {
+      return;
+    }
+
+    final index = _games.indexWhere((g) => g.id == gameId);
+    if (index < 0 || !await File(sourcePath).exists()) {
+      return;
+    }
+
+    try {
+      final stablePath = await _copyRomToLibrary(sourcePath);
+      if (stablePath != _games[index].path) {
+        _games[index] = _gameWithPath(_games[index], stablePath);
+        await _saveGames();
+      }
+    } catch (_) {}
+  }
+
+  Future<String> _copyRomToLibrary(String sourcePath) async {
+    final romsDir = await StoragePathsService.getRomsDirectory();
+    if (sourcePath.startsWith(romsDir.path)) {
+      return sourcePath;
+    }
+
+    final source = File(sourcePath);
+    if (!await source.exists()) {
+      throw Exception('文件不存在: $sourcePath');
+    }
+
+    final fileName = _safeRomFileName(sourcePath.split('/').last);
+    final dest = File('${romsDir.path}/$fileName');
+    if (await dest.exists()) {
+      return dest.path;
+    }
+    await source.copy(dest.path);
+    return dest.path;
+  }
+
+  Future<String?> _findRomInLibrary({
+    required String fileName,
+    String? md5,
+  }) async {
+    final romsDir = await StoragePathsService.getRomsDirectory();
+    final names = {fileName, _safeRomFileName(fileName)};
+
+    for (final name in names) {
+      final candidate = File('${romsDir.path}/$name');
+      if (!await candidate.exists()) {
+        continue;
+      }
+      if (md5 == null) {
+        return candidate.path;
+      }
+      try {
+        if (await _computeFileMd5(candidate.path) == md5) {
+          return candidate.path;
+        }
+      } catch (_) {}
+    }
+
+    if (md5 == null) {
+      return null;
+    }
+
+    try {
+      await for (final entity in romsDir.list()) {
+        if (entity is! File) {
+          continue;
+        }
+        try {
+          if (await _computeFileMd5(entity.path) == md5) {
+            return entity.path;
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
+
+    return null;
+  }
+
+  GameRom _gameWithPath(GameRom game, String path) => GameRom(
+    id: game.id,
+    name: game.name,
+    path: path,
+    extension: game.extension,
+    md5: game.md5,
+    thumbnailPath: game.thumbnailPath,
+    addedAt: game.addedAt,
+    lastPlayedAt: game.lastPlayedAt,
+    playCount: game.playCount,
+  );
+
+  String _safeRomFileName(String fileName) {
+    return fileName.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_').trim();
   }
 
   String _extractFileName(String fileName) {

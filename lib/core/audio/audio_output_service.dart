@@ -1,8 +1,15 @@
+import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_soloud/flutter_soloud.dart';
 
-/// Streams libretro PCM samples to the platform audio output.
+import 'audio_debug.dart';
+import '../emulator_loop/emulator_loop_ffi.dart' as emu_loop;
+
+/// Streams libretro PCM to platform audio.
+/// iOS: AVAudioEngine pulls from the native ring buffer (Delta-style).
+/// Other platforms: SoLoud via Dart timer drain.
 class AudioOutputService {
   AudioSource? _stream;
   SoundHandle? _handle;
@@ -10,59 +17,86 @@ class AudioOutputService {
   bool _mutedByError = false;
   bool _playing = false;
   bool _paused = false;
+  bool _useNativeAudio = false;
   double _sampleRate = 32768;
-  double _coreFps = 59.73;
   double _volume = 1;
   double _speed = 1;
-  int _bufferedBeforePlay = 0;
-  int _startPlaybackBytes = 4096;
-
   bool get isReady => _ready;
   bool get isPlaying => _playing;
+  bool get usesNativeAudio => _useNativeAudio;
 
   Future<void> initialize({
     required double sampleRate,
-    double fps = 59.73,
     double volume = 1,
   }) async {
     _sampleRate = sampleRate;
-    _coreFps = fps;
     _volume = volume;
 
-    final samplesPerFrame = (_sampleRate / _coreFps).round().clamp(1, 8192);
-    _startPlaybackBytes = samplesPerFrame * 4 * 2;
-
-    if (_ready) return;
-
-    if (!SoLoud.instance.isInitialized) {
-      await SoLoud.instance.init();
+    if (Platform.isIOS) {
+      logAudio(
+        'startNativeAudio: dart sampleRate=$sampleRate '
+        'reported=${emu_loop.getReportedSampleRate()}',
+      );
+      emu_loop.startNativeAudio(sampleRate);
+      _useNativeAudio = true;
+      _ready = true;
+      _playing = true;
+      _mutedByError = false;
+      return;
     }
 
-    _stream = _createStream();
+    _useNativeAudio = false;
+
+    if (_ready) {
+      await _restartStream();
+      return;
+    }
+
+    if (!SoLoud.instance.isInitialized) {
+      await SoLoud.instance.init(
+        sampleRate: _sampleRate.round().clamp(8000, 192000),
+        channels: Channels.stereo,
+      );
+    }
+
+    _startStream();
     _ready = true;
     _mutedByError = false;
-    _playing = false;
-    _bufferedBeforePlay = 0;
   }
 
-  AudioSource _createStream() {
+  void _startStream() {
     _stream = SoLoud.instance.setBufferStream(
-      maxBufferSizeDuration: const Duration(milliseconds: 800),
+      maxBufferSizeDuration: const Duration(milliseconds: 1200),
       bufferingType: BufferingType.released,
-      bufferingTimeNeeds: 0.05,
+      bufferingTimeNeeds: 0.1,
       sampleRate: _sampleRate.round(),
       channels: Channels.stereo,
       format: BufferType.s16le,
     );
-    return _stream!;
+
+    _handle = SoLoud.instance.play(
+      _stream!,
+      volume: _volume,
+      paused: _paused,
+    );
+    _playing = true;
+    _applyPlaySpeed();
   }
 
   void setSpeed(double speed) {
-    _speed = speed.clamp(1.0, 5.0);
+    final next = speed.clamp(1.0, 5.0);
+    if (_speed == next) return;
+    _speed = next;
+    if (_useNativeAudio) {
+      // Speed is driven by native emulation + audio ring discard (iOS).
+      emu_loop.setEmulationSpeed(next.round());
+      return;
+    }
     _applyPlaySpeed();
   }
 
   void _applyPlaySpeed() {
+    if (_useNativeAudio) return;
     final handle = _handle;
     if (!_ready || handle == null || !_playing) return;
 
@@ -72,6 +106,7 @@ class AudioOutputService {
   }
 
   void addSamples(Int16List samples) {
+    if (_useNativeAudio) return;
     final stream = _stream;
     if (!_ready || _mutedByError || stream == null || samples.isEmpty) {
       return;
@@ -84,36 +119,46 @@ class AudioOutputService {
 
     try {
       SoLoud.instance.addAudioDataStream(stream, bytes);
-      if (!_playing) {
-        _bufferedBeforePlay += bytes.length;
-        if (_bufferedBeforePlay >= _startPlaybackBytes) {
-          _handle = SoLoud.instance.play(
-            stream,
-            volume: _volume,
-            paused: _paused,
-          );
-          _playing = true;
-          _applyPlaySpeed();
-        }
-      }
     } on SoLoudStreamEndedAlreadyCppException {
       _restartStream();
     } on SoLoudPcmBufferFullCppException {
-      // Drop saturated chunks instead of spamming logs or blocking emulation.
-    } catch (_) {
+      // Drop when saturated; emulation must not block.
+    } catch (error, stackTrace) {
       _mutedByError = true;
+      debugPrint('AudioOutputService error: $error\n$stackTrace');
     }
   }
 
-  void _restartStream() {
-    _stream = _createStream();
+  Future<void> _restartStream() async {
+    final oldStream = _stream;
+    final oldHandle = _handle;
+
+    _stream = null;
     _handle = null;
     _playing = false;
-    _bufferedBeforePlay = 0;
+
+    try {
+      if (oldHandle != null) {
+        await SoLoud.instance.stop(oldHandle);
+      }
+      if (oldStream != null) {
+        SoLoud.instance.setDataIsEnded(oldStream);
+        await SoLoud.instance.disposeSource(oldStream);
+      }
+    } catch (_) {}
+
+    if (SoLoud.instance.isInitialized) {
+      _startStream();
+      _mutedByError = false;
+    }
   }
 
   void setPaused(bool paused) {
     _paused = paused;
+    if (_useNativeAudio) {
+      emu_loop.setNativeAudioPaused(paused);
+      return;
+    }
     final handle = _handle;
     if (!_ready || handle == null) return;
 
@@ -122,14 +167,21 @@ class AudioOutputService {
     } catch (_) {}
   }
 
-  /// Immediately stop playback and discard buffered audio.
   Future<void> stop() async {
+    if (_useNativeAudio) {
+      emu_loop.stopNativeAudio();
+      _useNativeAudio = false;
+      _ready = false;
+      _playing = false;
+      _paused = false;
+      return;
+    }
+
     final stream = _stream;
     final handle = _handle;
 
     _playing = false;
     _paused = false;
-    _bufferedBeforePlay = 0;
     _handle = null;
 
     try {

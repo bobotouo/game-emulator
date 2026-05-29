@@ -26,7 +26,7 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
 
   void _updateInput(int button, bool pressed) {
     if (pressed) {
-      _triggerButtonHaptic(button);
+      _triggerButtonFeedback(button);
     }
     setState(() {
       _inputState[button] = pressed;
@@ -34,13 +34,15 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
     widget.onInputUpdate?.call(Map.from(_inputState));
   }
 
-  void _triggerButtonHaptic(int button) {
+  void _triggerButtonFeedback(int button) {
     switch (button) {
       case RETRO_DEVICE_ID_JOYPAD_A:
       case RETRO_DEVICE_ID_JOYPAD_B:
         HapticService.instance.buttonPress();
+        break;
       default:
         HapticService.instance.selectionClick();
+        break;
     }
   }
 
@@ -96,9 +98,7 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
         widget.overlay ? 24 : 16,
         (widget.overlay ? 10 : 24) + bottomInset,
       ),
-      color: widget.overlay
-          ? Colors.transparent
-          : AppColors.surfaceContainerLow,
+      color: Colors.transparent,
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         crossAxisAlignment: widget.overlay

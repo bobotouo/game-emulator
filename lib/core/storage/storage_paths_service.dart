@@ -13,6 +13,7 @@ class StoragePathsService {
 
   static const appFolderName = 'GBAEmulator';
   static const savesFolderName = 'Saves';
+  static const romsFolderName = 'ROMs';
   static const androidPublicRoot = '/storage/emulated/0/$appFolderName';
 
   static Directory? _saveStatesDir;
@@ -45,6 +46,25 @@ class StoragePathsService {
     }
     await _migrateLegacySaves(dir);
     _saveStatesDir = dir;
+    return dir;
+  }
+
+  /// Permanent ROM storage (iOS file picker imports land in tmp otherwise).
+  static Future<Directory> getRomsDirectory() async {
+    if (Platform.isIOS) {
+      final docs = await getApplicationDocumentsDirectory();
+      final dir = Directory('${docs.path}/$romsFolderName');
+      if (!await dir.exists()) {
+        await dir.create(recursive: true);
+      }
+      return dir;
+    }
+
+    final root = await _getAccessibleRootDirectory();
+    final dir = Directory('${root.path}/roms');
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
     return dir;
   }
 

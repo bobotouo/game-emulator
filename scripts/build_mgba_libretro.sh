@@ -6,7 +6,8 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_DIR/build/libretro"
-OUTPUT_DIR="$PROJECT_DIR/assets/cores"
+JNI_LIBS_DIR="$PROJECT_DIR/android/app/src/main/jniLibs"
+IOS_FRAMEWORKS_DIR="$PROJECT_DIR/ios/Runner/Frameworks"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -30,7 +31,7 @@ if [ ! -d "$MGBA_DIR" ]; then
     git clone --depth 1 --recurse-submodules https://github.com/mgba-emu/mgba.git "$MGBA_DIR"
 fi
 
-mkdir -p "$OUTPUT_DIR"
+mkdir -p "$JNI_LIBS_DIR"
 
 # Read ndkVersion from the Flutter SDK used by this project (matches flutter.ndkVersion)
 flutter_ndk_version() {
@@ -102,8 +103,9 @@ build_ios() {
 
     make -j$(sysctl -n hw.ncpu)
 
-    cp "$BUILD_IOS/mgba_libretro.dylib" "$OUTPUT_DIR/mgba_libretro_ios.dylib"
-    echo -e "${GREEN}iOS build complete: $OUTPUT_DIR/mgba_libretro_ios.dylib${NC}"
+    mkdir -p "$IOS_FRAMEWORKS_DIR"
+    cp "$BUILD_IOS/mgba_libretro.dylib" "$IOS_FRAMEWORKS_DIR/mgba_libretro_ios.dylib"
+    echo -e "${GREEN}iOS build complete: $IOS_FRAMEWORKS_DIR/mgba_libretro_ios.dylib${NC}"
 }
 
 # Build for Android
@@ -120,7 +122,7 @@ build_android() {
     local BUILD_ANDROID="$BUILD_DIR/android"
     mkdir -p "$BUILD_ANDROID"
 
-    for ABI in armeabi-v7a arm64-v8a x86_64; do
+    for ABI in arm64-v8a; do
         echo -e "${YELLOW}Building for Android $ABI...${NC}"
         local BUILD_ABI="$BUILD_ANDROID/$ABI"
         mkdir -p "$BUILD_ABI"
@@ -138,8 +140,8 @@ build_android() {
 
         make -j$(sysctl -n hw.ncpu)
 
-        mkdir -p "$OUTPUT_DIR/android/$ABI"
-        cp "$BUILD_ABI/mgba_libretro.so" "$OUTPUT_DIR/android/$ABI/libmgba_libretro.so"
+        mkdir -p "$JNI_LIBS_DIR/$ABI"
+        cp "$BUILD_ABI/mgba_libretro.so" "$JNI_LIBS_DIR/$ABI/libmgba_libretro.so"
         echo -e "${GREEN}Android $ABI build complete${NC}"
     done
 }

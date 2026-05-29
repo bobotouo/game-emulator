@@ -11,6 +11,7 @@ class AppSettingsService extends ChangeNotifier {
   static const aspectStretch = 'stretch';
 
   static const _hapticFeedbackKey = 'settings.haptic_feedback';
+  static const _buttonFeedbackKey = 'settings.button_feedback';
   static const _displayAspectRatioKey = 'settings.display_aspect_ratio';
   static const _displayBrightnessKey = 'settings.display_brightness';
   static const _networkEnabledKey = 'settings.network_enabled';
@@ -19,12 +20,14 @@ class AppSettingsService extends ChangeNotifier {
   SharedPreferences? _prefs;
 
   bool _hapticFeedbackEnabled = true;
+  bool _buttonFeedbackEnabled = false;
   String _displayAspectRatio = aspectOriginal;
   double _displayBrightness = 1;
   bool _networkEnabled = true;
   int _networkPort = 7845;
 
   bool get hapticFeedbackEnabled => _hapticFeedbackEnabled;
+  bool get buttonFeedbackEnabled => _buttonFeedbackEnabled;
   String get displayAspectRatio => _displayAspectRatio;
   double get displayBrightness => _displayBrightness;
   bool get networkEnabled => _networkEnabled;
@@ -33,6 +36,7 @@ class AppSettingsService extends ChangeNotifier {
   Future<void> init() async {
     _prefs ??= await SharedPreferences.getInstance();
     _hapticFeedbackEnabled = _prefs!.getBool(_hapticFeedbackKey) ?? true;
+    _buttonFeedbackEnabled = _prefs!.getBool(_buttonFeedbackKey) ?? false;
     _displayAspectRatio =
         _prefs!.getString(_displayAspectRatioKey) ?? aspectOriginal;
     _displayBrightness = _prefs!.getDouble(_displayBrightnessKey) ?? 1;
@@ -43,6 +47,12 @@ class AppSettingsService extends ChangeNotifier {
   Future<void> setHapticFeedbackEnabled(bool value) async {
     _hapticFeedbackEnabled = value;
     await _prefs?.setBool(_hapticFeedbackKey, value);
+    notifyListeners();
+  }
+
+  Future<void> setButtonFeedbackEnabled(bool value) async {
+    _buttonFeedbackEnabled = value;
+    await _prefs?.setBool(_buttonFeedbackKey, value);
     notifyListeners();
   }
 

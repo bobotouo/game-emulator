@@ -24,13 +24,13 @@ class HapticService {
 
   /// Virtual gamepad action buttons (A / B).
   Future<void> buttonPress() async {
-    if (!_settings.hapticFeedbackEnabled) return;
+    if (!_settings.buttonFeedbackEnabled) return;
     await _vibrate(duration: 20, amplitude: 180);
   }
 
   /// D-pad, Start, Select and other secondary controls.
   Future<void> selectionClick() async {
-    if (!_settings.hapticFeedbackEnabled) return;
+    if (!_settings.buttonFeedbackEnabled) return;
     await _vibrate(duration: 12, amplitude: 120);
   }
 

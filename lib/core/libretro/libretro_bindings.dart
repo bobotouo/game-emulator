@@ -84,8 +84,9 @@ final class retro_system_timing extends Struct {
 
 final class retro_rumble_interface extends Struct {
   external Pointer<
-      NativeFunction<
-          Int32 Function(Uint32 port, Uint32 effect, Uint16 strength)>> set_rumble_state;
+    NativeFunction<Int32 Function(Uint32 port, Uint32 effect, Uint16 strength)>
+  >
+  set_rumble_state;
 }
 
 // Callback types
@@ -224,6 +225,10 @@ class LibretroBindings {
     _lib = DynamicLibrary.open(corePath);
     _bindFunctions();
   }
+
+  /// Native function pointer for retro_run (passed to the native game loop).
+  Pointer<NativeFunction<retro_run_native>> get retroRunPtr =>
+      _lib.lookup<NativeFunction<retro_run_native>>('retro_run');
 
   void _bindFunctions() {
     retroInit = _lib.lookupFunction<retro_init_native, retro_init_dart>(

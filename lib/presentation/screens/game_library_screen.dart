@@ -84,13 +84,15 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
   }
 
   Future<void> _launchGame(GameRom game) async {
-    // Check if ROM file exists
-    final exists = await _libraryService.isRomExists(game.path);
-    if (!exists) {
+    final romPath = await _libraryService.resolvePlayableRomPath(
+      game.path,
+      md5: game.md5,
+    );
+    if (romPath == null) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('ROM文件不存在: ${game.path}'),
+            content: Text('ROM 文件不存在，请重新添加: ${game.name}'),
             backgroundColor: AppColors.error,
           ),
         );
@@ -107,7 +109,7 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
         context,
         MaterialPageRoute(
           builder: (context) => EmulatorScreen(
-            romPath: game.path,
+            romPath: romPath,
             gameId: game.id,
           ),
         ),
@@ -171,6 +173,7 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      extendBodyBehindAppBar: true,
       appBar: AppBar(
         title: const Text('游戏库'),
         actions: [
@@ -183,6 +186,7 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
       ),
       body: Column(
         children: [
+          SizedBox(height: MediaQuery.paddingOf(context).top + kToolbarHeight),
           // Search Bar
           Padding(
             padding: const EdgeInsets.all(16),
@@ -273,7 +277,7 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
           ),
           const SizedBox(height: 8),
           Text(
-            isSearchResult ? '换个名字试试' : '点击右上角 + 添加 GBA ROM 文件',
+            isSearchResult ? '换个名字试试' : '点击右上角 + 添加 ROM 文件',
             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
               color: AppColors.onSurfaceVariant.withValues(alpha: 0.7),
             ),
