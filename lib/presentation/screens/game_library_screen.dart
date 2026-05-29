@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import '../theme/app_theme.dart';
 import '../widgets/game_card.dart';
+import '../widgets/immersive_scroll_page.dart';
 import '../../features/game_library/game_library_service.dart';
 import 'emulator_screen.dart';
 
@@ -108,10 +109,8 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
       Navigator.push(
         context,
         MaterialPageRoute(
-          builder: (context) => EmulatorScreen(
-            romPath: romPath,
-            gameId: game.id,
-          ),
+          builder: (context) =>
+              EmulatorScreen(romPath: romPath, gameId: game.id),
         ),
       ).then((_) {
         // Refresh game list when returning
@@ -172,24 +171,22 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      extendBodyBehindAppBar: true,
-      appBar: AppBar(
-        title: const Text('游戏库'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.add),
-            onPressed: _addGame,
-            tooltip: '添加游戏',
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          SizedBox(height: MediaQuery.paddingOf(context).top + kToolbarHeight),
-          // Search Bar
-          Padding(
-            padding: const EdgeInsets.all(16),
+    final bottomInset =
+        kBottomNavigationBarHeight + MediaQuery.paddingOf(context).bottom + 16;
+
+    return ImmersiveScrollPage(
+      title: '游戏库',
+      actions: [
+        IconButton(
+          icon: const Icon(Icons.add),
+          onPressed: _addGame,
+          tooltip: '添加游戏',
+        ),
+      ],
+      slivers: [
+        SliverToBoxAdapter(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
             child: TextField(
               controller: _searchController,
               onChanged: (value) {
@@ -230,9 +227,10 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
               ),
             ),
           ),
-
-          // Category Chips
-          SizedBox(
+        ),
+        const SliverToBoxAdapter(child: SizedBox(height: 12)),
+        SliverToBoxAdapter(
+          child: SizedBox(
             height: 40,
             child: ListView(
               scrollDirection: Axis.horizontal,
@@ -240,21 +238,39 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
               children: [_buildCategoryChip('全部'), _buildCategoryChip('最近游玩')],
             ),
           ),
-
-          const SizedBox(height: 16),
-
-          // Game List
-          Expanded(
-            child: _isLoading
-                ? const Center(child: CircularProgressIndicator())
-                : _filteredGames.isEmpty
-                ? _buildEmptyState(
-                    isSearchResult: _searchQuery.trim().isNotEmpty,
-                  )
-                : _buildGameList(),
+        ),
+        const SliverToBoxAdapter(child: SizedBox(height: 16)),
+        if (_isLoading)
+          const SliverFillRemaining(
+            child: Center(child: CircularProgressIndicator()),
+          )
+        else if (_filteredGames.isEmpty)
+          SliverFillRemaining(
+            child: _buildEmptyState(
+              isSearchResult: _searchQuery.trim().isNotEmpty,
+            ),
+          )
+        else
+          SliverPadding(
+            padding: EdgeInsets.fromLTRB(16, 0, 16, bottomInset),
+            sliver: SliverGrid(
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 2,
+                childAspectRatio: 0.75,
+                crossAxisSpacing: 12,
+                mainAxisSpacing: 12,
+              ),
+              delegate: SliverChildBuilderDelegate((context, index) {
+                final game = _filteredGames[index];
+                return GameCard(
+                  game: game,
+                  onTap: () => _launchGame(game),
+                  onLongPress: () => _removeGame(game),
+                );
+              }, childCount: _filteredGames.length),
+            ),
           ),
-        ],
-      ),
+      ],
     );
   }
 
@@ -292,27 +308,6 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
           ],
         ],
       ),
-    );
-  }
-
-  Widget _buildGameList() {
-    return GridView.builder(
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 2,
-        childAspectRatio: 0.75,
-        crossAxisSpacing: 12,
-        mainAxisSpacing: 12,
-      ),
-      itemCount: _filteredGames.length,
-      itemBuilder: (context, index) {
-        final game = _filteredGames[index];
-        return GameCard(
-          game: game,
-          onTap: () => _launchGame(game),
-          onLongPress: () => _removeGame(game),
-        );
-      },
     );
   }
 

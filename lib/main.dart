@@ -6,6 +6,7 @@ import 'presentation/theme/system_ui.dart';
 import 'presentation/screens/game_library_screen.dart';
 import 'presentation/screens/multiplayer_lobby_screen.dart';
 import 'presentation/screens/settings_screen.dart';
+import 'core/audio/audio_output_service.dart';
 import 'core/settings/app_settings_service.dart';
 import 'core/storage/storage_paths_service.dart';
 
@@ -14,6 +15,7 @@ Future<void> main() async {
   AppSystemUi.apply();
   await AppSettingsService.instance.init();
   await StoragePathsService.ensureStorageAccess();
+  await AudioOutputService.warmUpEngine();
   runApp(const ProviderScope(child: GBAEmulatorApp()));
 }
 

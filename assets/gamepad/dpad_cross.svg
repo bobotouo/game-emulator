@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="currentColor">
+  <!-- Inner bevel sharp; outer flat edge corners rounded (r=4) -->
+  <path id="dpad_up" d="M 60 54 L 44 38 L 44 4 Q 44 0 48 0 L 72 0 Q 76 0 76 4 L 76 38 Z"/>
+  <path id="dpad_down" d="M 60 66 L 44 82 L 44 116 Q 44 120 48 120 L 72 120 Q 76 120 76 116 L 76 82 Z"/>
+  <path id="dpad_left" d="M 54 60 L 38 44 L 4 44 Q 0 44 0 48 L 0 72 Q 0 76 4 76 L 38 76 Z"/>
+  <path id="dpad_right" d="M 66 60 L 82 44 L 116 44 Q 120 44 120 48 L 120 72 Q 120 76 116 76 L 82 76 Z"/>
+</svg>

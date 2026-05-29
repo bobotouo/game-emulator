@@ -16,6 +16,11 @@ class AppSettingsService extends ChangeNotifier {
   static const _displayBrightnessKey = 'settings.display_brightness';
   static const _networkEnabledKey = 'settings.network_enabled';
   static const _networkPortKey = 'settings.network_port';
+  static const _gamepadSkinKey = 'settings.gamepad_skin';
+  static const _gamepadLayoutKey = 'settings.gamepad_layout';
+
+  /// Empty [gamepadLayoutId] = pick layout from current ROM system.
+  static const gamepadLayoutAuto = '';
 
   SharedPreferences? _prefs;
 
@@ -25,6 +30,8 @@ class AppSettingsService extends ChangeNotifier {
   double _displayBrightness = 1;
   bool _networkEnabled = true;
   int _networkPort = 7845;
+  String _gamepadSkinId = 'classic';
+  String _gamepadLayoutId = gamepadLayoutAuto;
 
   bool get hapticFeedbackEnabled => _hapticFeedbackEnabled;
   bool get buttonFeedbackEnabled => _buttonFeedbackEnabled;
@@ -32,6 +39,8 @@ class AppSettingsService extends ChangeNotifier {
   double get displayBrightness => _displayBrightness;
   bool get networkEnabled => _networkEnabled;
   int get networkPort => _networkPort;
+  String get gamepadSkinId => _gamepadSkinId;
+  String get gamepadLayoutId => _gamepadLayoutId;
 
   Future<void> init() async {
     _prefs ??= await SharedPreferences.getInstance();
@@ -42,6 +51,13 @@ class AppSettingsService extends ChangeNotifier {
     _displayBrightness = _prefs!.getDouble(_displayBrightnessKey) ?? 1;
     _networkEnabled = _prefs!.getBool(_networkEnabledKey) ?? true;
     _networkPort = _prefs!.getInt(_networkPortKey) ?? 7845;
+    _gamepadSkinId = _prefs!.getString(_gamepadSkinKey) ?? 'classic';
+    if (_gamepadSkinId.startsWith('delta:')) {
+      _gamepadSkinId = 'classic';
+      await _prefs!.setString(_gamepadSkinKey, _gamepadSkinId);
+    }
+    _gamepadLayoutId =
+        _prefs!.getString(_gamepadLayoutKey) ?? gamepadLayoutAuto;
   }
 
   Future<void> setHapticFeedbackEnabled(bool value) async {
@@ -77,6 +93,18 @@ class AppSettingsService extends ChangeNotifier {
   Future<void> setNetworkPort(int value) async {
     _networkPort = value.clamp(1024, 65535);
     await _prefs?.setInt(_networkPortKey, _networkPort);
+    notifyListeners();
+  }
+
+  Future<void> setGamepadSkinId(String value) async {
+    _gamepadSkinId = value;
+    await _prefs?.setString(_gamepadSkinKey, value);
+    notifyListeners();
+  }
+
+  Future<void> setGamepadLayoutId(String value) async {
+    _gamepadLayoutId = value;
+    await _prefs?.setString(_gamepadLayoutKey, value);
     notifyListeners();
   }
 }

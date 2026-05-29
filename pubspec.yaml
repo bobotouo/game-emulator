@@ -69,6 +69,9 @@ flutter:
   shaders:
     - shaders/gba_display.frag
 
+  assets:
+    - assets/gamepad/dpad_cross.svg
+
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images
 

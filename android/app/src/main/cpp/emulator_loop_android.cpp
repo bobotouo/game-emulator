@@ -92,12 +92,7 @@ void emulator_loop_run_frames(emu_retro_run_t retro_run, uint32_t count) {
   }
 }
 
-double emulator_loop_prepare_audio_output_rate(double preferred_hz) {
-  const unsigned rate =
-      preferred_hz >= 8000.0 ? static_cast<unsigned>(preferred_hz + 0.5) : 48000u;
-  emulator_loop_set_target_sample_rate(rate);
-  return static_cast<double>(rate);
-}
+// emulator_loop_prepare_audio_output_rate → emulator_loop.cpp (non-iOS)
 
 void emulator_loop_audio_start(double /*sample_rate*/) {}
 void emulator_loop_audio_stop(void) {}

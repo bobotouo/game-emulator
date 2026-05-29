@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import '../theme/app_theme.dart';
+import '../widgets/immersive_scroll_page.dart';
 import '../../core/network/lan_service.dart';
 import '../../core/settings/app_settings_service.dart';
 import 'battle_room_screen.dart';
@@ -116,22 +117,28 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      extendBodyBehindAppBar: true,
-      appBar: AppBar(
-        title: const Text('联机大厅'),
-        actions: [
-          IconButton(
-            icon: Icon(_isSearching ? Icons.stop : Icons.refresh),
-            onPressed: _isSearching ? _stopSearching : _startSearching,
-          ),
-        ],
+    final bottomInset = kBottomNavigationBarHeight +
+        MediaQuery.paddingOf(context).bottom +
+        88;
+
+    return ImmersiveScrollPage(
+      title: '联机大厅',
+      actions: [
+        IconButton(
+          icon: Icon(_isSearching ? Icons.stop : Icons.refresh),
+          onPressed: _isSearching ? _stopSearching : _startSearching,
+        ),
+      ],
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _createRoom,
+        backgroundColor: AppColors.secondary,
+        foregroundColor: AppColors.onSecondary,
+        icon: const Icon(Icons.add),
+        label: const Text('创建房间'),
       ),
-      body: Column(
-        children: [
-          SizedBox(height: MediaQuery.paddingOf(context).top + kToolbarHeight),
-          // Online Status
-          Container(
+      slivers: [
+        SliverToBoxAdapter(
+          child: Container(
             padding: const EdgeInsets.all(16),
             color: AppColors.surfaceContainerLow,
             child: Row(
@@ -165,10 +172,10 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
                 ),
               ],
             ),
-          ),
-
-          // Search/Filter
-          Padding(
+            ),
+        ),
+        SliverToBoxAdapter(
+          child: Padding(
             padding: const EdgeInsets.all(16),
             child: TextField(
               decoration: InputDecoration(
@@ -191,10 +198,10 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
               ),
             ),
           ),
-
-          // Searching indicator
-          if (_isSearching)
-            Padding(
+        ),
+        if (_isSearching)
+          SliverToBoxAdapter(
+            child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16),
               child: Row(
                 children: [
@@ -216,57 +223,47 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
                 ],
               ),
             ),
-
-          // Room List
-          Expanded(
-            child: _rooms.isEmpty
-                ? Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(
-                          Icons.wifi_find,
-                          size: 64,
-                          color: AppColors.onSurfaceVariant.withValues(
-                            alpha: 0.3,
-                          ),
-                        ),
-                        const SizedBox(height: 16),
-                        Text(
-                          _isSearching ? '正在搜索房间...' : '暂未发现房间',
-                          style: Theme.of(context).textTheme.bodyLarge
-                              ?.copyWith(color: AppColors.onSurfaceVariant),
-                        ),
-                        const SizedBox(height: 8),
-                        Text(
-                          '点击右上角刷新按钮开始搜索',
-                          style: Theme.of(context).textTheme.bodySmall
-                              ?.copyWith(
-                                color: AppColors.onSurfaceVariant.withValues(
-                                  alpha: 0.7,
-                                ),
-                              ),
-                        ),
-                      ],
-                    ),
-                  )
-                : ListView.builder(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    itemCount: _rooms.length,
-                    itemBuilder: (context, index) {
-                      return _buildRoomCard(context, _rooms[index]);
-                    },
-                  ),
           ),
-        ],
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _createRoom,
-        backgroundColor: AppColors.secondary,
-        foregroundColor: AppColors.onSecondary,
-        icon: const Icon(Icons.add),
-        label: const Text('创建房间'),
-      ),
+        if (_rooms.isEmpty)
+          SliverFillRemaining(
+            hasScrollBody: false,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(
+                  Icons.wifi_find,
+                  size: 64,
+                  color: AppColors.onSurfaceVariant.withValues(alpha: 0.3),
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  _isSearching ? '正在搜索房间...' : '暂未发现房间',
+                  style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                    color: AppColors.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '点击右上角刷新按钮开始搜索',
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: AppColors.onSurfaceVariant.withValues(alpha: 0.7),
+                  ),
+                ),
+              ],
+            ),
+          )
+        else
+          SliverPadding(
+            padding: EdgeInsets.fromLTRB(16, 0, 16, bottomInset),
+            sliver: SliverList(
+              delegate: SliverChildBuilderDelegate(
+                (context, index) =>
+                    _buildRoomCard(context, _rooms[index]),
+                childCount: _rooms.length,
+              ),
+            ),
+          ),
+      ],
     );
   }
 

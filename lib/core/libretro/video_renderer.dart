@@ -153,7 +153,13 @@ class _GBADisplayState extends State<GBADisplay> {
   void dispose() {
     _frameGeneration++;
     widget.frameBuffer.removeListener(_onFrameAvailable);
-    _image?.dispose();
+    final img = _image;
+    _image = null;
+    if (img != null) {
+      SchedulerBinding.instance.addPostFrameCallback((_) {
+        img.dispose();
+      });
+    }
     super.dispose();
   }
 
@@ -204,9 +210,17 @@ class _GBADisplayState extends State<GBADisplay> {
       return;
     }
 
-    _image?.dispose();
+    final previous = _image;
     _image = image;
     _repaint.repaint();
+    _disposeImageAfterFrame(previous);
+  }
+
+  void _disposeImageAfterFrame(ui.Image? image) {
+    if (image == null) return;
+    SchedulerBinding.instance.addPostFrameCallback((_) {
+      image.dispose();
+    });
   }
 
   @override

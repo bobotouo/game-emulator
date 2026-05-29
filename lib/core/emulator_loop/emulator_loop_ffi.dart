@@ -175,14 +175,14 @@ final _audioRead =
 final Pointer<Int16> _audioBuf = calloc<Int16>(4096);
 
 /// Drain up to [maxSamples] int16 samples from the ring buffer.
-/// Returns them as an [Int16List] view (valid until next call).
+/// Returns a copy so the next drain cannot race with SoLoud on another thread.
 Int16List? drainAudio({int maxSamples = 4096}) {
   final avail = audioAvailable();
   if (avail <= 0) return null;
   final n = avail.clamp(0, maxSamples);
   final read = _audioRead(_audioBuf, n);
   if (read <= 0) return null;
-  return _audioBuf.asTypedList(read);
+  return Int16List.fromList(_audioBuf.asTypedList(read));
 }
 
 // ── Frame counter ──────────────────────────────────────────────────────────

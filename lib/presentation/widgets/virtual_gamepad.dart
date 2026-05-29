@@ -1,37 +1,52 @@
 import 'package:flutter/material.dart';
+
+import '../gamepad/gamepad_layout.dart';
+import '../gamepad/gamepad_skin.dart';
 import '../theme/app_theme.dart';
 import '../../core/haptics/haptic_service.dart';
 import '../../core/libretro/libretro_bindings.dart';
+import 'cross_dpad.dart';
 
-/// Input update callback
 typedef InputUpdateCallback = void Function(Map<int, bool> state);
 
 class VirtualGamepad extends StatefulWidget {
   final InputUpdateCallback? onInputUpdate;
   final bool overlay;
+  final GamepadSkin skin;
+  final GamepadLayout layout;
 
-  const VirtualGamepad({super.key, this.onInputUpdate, this.overlay = false});
+  const VirtualGamepad({
+    super.key,
+    this.onInputUpdate,
+    this.overlay = false,
+    this.skin = GamepadSkins.classic,
+    this.layout = GamepadLayouts.gba,
+  });
 
   @override
   State<VirtualGamepad> createState() => _VirtualGamepadState();
 }
 
 class _VirtualGamepadState extends State<VirtualGamepad> {
-  static const double _joystickSize = 108;
-  static const double _joystickTravel = 28;
-  static const double _joystickThreshold = 13;
-
   final Map<int, bool> _inputState = {};
-  Offset _joystickOffset = Offset.zero;
+
+  double get _dpadSize => widget.layout.compact ? 100.0 : 116.0;
+
+  GamepadSkin get _skin => widget.skin;
+
+  void _notifyInput() {
+    widget.onInputUpdate?.call(Map.from(_inputState));
+  }
 
   void _updateInput(int button, bool pressed) {
+    if (_inputState[button] == pressed) return;
     if (pressed) {
       _triggerButtonFeedback(button);
     }
     setState(() {
       _inputState[button] = pressed;
     });
-    widget.onInputUpdate?.call(Map.from(_inputState));
+    _notifyInput();
   }
 
   void _triggerButtonFeedback(int button) {
@@ -46,180 +61,140 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
     }
   }
 
-  void _updateDirectionalInput(Offset offset) {
-    final updates = {
-      RETRO_DEVICE_ID_JOYPAD_UP: offset.dy < -_joystickThreshold,
-      RETRO_DEVICE_ID_JOYPAD_DOWN: offset.dy > _joystickThreshold,
-      RETRO_DEVICE_ID_JOYPAD_LEFT: offset.dx < -_joystickThreshold,
-      RETRO_DEVICE_ID_JOYPAD_RIGHT: offset.dx > _joystickThreshold,
-    };
+  void _clearDpad() {
+    const ids = [
+      RETRO_DEVICE_ID_JOYPAD_UP,
+      RETRO_DEVICE_ID_JOYPAD_DOWN,
+      RETRO_DEVICE_ID_JOYPAD_LEFT,
+      RETRO_DEVICE_ID_JOYPAD_RIGHT,
+    ];
 
     var changed = false;
-    updates.forEach((button, pressed) {
-      if (_inputState[button] != pressed) {
+    for (final id in ids) {
+      if (_inputState[id] == true) {
         changed = true;
+      }
+      _inputState[id] = false;
+    }
+    if (!changed) return;
+    setState(() {});
+    _notifyInput();
+  }
+
+  void _onDpadDirections(Map<int, bool> directions) {
+    var changed = false;
+    for (final entry in directions.entries) {
+      if (_inputState[entry.key] != entry.value) {
+        changed = true;
+        break;
+      }
+    }
+    if (!changed) return;
+
+    final anyNewPress = directions.entries.any(
+      (e) => e.value && _inputState[e.key] != true,
+    );
+
+    setState(() {
+      for (final entry in directions.entries) {
+        _inputState[entry.key] = entry.value;
       }
     });
 
-    setState(() {
-      _joystickOffset = offset;
-      _inputState.addAll(updates);
-    });
-
-    if (changed) {
+    if (anyNewPress) {
       HapticService.instance.selectionClick();
-      widget.onInputUpdate?.call(Map.from(_inputState));
     }
-  }
-
-  void _handleJoystickPosition(Offset localPosition) {
-    final center = const Offset(_joystickSize / 2, _joystickSize / 2);
-    final rawOffset = localPosition - center;
-    final distance = rawOffset.distance;
-    final clampedOffset = distance > _joystickTravel
-        ? rawOffset * (_joystickTravel / distance)
-        : rawOffset;
-
-    _updateDirectionalInput(clampedOffset);
-  }
-
-  void _resetJoystick() {
-    _updateDirectionalInput(Offset.zero);
+    _notifyInput();
   }
 
   @override
   Widget build(BuildContext context) {
     final bottomInset = MediaQuery.paddingOf(context).bottom;
+    final hPad = widget.overlay ? 24.0 : 12.0;
 
-    return Container(
+    final controls = Padding(
       padding: EdgeInsets.fromLTRB(
-        widget.overlay ? 24 : 16,
-        10,
-        widget.overlay ? 24 : 16,
-        (widget.overlay ? 10 : 24) + bottomInset,
+        hPad,
+        widget.overlay ? 10 : 0,
+        hPad,
+        (widget.overlay ? 10 : 4) + bottomInset,
       ),
-      color: Colors.transparent,
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         crossAxisAlignment: widget.overlay
             ? CrossAxisAlignment.end
             : CrossAxisAlignment.center,
         children: [
-          _buildJoystick(),
-          _buildCenterButtons(),
+          if (widget.layout.showDpad)
+            _buildDpad()
+          else
+            const SizedBox(width: 8),
+          if (widget.layout.showSelectStart)
+            _buildCenterButtons()
+          else
+            const SizedBox(width: 8),
           _buildActionButtons(),
+        ],
+      ),
+    );
+
+    if (widget.overlay) {
+      return controls;
+    }
+
+    return ColoredBox(
+      color: AppColors.background,
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          if (widget.layout.showShoulders)
+            Padding(
+              padding: EdgeInsets.fromLTRB(hPad, 0, hPad, 40),
+              child: _buildShoulderRow(),
+            ),
+          controls,
         ],
       ),
     );
   }
 
-  Widget _buildJoystick() {
-    final isActive = _joystickOffset != Offset.zero;
-
-    return GestureDetector(
-      behavior: HitTestBehavior.opaque,
-      onTapDown: (details) {
-        _handleJoystickPosition(details.localPosition);
-      },
-      onTapUp: (_) => _resetJoystick(),
-      onTapCancel: _resetJoystick,
-      onPanStart: (details) {
-        _handleJoystickPosition(details.localPosition);
-      },
-      onPanUpdate: (details) => _handleJoystickPosition(details.localPosition),
-      onPanEnd: (_) => _resetJoystick(),
-      onPanCancel: _resetJoystick,
-      child: SizedBox(
-        width: _joystickSize,
-        height: _joystickSize,
-        child: Stack(
-          alignment: Alignment.center,
-          children: [
-            Container(
-              width: _joystickSize,
-              height: _joystickSize,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                gradient: const LinearGradient(
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                  colors: [
-                    AppColors.surfaceContainerHighest,
-                    AppColors.surfaceContainer,
-                    AppColors.surfaceContainerLowest,
-                  ],
-                ),
-                border: Border.all(
-                  color: isActive
-                      ? AppColors.primary.withValues(alpha: 0.8)
-                      : AppColors.outlineVariant,
-                  width: 1.5,
-                ),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.42),
-                    blurRadius: 18,
-                    offset: const Offset(0, 8),
-                  ),
-                  BoxShadow(
-                    color: AppColors.primary.withValues(
-                      alpha: isActive ? 0.22 : 0.08,
-                    ),
-                    blurRadius: 18,
-                    spreadRadius: 1,
-                  ),
-                ],
-              ),
+  Widget _buildShoulderRow() {
+    return Row(
+      children: [
+        Expanded(
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: _buildShoulderButton(
+              label: 'L',
+              button: RETRO_DEVICE_ID_JOYPAD_L,
             ),
-            Container(
-              width: 66,
-              height: 66,
-              decoration: BoxDecoration(
-                shape: BoxShape.circle,
-                color: AppColors.surfaceContainerLow.withValues(alpha: 0.82),
-                border: Border.all(
-                  color: AppColors.outlineVariant.withValues(alpha: 0.7),
-                ),
-              ),
-            ),
-            Transform.translate(
-              offset: _joystickOffset,
-              child: Container(
-                width: 46,
-                height: 46,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  gradient: RadialGradient(
-                    center: const Alignment(-0.35, -0.45),
-                    radius: 0.95,
-                    colors: [
-                      AppColors.primary.withValues(alpha: 0.95),
-                      AppColors.primaryContainer,
-                      AppColors.surfaceContainerHighest,
-                    ],
-                    stops: const [0.0, 0.62, 1.0],
-                  ),
-                  border: Border.all(
-                    color: AppColors.onPrimary.withValues(alpha: 0.18),
-                  ),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withValues(alpha: 0.5),
-                      blurRadius: 8,
-                      offset: const Offset(0, 5),
-                    ),
-                    BoxShadow(
-                      color: AppColors.primary.withValues(alpha: 0.28),
-                      blurRadius: 14,
-                      spreadRadius: 1,
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ],
+          ),
         ),
-      ),
+        Expanded(
+          child: Align(
+            alignment: Alignment.centerRight,
+            child: _buildShoulderButton(
+              label: 'R',
+              button: RETRO_DEVICE_ID_JOYPAD_R,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildDpad() {
+    return CrossDpad(
+      size: _dpadSize,
+      idleColor: _skin.barButtonFill.withValues(alpha: 0.96),
+      pressedColor: _skin.joystickActiveBorder,
+      outlineColor: _skin.barLabel,
+      up: _inputState[RETRO_DEVICE_ID_JOYPAD_UP] == true,
+      down: _inputState[RETRO_DEVICE_ID_JOYPAD_DOWN] == true,
+      left: _inputState[RETRO_DEVICE_ID_JOYPAD_LEFT] == true,
+      right: _inputState[RETRO_DEVICE_ID_JOYPAD_RIGHT] == true,
+      onDirectionsChanged: _onDpadDirections,
+      onDirectionsCleared: _clearDpad,
     );
   }
 
@@ -247,47 +222,103 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
             label: 'SELECT',
             button: RETRO_DEVICE_ID_JOYPAD_SELECT,
           ),
-          const SizedBox(height: 10),
+          SizedBox(height: widget.layout.compact ? 8 : 10),
           _buildBarButton(label: 'START', button: RETRO_DEVICE_ID_JOYPAD_START),
         ],
       ),
     );
   }
 
-  Widget _buildBarButton({required String label, required int button}) {
+  Widget _buildShoulderButton({required String label, required int button}) {
     final isPressed = _inputState[button] == true;
+    final base = _skin.colorShoulder;
+    final dark = _skin.colorShoulderDark;
 
     return GestureDetector(
-      onTapDown: (_) {
-        _updateInput(button, true);
-      },
+      onTapDown: (_) => _updateInput(button, true),
+      onTapUp: (_) => _updateInput(button, false),
+      onTapCancel: () => _updateInput(button, false),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 60),
+        width: 76,
+        height: 36,
+        alignment: Alignment.center,
+        transform: Matrix4.translationValues(0, isPressed ? 2 : 0, 0),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(14),
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: isPressed
+                ? [dark, dark.withValues(alpha: 0.92)]
+                : [base.withValues(alpha: 0.95), dark],
+          ),
+          border: Border.all(
+            color: Colors.white.withValues(alpha: isPressed ? 0.22 : 0.14),
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: isPressed ? 0.28 : 0.42),
+              blurRadius: isPressed ? 6 : 10,
+              offset: Offset(0, isPressed ? 2 : 5),
+            ),
+            BoxShadow(
+              color: _skin.joystickActiveBorder.withValues(
+                alpha: isPressed ? 0.15 : 0.08,
+              ),
+              blurRadius: 12,
+            ),
+          ],
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontSize: 15,
+            fontWeight: FontWeight.w800,
+            letterSpacing: 1.2,
+            color: _skin.barLabel.withValues(alpha: isPressed ? 0.95 : 0.88),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBarButton({required String label, required int button}) {
+    final isPressed = _inputState[button] == true;
+    final width = label.length <= 1 ? 56.0 : 72.0;
+
+    return GestureDetector(
+      onTapDown: (_) => _updateInput(button, true),
       onTapUp: (_) => _updateInput(button, false),
       onTapCancel: () => _updateInput(button, false),
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 50),
-        width: 72,
+        width: width,
         height: 24,
         alignment: Alignment.center,
         transform: Matrix4.translationValues(0, isPressed ? 1.5 : 0, 0),
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(12),
           color: isPressed
-              ? AppColors.surfaceContainerHighest
-              : AppColors.surfaceBright.withValues(alpha: 0.96),
+              ? _skin.barButtonPressed
+              : _skin.barButtonFill.withValues(alpha: 0.96),
           border: Border.all(
-            color: AppColors.onSurfaceVariant.withValues(
-              alpha: isPressed ? 0.28 : 0.14,
-            ),
+            color: _skin.barLabel.withValues(alpha: isPressed ? 0.28 : 0.14),
           ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: isPressed ? 0.22 : 0.32),
+              blurRadius: isPressed ? 4 : 6,
+              offset: Offset(0, isPressed ? 1 : 3),
+            ),
+          ],
         ),
         child: Text(
           label,
           style: TextStyle(
-            fontSize: 8,
-            fontFamily: 'JetBrains Mono',
+            fontSize: label.length <= 1 ? 11 : 8,
             fontWeight: FontWeight.w700,
-            color: AppColors.onSurface.withValues(alpha: 0.82),
-            letterSpacing: 0,
+            color: _skin.barLabel.withValues(alpha: 0.82),
           ),
         ),
       ),
@@ -295,9 +326,20 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
   }
 
   Widget _buildActionButtons() {
+    if (widget.layout.showFaceXY) {
+      return _buildFourFaceButtons();
+    }
+    return _buildTwoFaceButtons();
+  }
+
+  Widget _buildTwoFaceButtons() {
+    final size = widget.layout.compact ? 50.0 : 56.0;
+    final areaW = widget.layout.compact ? 104.0 : 118.0;
+    final areaH = widget.layout.compact ? 100.0 : 112.0;
+
     return SizedBox(
-      width: 118,
-      height: 112,
+      width: areaW,
+      height: areaH,
       child: Stack(
         children: [
           Positioned(
@@ -306,9 +348,7 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
             child: _buildActionButton(
               label: 'B',
               button: RETRO_DEVICE_ID_JOYPAD_B,
-              baseColor: AppColors.secondary,
-              darkColor: AppColors.secondaryContainer,
-              textColor: AppColors.onSecondary,
+              diameter: size,
             ),
           ),
           Positioned(
@@ -317,9 +357,57 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
             child: _buildActionButton(
               label: 'A',
               button: RETRO_DEVICE_ID_JOYPAD_A,
-              baseColor: AppColors.primary,
-              darkColor: AppColors.primaryContainer,
-              textColor: AppColors.onPrimary,
+              diameter: size,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFourFaceButtons() {
+    final size = widget.layout.compact ? 46.0 : 52.0;
+    final area = widget.layout.compact ? 120.0 : 132.0;
+
+    return SizedBox(
+      width: area,
+      height: area,
+      child: Stack(
+        children: [
+          Positioned(
+            top: 0,
+            left: area / 2 - size / 2,
+            child: _buildActionButton(
+              label: 'Y',
+              button: RETRO_DEVICE_ID_JOYPAD_Y,
+              diameter: size,
+            ),
+          ),
+          Positioned(
+            left: 0,
+            top: area / 2 - size / 2,
+            child: _buildActionButton(
+              label: 'X',
+              button: RETRO_DEVICE_ID_JOYPAD_X,
+              diameter: size,
+            ),
+          ),
+          Positioned(
+            right: 0,
+            top: area / 2 - size / 2,
+            child: _buildActionButton(
+              label: 'A',
+              button: RETRO_DEVICE_ID_JOYPAD_A,
+              diameter: size,
+            ),
+          ),
+          Positioned(
+            bottom: 0,
+            left: area / 2 - size / 2,
+            child: _buildActionButton(
+              label: 'B',
+              button: RETRO_DEVICE_ID_JOYPAD_B,
+              diameter: size,
             ),
           ),
         ],
@@ -330,26 +418,26 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
   Widget _buildActionButton({
     required String label,
     required int button,
-    required Color baseColor,
-    required Color darkColor,
-    required Color textColor,
+    required double diameter,
   }) {
     final isPressed = _inputState[button] == true;
+    final baseColor = _skin.faceButtonColor(label);
+    final darkColor = _skin.faceButtonDark(label);
+    final textColor = _skin.faceButtonText(label);
+    final fontSize = widget.layout.compact ? 18.0 : 21.0;
 
     return GestureDetector(
-      onTapDown: (_) {
-        _updateInput(button, true);
-      },
+      onTapDown: (_) => _updateInput(button, true),
       onTapUp: (_) => _updateInput(button, false),
       onTapCancel: () => _updateInput(button, false),
       child: SizedBox(
-        width: 56,
-        height: 60,
+        width: diameter,
+        height: diameter + 4,
         child: Transform.translate(
           offset: Offset(0, isPressed ? 2 : 0),
           child: Container(
-            width: 56,
-            height: 56,
+            width: diameter,
+            height: diameter,
             alignment: Alignment.center,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
@@ -365,7 +453,6 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
               ),
               border: Border.all(
                 color: Colors.white.withValues(alpha: 0.20),
-                width: 1,
               ),
               boxShadow: [
                 BoxShadow(
@@ -376,18 +463,15 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
                 BoxShadow(
                   color: baseColor.withValues(alpha: isPressed ? 0.12 : 0.20),
                   blurRadius: isPressed ? 8 : 14,
-                  spreadRadius: 0,
                 ),
               ],
             ),
             child: Text(
               label,
               style: TextStyle(
-                fontSize: 21,
-                fontFamily: 'Space Mono',
+                fontSize: fontSize,
                 fontWeight: FontWeight.w800,
                 color: textColor.withValues(alpha: 0.96),
-                letterSpacing: 0,
                 shadows: [
                   Shadow(
                     color: Colors.black.withValues(alpha: 0.22),

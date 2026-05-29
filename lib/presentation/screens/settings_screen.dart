@@ -1,8 +1,12 @@
 import 'package:flutter/material.dart';
 
 import '../theme/app_theme.dart';
+import '../widgets/immersive_scroll_page.dart';
 import '../../core/network/lan_service.dart';
 import '../../core/settings/app_settings_service.dart';
+import '../gamepad/gamepad_layout.dart';
+import '../screens/skin_management_screen.dart';
+import '../gamepad/gamepad_skin.dart';
 import '../../core/storage/storage_paths_service.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -58,17 +62,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      extendBodyBehindAppBar: true,
-      appBar: AppBar(title: const Text('设置')),
-      body: ListView(
-        padding: EdgeInsets.fromLTRB(
-          16,
-          MediaQuery.paddingOf(context).top + kToolbarHeight + 16,
-          16,
-          16,
-        ),
-        children: [
+    final bottomInset = kBottomNavigationBarHeight +
+        MediaQuery.paddingOf(context).bottom +
+        16;
+
+    return ImmersiveScrollPage(
+      title: '设置',
+      slivers: [
+        SliverPadding(
+          padding: EdgeInsets.fromLTRB(16, 8, 16, bottomInset),
+          sliver: SliverList(
+            delegate: SliverChildListDelegate([
           _buildSectionHeader(context, '模拟器设置'),
           _buildSettingsCard(
             children: [
@@ -91,6 +95,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
               _buildAspectRatioTile(),
               _buildDivider(),
               _buildBrightnessTile(),
+              _buildDivider(),
+              _buildGamepadSkinManagementTile(),
+              _buildDivider(),
+              _buildGamepadLayoutTile(),
               _buildDivider(),
               _buildStaticTile(
                 icon: Icons.bluetooth,
@@ -167,8 +175,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ],
           ),
           const SizedBox(height: 32),
-        ],
-      ),
+            ]),
+          ),
+        ),
+      ],
     );
   }
 
@@ -237,43 +247,172 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  Widget _buildDropdownSettingTile({
+    required IconData icon,
+    required String title,
+    required String value,
+    required String subtitle,
+    required List<DropdownMenuItem<String>> items,
+    required ValueChanged<String?> onChanged,
+  }) {
+    return ListTile(
+      leading: Icon(icon, color: AppColors.onSurfaceVariant, size: 22),
+      title: Text(title, style: const TextStyle(fontSize: 14)),
+      subtitle: Text(
+        subtitle,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(fontSize: 12, color: AppColors.onSurfaceVariant),
+      ),
+      trailing: DropdownButtonHideUnderline(
+        child: ButtonTheme(
+          alignedDropdown: true,
+          padding: EdgeInsets.zero,
+          child: DropdownButton<String>(
+            value: value,
+            isDense: true,
+            dropdownColor: AppColors.surfaceContainerHigh,
+            style: const TextStyle(fontSize: 14, color: AppColors.onSurface),
+            icon: const Icon(Icons.arrow_drop_down, size: 22),
+            items: items,
+            onChanged: onChanged,
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildAspectRatioTile() {
+    return _buildDropdownSettingTile(
+      icon: Icons.aspect_ratio,
+      title: '画面比例',
+      value: _settings.displayAspectRatio,
+      subtitle: _aspectRatioLabel(_settings.displayAspectRatio),
+      items: const [
+        DropdownMenuItem(
+          value: AppSettingsService.aspectOriginal,
+          child: Text('原始 3:2'),
+        ),
+        DropdownMenuItem(
+          value: AppSettingsService.aspectFourThree,
+          child: Text('4:3'),
+        ),
+        DropdownMenuItem(
+          value: AppSettingsService.aspectStretch,
+          child: Text('填满窗口'),
+        ),
+      ],
+      onChanged: (value) {
+        if (value != null) {
+          _settings.setDisplayAspectRatio(value);
+        }
+      },
+    );
+  }
+
+  String _activeSkinLabel() {
+    return GamepadSkins.byId(_settings.gamepadSkinId).name;
+  }
+
+  Widget _buildGamepadSkinManagementTile() {
     return ListTile(
       leading: const Icon(
-        Icons.aspect_ratio,
+        Icons.palette_outlined,
         color: AppColors.onSurfaceVariant,
         size: 22,
       ),
-      title: const Text('画面比例', style: TextStyle(fontSize: 14)),
+      title: const Text('皮肤管理', style: TextStyle(fontSize: 14)),
       subtitle: Text(
-        _aspectRatioLabel(_settings.displayAspectRatio),
+        '当前：${_activeSkinLabel()}',
         style: TextStyle(fontSize: 12, color: AppColors.onSurfaceVariant),
       ),
-      trailing: DropdownButton<String>(
-        value: _settings.displayAspectRatio,
-        underline: const SizedBox.shrink(),
-        dropdownColor: AppColors.surfaceContainerHigh,
-        items: const [
-          DropdownMenuItem(
-            value: AppSettingsService.aspectOriginal,
-            child: Text('原始'),
+      trailing: const Icon(Icons.chevron_right),
+      onTap: () {
+        Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => const SkinManagementScreen(),
           ),
-          DropdownMenuItem(
-            value: AppSettingsService.aspectFourThree,
-            child: Text('4:3'),
-          ),
-          DropdownMenuItem(
-            value: AppSettingsService.aspectStretch,
-            child: Text('填充'),
-          ),
-        ],
-        onChanged: (value) {
-          if (value != null) {
-            _settings.setDisplayAspectRatio(value);
-          }
-        },
-      ),
+        );
+      },
     );
+  }
+
+  Widget _buildGamepadLayoutTile() {
+    final layoutId = _settings.gamepadLayoutId;
+    final value = layoutId.isEmpty
+        ? AppSettingsService.gamepadLayoutAuto
+        : layoutId;
+
+    const autoValue = AppSettingsService.gamepadLayoutAuto;
+    final menuItems = <DropdownMenuItem<String>>[
+      const DropdownMenuItem(value: autoValue, child: Text('自动')),
+      for (final layout in GamepadLayouts.all)
+        DropdownMenuItem(
+          value: layout.id,
+          child: Text(_gamepadLayoutShortLabel(layout.id)),
+        ),
+    ];
+
+    return _buildDropdownSettingTile(
+      icon: Icons.gamepad_outlined,
+      title: '按键布局',
+      value: value,
+      subtitle: _gamepadLayoutSubtitle(layoutId),
+      items: menuItems,
+      onChanged: (picked) {
+        if (picked == null) return;
+        _settings.setGamepadLayoutId(picked == autoValue ? '' : picked);
+      },
+    );
+  }
+
+  String _gamepadLayoutSubtitle(String layoutId) {
+    if (layoutId.isEmpty) {
+      return '按游戏类型自动匹配';
+    }
+    return _gamepadLayoutMenuHint(layoutId);
+  }
+
+  /// Short label for closed dropdown + menu row (keeps width tight).
+  String _gamepadLayoutShortLabel(String layoutId) {
+    if (layoutId.isEmpty) {
+      return '自动';
+    }
+    switch (layoutId) {
+      case 'gb':
+        return 'GB / GBC';
+      case 'gba':
+        return 'GBA';
+      case 'gba_full':
+        return 'GBA 肩键';
+      case 'nes':
+        return 'NES';
+      case 'snes':
+        return 'SNES';
+      case 'minimal':
+        return '精简';
+      default:
+        return GamepadLayouts.byId(layoutId).name;
+    }
+  }
+
+  String _gamepadLayoutMenuHint(String layoutId) {
+    final layout = GamepadLayouts.byId(layoutId);
+    switch (layoutId) {
+      case 'gb':
+        return 'GB / GBC · 十字键 + A/B';
+      case 'gba':
+      case 'gba_full':
+        return 'GBA · 含 L/R 肩键';
+      case 'nes':
+        return 'NES · 十字键 + A/B';
+      case 'snes':
+        return 'SNES · 含 X/Y 与肩键';
+      case 'minimal':
+        return '精简 · 无 Select/Start';
+      default:
+        return layout.name;
+    }
   }
 
   Widget _buildBrightnessTile() {

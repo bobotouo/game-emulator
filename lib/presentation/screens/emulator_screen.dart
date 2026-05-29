@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../theme/app_theme.dart';
 import '../theme/system_ui.dart';
+import '../gamepad/gamepad_layout.dart';
+import '../gamepad/gamepad_skin.dart';
 import '../widgets/virtual_gamepad.dart';
 import '../../core/libretro/emulator_core_resolver.dart';
 import '../../core/game_texture/game_texture_controller.dart';
@@ -29,7 +31,7 @@ class EmulatorScreen extends StatefulWidget {
 class _EmulatorScreenState extends State<EmulatorScreen> {
   // Emulator service
   final EmulatorService _emulatorService = EmulatorService();
-  final AudioOutputService _audioOutputService = AudioOutputService();
+  final AudioOutputService _audioOutputService = AudioOutputService.instance;
   final AppSettingsService _settings = AppSettingsService.instance;
 
   // Frame buffer manager
@@ -63,6 +65,8 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   // Input state
   final Map<int, bool> _inputState = {};
 
+  bool _sessionEnded = false;
+
   @override
   void initState() {
     super.initState();
@@ -90,18 +94,47 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     _initializeEmulator();
   }
 
+  void _cancelSessionTimers() {
+    _fpsTimer?.cancel();
+    _fpsTimer = null;
+    _audioDrainTimer?.cancel();
+    _audioDrainTimer = null;
+    _rumblePollTimer?.cancel();
+    _rumblePollTimer = null;
+  }
+
+  /// Stop timers → emulation → audio (order matters for SoLoud / AAudio).
+  Future<void> _endSession({bool autoSave = true}) async {
+    if (_sessionEnded) return;
+    _sessionEnded = true;
+
+    _cancelSessionTimers();
+    _emulatorService.pause();
+
+    if (autoSave) {
+      await _emulatorService.autoSave();
+    }
+
+    _emulatorService.stop();
+    emu_loop.flushAudioRing();
+    await _audioOutputService.stop();
+  }
+
   @override
   void dispose() {
-    _fpsTimer?.cancel();
-    _audioDrainTimer?.cancel();
-    _rumblePollTimer?.cancel();
+    _cancelSessionTimers();
     _fps.dispose();
     _emulatorService.core?.unbindDisplayBuffer();
     _frameBufferManager.disposeBuffer();
-    _gameTexture.dispose();
-    _restorePortraitMode();
+    unawaited(_gameTexture.dispose());
+    unawaited(_restorePortraitMode());
     _settings.removeListener(_syncSettings);
-    _audioOutputService.dispose();
+    if (!_sessionEnded) {
+      _emulatorService.pause();
+      _emulatorService.stop();
+      emu_loop.flushAudioRing();
+      unawaited(_audioOutputService.stop());
+    }
     _emulatorService.dispose();
     super.dispose();
   }
@@ -177,9 +210,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
 
       final coreRate = _emulatorService.core?.sampleRate ?? 0.0;
       final reported = Platform.isIOS ? emu_loop.getReportedSampleRate() : coreRate;
-      if (Platform.isIOS) {
-        emu_loop.flushAudioRing();
-      }
+      emu_loop.flushAudioRing();
       final audioRate = Platform.isIOS
           ? (reported > 0 ? reported : 32768.0).clamp(8000.0, 192000.0)
           : (coreRate > 0 ? coreRate : 32768.0);
@@ -280,10 +311,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   }
 
   Future<void> _exitGame() async {
-    _emulatorService.pause();
-    _emulatorService.setAudioCallback(null);
-    await _audioOutputService.stop();
-    await _emulatorService.autoSaveAndStop();
+    await _endSession();
     if (mounted) {
       Navigator.of(context).pop();
     }
@@ -365,21 +393,50 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     );
   }
 
+  GamepadLayout get _gamepadLayout {
+    final id = _settings.gamepadLayoutId;
+    if (id.isNotEmpty) {
+      return GamepadLayouts.byId(id);
+    }
+    return GamepadLayouts.forSystem(_coreConfig.system);
+  }
+
+  GamepadSkin get _gamepadSkin => GamepadSkins.byId(_settings.gamepadSkinId);
+
+  Widget _buildGamepad({bool overlay = false, bool landscape = false}) {
+    return VirtualGamepad(
+      overlay: overlay,
+      skin: _gamepadSkin,
+      layout: _gamepadLayout,
+      onInputUpdate: _onInputUpdate,
+    );
+  }
+
   Widget _buildPortraitBody() {
     final topInset = MediaQuery.paddingOf(context).top;
 
-    return Column(
-      children: [
-        _buildTopBar(context, topInset: topInset),
-        Expanded(
-          child: _isLoading
-              ? _buildLoadingScreen()
-              : _errorMessage != null
-              ? _buildErrorScreen()
-              : _buildGameScreen(),
-        ),
-        if (_isRunning) VirtualGamepad(onInputUpdate: _onInputUpdate),
-      ],
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final controlHeight = (constraints.maxHeight * 0.40).clamp(220.0, 340.0);
+
+        return Column(
+          children: [
+            _buildTopBar(context, topInset: topInset),
+            Expanded(
+              child: _isLoading
+                  ? _buildLoadingScreen()
+                  : _errorMessage != null
+                  ? _buildErrorScreen()
+                  : _buildPortraitGameArea(),
+            ),
+            if (_isRunning)
+              SizedBox(
+                height: controlHeight,
+                child: _buildGamepad(),
+              ),
+          ],
+        );
+      },
     );
   }
 
@@ -408,10 +465,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
               left: 0,
               right: 0,
               bottom: 0,
-              child: VirtualGamepad(
-                overlay: true,
-                onInputUpdate: _onInputUpdate,
-              ),
+              child: _buildGamepad(overlay: true, landscape: true),
             ),
           Positioned(
             left: 0,
@@ -652,43 +706,86 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     );
   }
 
-  Widget _buildGameScreen() {
-    final display = _isDisplayStretched
-        ? Positioned.fill(child: _buildDisplay())
-        : Positioned.fill(child: Center(child: _buildDisplay()));
+  Widget _buildPortraitGameArea() {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        const horizontalPad = 4.0;
+        final maxWidth = constraints.maxWidth - horizontalPad * 2;
+        final maxHeight = constraints.maxHeight;
 
-    return Container(
-      margin: const EdgeInsets.all(16),
+        if (_isDisplayStretched) {
+          return Padding(
+            padding: const EdgeInsets.symmetric(horizontal: horizontalPad),
+            child: _buildGameFrame(
+              child: _buildGameViewportStack(
+                onFullscreen: _enterFullscreen,
+              ),
+            ),
+          );
+        }
+
+        final aspectRatio = _targetAspectRatio;
+        final availableRatio = maxWidth / maxHeight;
+        final displayWidth = availableRatio > aspectRatio
+            ? maxHeight * aspectRatio
+            : maxWidth;
+        final displayHeight = availableRatio > aspectRatio
+            ? maxHeight
+            : maxWidth / aspectRatio;
+
+        return Center(
+          child: SizedBox(
+            width: displayWidth,
+            height: displayHeight,
+            child: _buildGameFrame(
+              child: _buildGameViewportStack(
+                onFullscreen: _enterFullscreen,
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildGameViewportStack({VoidCallback? onFullscreen}) {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        const ColoredBox(color: Colors.black),
+        _buildDisplay(),
+        Positioned(top: 6, right: 6, child: _buildFpsBadge()),
+        if (onFullscreen != null)
+          Positioned(
+            right: 8,
+            bottom: 8,
+            child: _buildTransparentIconButton(
+              icon: Icons.fullscreen,
+              tooltip: '全屏',
+              onPressed: onFullscreen,
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildGameFrame({required Widget child}) {
+    return DecoratedBox(
       decoration: BoxDecoration(
-        color: Colors.black,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: AppColors.outlineVariant, width: 2),
+        color: AppColors.background,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColors.outlineVariant, width: 1.5),
         boxShadow: [
           BoxShadow(
-            color: AppColors.primary.withValues(alpha: 0.2),
-            blurRadius: 20,
-            spreadRadius: 2,
+            color: AppColors.primary.withValues(alpha: 0.16),
+            blurRadius: 14,
+            spreadRadius: 1,
           ),
         ],
       ),
       child: ClipRRect(
-        borderRadius: BorderRadius.circular(14),
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            display,
-            Positioned(top: 6, right: 6, child: _buildFpsBadge()),
-            Positioned(
-              right: 8,
-              bottom: 8,
-              child: _buildTransparentIconButton(
-                icon: Icons.fullscreen,
-                tooltip: '全屏',
-                onPressed: _enterFullscreen,
-              ),
-            ),
-          ],
-        ),
+        borderRadius: BorderRadius.circular(10.5),
+        child: child,
       ),
     );
   }
