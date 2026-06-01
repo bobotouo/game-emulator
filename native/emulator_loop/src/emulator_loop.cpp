@@ -22,6 +22,20 @@ static void AudioLog(const char* fmt, ...) {
 #define _RETRO_ENV_GET_SAVE_DIRECTORY  31
 #define _RETRO_ENV_SET_SYSTEM_AV_INFO  14
 #define _RETRO_ENV_GET_TARGET_SAMPLE_RATE 67
+#define _RETRO_ENV_SET_CONTROLLER_INFO 35
+#define _RETRO_ENV_GET_INPUT_BITMASKS 51
+
+#define RETRO_DEVICE_ID_JOYPAD_MASK 256
+
+struct retro_controller_description {
+  const char* desc;
+  unsigned id;
+};
+
+struct retro_controller_info {
+  const retro_controller_description* types;
+  unsigned num_types;
+};
 
 struct retro_system_timing {
   double fps;
@@ -58,6 +72,7 @@ static std::atomic<int32_t> gAudioW{0};
 static std::atomic<int32_t> gAudioTarget{0};
 static std::atomic<unsigned> gTargetSampleRate{48000};
 static std::atomic<double> gReportedSampleRate{48000.0};
+static std::atomic<unsigned> gControllerPortCount{0};
 
 static void AudioWrite(const int16_t* src, int32_t n) {
   if (n <= 0) return;
@@ -76,8 +91,8 @@ static void AudioWrite(const int16_t* src, int32_t n) {
   gAudioW.store((w + n) % kAudioRing, std::memory_order_release);
 }
 
-// ── Input bitmask ─────────────────────────────────────────────────────────
-static std::atomic<uint64_t> gInputMask{0};
+// ── Input bitmask (per libretro port, up to 4 players) ───────────────────
+static std::atomic<uint64_t> gInputMaskByPort[4] = {};
 
 // ── Frame counter ─────────────────────────────────────────────────────────
 static std::atomic<uint64_t> gFrameCount{0};
@@ -291,8 +306,16 @@ static void C_InputPoll(void) {}
 
 static int16_t C_InputState(unsigned port, unsigned /*device*/,
                               unsigned /*index*/, unsigned id) {
-  if (port != 0 || id >= 64) return 0;
-  return (gInputMask.load(std::memory_order_relaxed) >> id) & 1 ? 1 : 0;
+  if (port >= 4) return 0;
+
+  const uint64_t mask = gInputMaskByPort[port].load(std::memory_order_relaxed);
+
+  if (id == RETRO_DEVICE_ID_JOYPAD_MASK) {
+    return static_cast<int16_t>(mask & 0xFFFF);
+  }
+
+  if (id >= 64) return 0;
+  return ((mask >> id) & 1) ? 1 : 0;
 }
 
 static bool C_SetRumbleState(unsigned port, unsigned effect, uint16_t strength) {
@@ -357,6 +380,23 @@ static unsigned C_Environment(unsigned cmd, void* data) {
     }
     return 0;
   }
+  if (cmd == _RETRO_ENV_SET_CONTROLLER_INFO) {
+    if (data) {
+      const auto* ports = static_cast<const retro_controller_info*>(data);
+      unsigned count = 0;
+      while (ports[count].types != nullptr) {
+        count++;
+      }
+      if (count > 0) {
+        gControllerPortCount.store(count, std::memory_order_release);
+      }
+      return 1;
+    }
+    return 0;
+  }
+  if (cmd == _RETRO_ENV_GET_INPUT_BITMASKS) {
+    return 1;
+  }
   return 0;
 }
 
@@ -375,17 +415,29 @@ void emulator_loop_set_pixel_format(int32_t format) {
 }
 
 void emulator_loop_set_input_bit(int32_t btn_id, bool pressed) {
-  if (btn_id < 0 || btn_id >= 64) return;
-  uint64_t mask = uint64_t(1) << btn_id;
+  emulator_loop_set_input_bit_for_port(0, btn_id, pressed);
+}
+
+void emulator_loop_set_input_bit_for_port(unsigned port, int32_t btn_id,
+                                          bool pressed) {
+  if (port >= 4 || btn_id < 0 || btn_id >= 64) return;
+  const uint64_t mask = uint64_t(1) << btn_id;
   if (pressed) {
-    gInputMask.fetch_or(mask,  std::memory_order_relaxed);
+    gInputMaskByPort[port].fetch_or(mask, std::memory_order_relaxed);
   } else {
-    gInputMask.fetch_and(~mask, std::memory_order_relaxed);
+    gInputMaskByPort[port].fetch_and(~mask, std::memory_order_relaxed);
   }
 }
 
+void emulator_loop_set_port_input_mask(unsigned port, uint64_t mask) {
+  if (port >= 4) return;
+  gInputMaskByPort[port].store(mask, std::memory_order_relaxed);
+}
+
 void emulator_loop_clear_inputs(void) {
-  gInputMask.store(0, std::memory_order_relaxed);
+  for (unsigned port = 0; port < 4; ++port) {
+    gInputMaskByPort[port].store(0, std::memory_order_relaxed);
+  }
 }
 
 int32_t emulator_loop_audio_available(void) {
@@ -482,6 +534,14 @@ double emulator_loop_prepare_audio_output_rate(double preferred_hz) {
 
 double emulator_loop_get_reported_sample_rate(void) {
   return gReportedSampleRate.load(std::memory_order_acquire);
+}
+
+void emulator_loop_reset_controller_ports(void) {
+  gControllerPortCount.store(0, std::memory_order_release);
+}
+
+unsigned emulator_loop_get_controller_ports(void) {
+  return gControllerPortCount.load(std::memory_order_acquire);
 }
 
 } // extern "C"

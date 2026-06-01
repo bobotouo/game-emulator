@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import '../theme/app_theme.dart';
@@ -40,7 +41,6 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
   void dispose() {
     _gamesSubscription?.cancel();
     _searchController.dispose();
-    _libraryService.dispose();
     super.dispose();
   }
 
@@ -85,6 +85,12 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
   }
 
   Future<void> _launchGame(GameRom game) async {
+    final quickPath = game.path;
+    if (File(quickPath).existsSync()) {
+      _openEmulator(quickPath, game.id);
+      return;
+    }
+
     final romPath = await _libraryService.resolvePlayableRomPath(
       game.path,
       md5: game.md5,
@@ -101,24 +107,29 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
       return;
     }
 
-    // Update last played
-    await _libraryService.updateLastPlayed(game.id);
+    _openEmulator(romPath, game.id);
+  }
 
-    // Navigate to emulator screen
-    if (mounted) {
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (context) =>
-              EmulatorScreen(romPath: romPath, gameId: game.id),
-        ),
-      ).then((_) {
-        // Refresh game list when returning
+  void _openEmulator(String romPath, String gameId) {
+    if (!mounted) {
+      return;
+    }
+
+    unawaited(_libraryService.updateLastPlayed(gameId));
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) =>
+            EmulatorScreen(romPath: romPath, gameId: gameId),
+      ),
+    ).then((_) {
+      if (mounted) {
         setState(() {
           _games = _libraryService.games;
         });
-      });
-    }
+      }
+    });
   }
 
   Future<void> _removeGame(GameRom game) async {

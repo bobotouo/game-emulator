@@ -7,6 +7,7 @@ import 'package:path_provider/path_provider.dart';
 import '../emulator_loop/emulator_loop_ffi.dart' as emu_loop;
 import 'emulator_core_resolver.dart';
 import 'libretro_core.dart';
+import 'libretro_session_lock.dart';
 
 /// Generates thumbnail images for ROMs by running the emulator briefly.
 class ThumbnailGenerator {
@@ -16,6 +17,19 @@ class ThumbnailGenerator {
     String romPath,
     String gameId,
   ) async {
+    return LibretroSessionLock.runExclusive(() async {
+      return _generateThumbnailLocked(romPath, gameId);
+    });
+  }
+
+  static Future<String?> _generateThumbnailLocked(
+    String romPath,
+    String gameId,
+  ) async {
+    while (emu_loop.isLoopRunning()) {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+
     try {
       print('Generating thumbnail for: $romPath');
 

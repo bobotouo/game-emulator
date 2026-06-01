@@ -6,6 +6,7 @@ import '../storage/storage_paths_service.dart';
 import '../audio/audio_debug.dart';
 import '../emulator_loop/emulator_loop_ffi.dart' as emu_loop;
 import 'libretro_core.dart';
+import 'libretro_session_lock.dart';
 
 /// Emulator service managing the core lifecycle
 class EmulatorService {
@@ -33,6 +34,14 @@ class EmulatorService {
   int get speed => _speed;
   int get baseWidth => _core?.baseWidth ?? 240;
   int get baseHeight => _core?.baseHeight ?? 160;
+  double get coreAspectRatio {
+    final ratio = _core?.geometryAspectRatio ?? 0;
+    if (ratio > 0) {
+      return ratio;
+    }
+    final h = baseHeight;
+    return h > 0 ? baseWidth / h : 4 / 3;
+  }
   String? get currentRomPath => _currentRomPath;
   LibretroCore? get core => _core;
 
@@ -46,59 +55,78 @@ class EmulatorService {
   }
 
   /// Initialize the emulator with a core file
+  /// Initialize the emulator with a core file (prefer [loadAndStart] with [corePath]).
   Future<bool> initialize(String corePath) async {
     _core = LibretroCore();
     return _core!.initialize(corePath);
   }
 
-  /// Load and start a ROM, restoring auto-save if present.
+  /// Load and start a ROM, optionally restoring auto-save if present.
   Future<bool> loadAndStart(
     String romPath, {
+    String? corePath,
     String? gameId,
     bool startLoop = true,
+    bool restoreSaveState = true,
   }) async {
-    if (_core == null) return false;
+    return LibretroSessionLock.runExclusive(() async {
+      if (_core == null) {
+        if (corePath == null) {
+          return false;
+        }
+        _core = LibretroCore();
+        if (!_core!.initialize(corePath)) {
+          return false;
+        }
+      }
 
-    await _core!.prepareSaveDirectory();
-    if (Platform.isIOS) {
-      final deviceHz = emu_loop.prepareAudioOutputRate(48000);
-      // mGBA libretro has mAudioResampler — resample inside the core to device rate.
-      final targetHz = deviceHz.round().clamp(8000, 192000);
-      emu_loop.setTargetSampleRate(targetHz);
-      logAudio('before loadGame: device=$deviceHz Hz mGBA_target=$targetHz (core resamples)');
-    }
-    final success = _core!.loadGame(romPath);
-    if (!success) return false;
+      await _core!.prepareSaveDirectory();
+      if (Platform.isIOS) {
+        final deviceHz = emu_loop.prepareAudioOutputRate(48000);
+        final targetHz = deviceHz.round().clamp(8000, 192000);
+        emu_loop.setTargetSampleRate(targetHz);
+        logAudio(
+          'before loadGame: device=$deviceHz Hz mGBA_target=$targetHz (core resamples)',
+        );
+      }
+      final success = _core!.loadGame(romPath);
+      if (!success) {
+        return false;
+      }
 
-    logAudio(
-      'after loadGame: core.sampleRate=${_core!.sampleRate} '
-      'reported=${emu_loop.getReportedSampleRate()} fps=${_core!.fps}',
-    );
+      logAudio(
+        'after loadGame: core.sampleRate=${_core!.sampleRate} '
+        'reported=${emu_loop.getReportedSampleRate()} fps=${_core!.fps}',
+      );
 
-    _currentRomPath = romPath;
-    _currentGameId = gameId;
-    _lastSaveState = null;
+      _currentRomPath = romPath;
+      _currentGameId = gameId;
+      _lastSaveState = null;
 
-    final restored = await _restoreSaveStateFromDisk();
-    debugPrint(
-      restored
-          ? 'Save state restored for $romPath'
-          : 'No save state restored for $romPath (gameId=$gameId)',
-    );
+      final restored = restoreSaveState
+          ? await _restoreSaveStateFromDisk()
+          : false;
+      debugPrint(
+        restored
+            ? 'Save state restored for $romPath'
+            : 'No save state restored for $romPath (gameId=$gameId)',
+      );
 
-    // Warm up on a native thread — never call retro_run on the Dart isolate.
-    final runPtr = _core!.retroRunPtr;
-    if (!restored) {
-      emu_loop.runSyncFrames(runPtr, 2);
-    } else {
-      emu_loop.runSyncFrames(runPtr, 1);
-    }
+      final runPtr = _core!.retroRunPtr;
+      if (!restored) {
+        emu_loop.runSyncFrames(runPtr, 2);
+      } else {
+        emu_loop.runSyncFrames(runPtr, 1);
+      }
 
-    if (startLoop) {
-      startGameLoop();
-    }
-    return true;
+      if (startLoop) {
+        startGameLoop();
+      }
+      return true;
+    });
   }
+
+  int get controllerPortCount => emu_loop.getControllerPortCount();
 
   /// Load from bytes and start
   Future<bool> loadFromBytesAndStart(Uint8List romBytes, String? path) async {
@@ -181,8 +209,9 @@ class EmulatorService {
     _core?.reset();
   }
 
-  /// Save state to disk.
-  Future<Uint8List?> saveState() async {
+  /// Save emulator state. Netplay should pass [persistToDisk: false] so room
+  /// session progress never overwrites the local single-player save file.
+  Future<Uint8List?> saveState({bool persistToDisk = true}) async {
     final state = _core?.saveState();
     if (state == null) {
       debugPrint('saveState: core returned null');
@@ -190,6 +219,10 @@ class EmulatorService {
     }
 
     _lastSaveState = state;
+
+    if (!persistToDisk) {
+      return state;
+    }
 
     final romPath = _currentRomPath;
     if (romPath != null) {
@@ -321,7 +354,14 @@ class EmulatorService {
   /// Dispose resources
   void dispose() {
     stop();
-    _core?.dispose();
+    final core = _core;
     _core = null;
+    if (core != null) {
+      unawaited(
+        LibretroSessionLock.runExclusive(() async {
+          core.dispose();
+        }),
+      );
+    }
   }
 }

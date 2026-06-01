@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -14,9 +16,15 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   AppSystemUi.apply();
   await AppSettingsService.instance.init();
-  await StoragePathsService.ensureStorageAccess();
-  await AudioOutputService.warmUpEngine();
   runApp(const ProviderScope(child: GBAEmulatorApp()));
+  unawaited(_bootstrapInBackground());
+}
+
+/// Heavy work after UI is up — avoids blocking first frame (white screen).
+Future<void> _bootstrapInBackground() async {
+  await Future<void>.delayed(Duration.zero);
+  unawaited(AudioOutputService.warmUpEngine());
+  await StoragePathsService.ensureStorageAccess();
 }
 
 class GBAEmulatorApp extends StatelessWidget {
@@ -43,19 +51,19 @@ class MainScreen extends StatefulWidget {
 class _MainScreenState extends State<MainScreen> {
   int _currentIndex = 0;
 
-  final List<Widget> _screens = [
-    const GameLibraryScreen(),
-    const MultiplayerLobbyScreen(),
-    const SettingsScreen(),
-  ];
-
   @override
   Widget build(BuildContext context) {
+    final screens = [
+      const GameLibraryScreen(),
+      MultiplayerLobbyScreen(isActive: _currentIndex == 1),
+      const SettingsScreen(),
+    ];
+
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: AppSystemUi.overlayStyle,
       child: Scaffold(
         backgroundColor: AppColors.background,
-        body: IndexedStack(index: _currentIndex, children: _screens),
+        body: IndexedStack(index: _currentIndex, children: screens),
         bottomNavigationBar: BottomNavigationBar(
           currentIndex: _currentIndex,
           onTap: (index) {

@@ -24,6 +24,7 @@ class LibretroCore {
   String _coreVersion = '';
   int _baseWidth = 240;
   int _baseHeight = 160;
+  double _geometryAspectRatio = 4 / 3;
   double _fps = 60.0;
   double _sampleRate = 32768.0;
 
@@ -42,6 +43,7 @@ class LibretroCore {
   String get coreVersion => _coreVersion;
   int get baseWidth => _baseWidth;
   int get baseHeight => _baseHeight;
+  double get geometryAspectRatio => _geometryAspectRatio;
   double get fps => _fps;
   double get sampleRate => _sampleRate;
   bool get isInitialized => _initialized;
@@ -110,6 +112,10 @@ class LibretroCore {
     _bindings.retroGetSystemAvInfo(avInfo);
     _baseWidth = avInfo.ref.geometry.base_width;
     _baseHeight = avInfo.ref.geometry.base_height;
+    _geometryAspectRatio = avInfo.ref.geometry.aspect_ratio;
+    if (_geometryAspectRatio <= 0 && _baseHeight > 0) {
+      _geometryAspectRatio = _baseWidth / _baseHeight;
+    }
     _fps = avInfo.ref.timing.fps;
     _sampleRate = avInfo.ref.timing.sample_rate;
     calloc.free(avInfo);
@@ -160,6 +166,8 @@ class LibretroCore {
   bool loadGameFromBytes(Uint8List romBytes, String? path) {
     if (!_initialized) return false;
 
+    emu_loop.resetControllerPortCount();
+
     final gameInfo = calloc<retro_game_info>();
     Pointer<Utf8>? pathNative;
 
@@ -191,9 +199,31 @@ class LibretroCore {
     // Query AV info after game is loaded
     if (result) {
       _queryAvInfo();
+      _configureJoypadPorts();
     }
 
     return result;
+  }
+
+  /// Enable a libretro joypad on the given port (0 = P1, 1 = P2, …).
+  void enableJoypadPort(int port) {
+    if (!_initialized || !_gameLoaded) {
+      return;
+    }
+    _bindings.retroSetControllerPortDevice(
+      port,
+      port == 1 ? RETRO_DEVICE_GAMEPAD : RETRO_DEVICE_JOYPAD,
+    );
+  }
+
+  /// fceumm needs port 1 as RETRO_DEVICE_GAMEPAD (513) for 2P co-op.
+  void configureMultiplayerJoypads() {
+    enableJoypadPort(0);
+    enableJoypadPort(1);
+  }
+
+  void _configureJoypadPorts() {
+    configureMultiplayerJoypads();
   }
 
   /// Run one frame

@@ -243,18 +243,9 @@ class _GBADisplayState extends State<GBADisplay> {
       ),
     );
 
-    final scaled = widget.stretch
-        ? FittedBox(fit: BoxFit.fill, child: nativeView)
-        : FittedBox(fit: BoxFit.contain, child: nativeView);
+    final scaled = FittedBox(fit: BoxFit.fill, child: nativeView);
 
-    if (widget.stretch) {
-      return SizedBox.expand(child: scaled);
-    }
-
-    return AspectRatio(
-      aspectRatio: widget.displayAspectRatio ?? widget.width / widget.height,
-      child: scaled,
-    );
+    return SizedBox.expand(child: scaled);
   }
 }
 
@@ -344,17 +335,8 @@ class NativeGameDisplay extends StatelessWidget {
 
     final nativeView = SizedBox(width: gameSize.width, height: gameSize.height, child: view);
 
-    final scaled = stretch
-        ? FittedBox(fit: BoxFit.fill, child: nativeView)
-        : FittedBox(fit: BoxFit.contain, child: nativeView);
+    final scaled = FittedBox(fit: BoxFit.fill, child: nativeView);
 
-    if (stretch) {
-      return SizedBox.expand(child: scaled);
-    }
-
-    return AspectRatio(
-      aspectRatio: displayAspectRatio ?? width / height,
-      child: scaled,
-    );
+    return SizedBox.expand(child: scaled);
   }
 }

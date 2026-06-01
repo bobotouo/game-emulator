@@ -62,25 +62,27 @@ void game_texture_android_upload(const uint8_t* src, int32_t width, int32_t heig
     return;
   }
 
-  std::lock_guard<std::mutex> lock(g_mutex);
-  ANativeWindow* window = g_window;
-  if (window == nullptr) {
-    return;
-  }
-
-  if (g_width != width || g_height != height) {
-    if (ANativeWindow_setBuffersGeometry(window, width, height,
-                                         WINDOW_FORMAT_RGBA_8888) != 0) {
-      LOGE("setBuffersGeometry failed");
+  ANativeWindow* window = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_window == nullptr) {
       return;
     }
-    g_width = width;
-    g_height = height;
+    window = g_window;
+    ANativeWindow_acquire(window);
+  }
+
+  if (ANativeWindow_setBuffersGeometry(window, width, height,
+                                       WINDOW_FORMAT_RGBA_8888) != 0) {
+    LOGE("setBuffersGeometry failed");
+    ANativeWindow_release(window);
+    return;
   }
 
   ANativeWindow_Buffer buffer{};
   if (ANativeWindow_lock(window, &buffer, nullptr) != 0) {
     LOGE("ANativeWindow_lock failed");
+    ANativeWindow_release(window);
     return;
   }
 
@@ -97,6 +99,7 @@ void game_texture_android_upload(const uint8_t* src, int32_t width, int32_t heig
   }
 
   ANativeWindow_unlockAndPost(window);
+  ANativeWindow_release(window);
   NotifyFrameLocked();
 }
 

@@ -128,11 +128,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
               _buildDivider(),
               _buildStaticTile(
                 icon: Icons.settings_ethernet,
-                title: '端口',
-                subtitle: '${_settings.networkPort}',
+                title: '联机端口 (TCP)',
+                subtitle:
+                    '${_settings.networkPort} · 发现 UDP ${_settings.networkPort + 1}',
                 trailing: IconButton(
                   icon: const Icon(Icons.edit, size: 18),
-                  tooltip: '修改端口',
+                  tooltip: '修改 TCP 端口',
                   color: AppColors.onSurfaceVariant,
                   onPressed: _editPort,
                 ),
@@ -464,12 +465,25 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final result = await showDialog<int>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('端口'),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          keyboardType: TextInputType.number,
-          decoration: const InputDecoration(hintText: '1024 - 65535'),
+        title: const Text('联机端口 (TCP)'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: controller,
+              autofocus: true,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(hintText: '1024 - 65535'),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              '房间发现会自动使用 UDP 端口 = TCP + 1',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: AppColors.onSurfaceVariant,
+                  ),
+            ),
+          ],
         ),
         actions: [
           TextButton(

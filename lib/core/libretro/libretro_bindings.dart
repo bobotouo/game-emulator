@@ -10,8 +10,11 @@ const int RETRO_PIXEL_FORMAT_XRGB8888 = 1;
 const int RETRO_PIXEL_FORMAT_RGB565 = 2;
 
 // Input device types
-const int RETRO_DEVICE_JOYPAD = 0;
+const int RETRO_DEVICE_NONE = 0;
+const int RETRO_DEVICE_JOYPAD = 1;
 const int RETRO_DEVICE_ANALOG = 5;
+// fceumm: port 2 must be RETRO_DEVICE_GAMEPAD (513), not plain JOYPAD/NONE.
+const int RETRO_DEVICE_GAMEPAD = ((1 + 1) << 8) | RETRO_DEVICE_JOYPAD;
 
 // Joypad buttons
 const int RETRO_DEVICE_ID_JOYPAD_B = 0;
@@ -26,6 +29,7 @@ const int RETRO_DEVICE_ID_JOYPAD_A = 8;
 const int RETRO_DEVICE_ID_JOYPAD_X = 9;
 const int RETRO_DEVICE_ID_JOYPAD_L = 10;
 const int RETRO_DEVICE_ID_JOYPAD_R = 11;
+const int RETRO_DEVICE_ID_JOYPAD_MASK = 256;
 
 // Environment commands
 const int RETRO_ENVIRONMENT_SET_PIXEL_FORMAT = 10;

@@ -23,6 +23,25 @@ void setSaveDirectory(String path) {
   }
 }
 
+typedef _ResetPortsNative = Void Function();
+typedef _ResetPortsDart = void Function();
+final _resetControllerPorts =
+    emuLoopLib.lookupFunction<_ResetPortsNative, _ResetPortsDart>(
+      'emulator_loop_reset_controller_ports',
+    );
+
+typedef _GetPortsNative = Uint32 Function();
+typedef _GetPortsDart = int Function();
+final _getControllerPorts =
+    emuLoopLib.lookupFunction<_GetPortsNative, _GetPortsDart>(
+      'emulator_loop_get_controller_ports',
+    );
+
+void resetControllerPortCount() => _resetControllerPorts();
+
+/// Joypad ports reported by the core after [retro_load_game] (0 if unknown).
+int getControllerPortCount() => _getControllerPorts();
+
 /// Native library (same binary as game_texture on both platforms).
 final DynamicLibrary emuLoopLib = () {
   if (Platform.isAndroid) return DynamicLibrary.open('libgame_texture.so');
@@ -154,6 +173,20 @@ final setInputBit =
 final clearInputs =
     emuLoopLib.lookupFunction<_VoidNative, _VoidDart>(
       'emulator_loop_clear_inputs',
+    );
+
+typedef _SetPortInputNative = Void Function(Uint32, Uint64);
+typedef _SetPortInputDart = void Function(int, int);
+final setPortInputMask =
+    emuLoopLib.lookupFunction<_SetPortInputNative, _SetPortInputDart>(
+      'emulator_loop_set_port_input_mask',
+    );
+
+typedef _SetInputForPortNative = Void Function(Uint32, Int32, Bool);
+typedef _SetInputForPortDart = void Function(int, int, bool);
+final setInputBitForPort =
+    emuLoopLib.lookupFunction<_SetInputForPortNative, _SetInputForPortDart>(
+      'emulator_loop_set_input_bit_for_port',
     );
 
 // ── Audio ring buffer ──────────────────────────────────────────────────────

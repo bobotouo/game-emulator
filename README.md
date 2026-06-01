@@ -10,12 +10,8 @@
 
 | 平台 | 状态 | 说明 |
 |------|------|------|
-| **Android** | ✅ 已验证 | 当前主要开发与测试平台，真机可正常游玩 |
-| **iOS** | 即将支持 | 待实机验证 |
-| **macOS** | 📋 计划中 | Flutter 桌面端适配 |
-| **Windows** | 📋 计划中 | Flutter 桌面端适配 |
-
-> **验证说明：** 截至当前版本，功能仅在 **Android 真机** 上完成完整测试（ROM 加载、画面、音频、存档、变速等）。其他平台代码可编译，但尚未完成系统级验证。
+| **Android** |
+| **iOS** | 
 
 ---
 
@@ -26,39 +22,31 @@
 | 模块 | 说明 |
 |------|------|
 | **模拟器核心** | 按 ROM 后缀自动选择核心：`.gba`/`.gb`/`.gbc` → mGBA；`.nes`/`.fds` 等 → FCEUmm |
-| **支持格式** | `.gba` `.gb` `.gbc` `.nes` `.fds` `.unf` `.unif` |
-| **画面渲染** | Impeller 片元着色器（`FragmentProgram`）+ 同步像素解码，GPU 直绘 |
-| **音频** | `flutter_soloud` 低延迟 PCM 流输出，支持倍速同步播放 |
 | **虚拟手柄** | 触控按键映射，支持触觉反馈与 libretro 震动回调 |
 | **自动存档** | 退出自动保存、进入自动读取；Android 公共目录 / iOS Documents |
-| **游戏库** | ROM 导入、缩略图生成、搜索分类、**MD5 去重** |
+| **游戏库** | ROM 导入、缩略图生成、搜索分类|
 | **变速齿轮** | 1x ~ 5x 快进，音画同步加速 |
-| **设置** | 画面比例、亮度、触觉反馈、存档路径展示、网络端口 |
-| **UI** | 游戏库、模拟器、设置、联机大厅与对战房间页面骨架 |
 
 ### 进行中 / 部分完成
 
 | 模块 | 说明 |
 |------|------|
-| **局域网联机** | mDNS 发现、房间 UI 已有，核心同步逻辑待完善 |
+| **局域网联机** | FC/NES 已实现局域网联机|
 | **性能优化** | 持续调优渲染与音频缓冲，降低发热 |
-| **NES 实机验证** | FCEUmm 核心集成完成，待 Android 真机测试 |
 
 ### 尚未实现
 
 - 蓝牙 / MFi 外接手柄
 - 金手指（Cheats）
 - 手动多档位存档槽
-- 联机输入与状态同步
-- GB / GBC 专属 UI 与调色板选项
 - 画面滤镜（扫描线、CRT、像素平滑等 Shader 扩展）
 - 街机（Arcade）与其他 libretro 核心
-
+- GBA 掌机的联机对战
 ---
 
 ## 未来计划
 
-1. **联机对战** — 完善 UDP/TCP 帧同步与延迟补偿
+1. **联机对战** — 完善 GBA和街机的联机
 2. **外设支持** — 蓝牙手柄、键盘映射
 3. **增强体验** — 金手指、作弊码、ROM 信息展示
 4. **画面增强** — Shader 滤镜链（HQ2X / Scanlines / Color correction）
@@ -125,12 +113,9 @@ iOS 需在 Xcode 中将 `Frameworks` 下的 dylib 设为 **Embed & Sign**。
 
 ## 技术栈
 
-- **UI 框架：** Flutter 3.x（Impeller）
-- **状态管理：** Riverpod
-- **模拟核心：** [mGBA](https://github.com/mgba-emu/mgba)（GBA/GB/GBC）、[FCEUmm](https://github.com/libretro/libretro-fceumm)（NES/FC）
-- **音频：** [flutter_soloud](https://pub.dev/packages/flutter_soloud)
-- **网络：** multicast_dns、network_info_plus
-
+- **模拟核心：** 
+[mGBA](https://github.com/mgba-emu/mgba)（GBA/GB/GBC）
+[FCEUmm](https://github.com/libretro/libretro-fceumm)（NES/FC）
 ---
 
 ## 快速开始
@@ -153,7 +138,6 @@ flutter run
 - **[mGBA](https://mgba.io/)** — GBA / GB / GBC 模拟核心（MPL 2.0）
 - **[FCEUmm](https://github.com/libretro/libretro-fceumm)** — FC / NES 模拟核心（GPL-2.0）
 - **[libretro](https://www.libretro.com/)** — 统一的模拟器 API 规范
-- **[Flutter](https://flutter.dev/)** — 跨平台 UI 与 Impeller 渲染引擎
 - 以及其他开源依赖的作者与社区贡献者
 
 ---

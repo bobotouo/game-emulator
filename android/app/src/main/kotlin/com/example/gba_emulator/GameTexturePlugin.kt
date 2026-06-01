@@ -23,6 +23,8 @@ class GameTexturePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     private var channel: MethodChannel? = null
     private var textureRegistry: TextureRegistry? = null
     private val entries = mutableMapOf<Long, TextureRegistry.SurfaceProducer>()
+    /** Texture id that currently owns the native ANativeWindow (global in C++). */
+    private var surfaceOwnerId: Long? = null
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         textureRegistry = binding.textureRegistry
@@ -34,7 +36,10 @@ class GameTexturePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         channel?.setMethodCallHandler(null)
         channel = null
         for ((_, producer) in entries) {
-            nativeClearSurface()
+            if (surfaceOwnerId != null) {
+                nativeClearSurface()
+                surfaceOwnerId = null
+            }
             producer.release()
         }
         entries.clear()
@@ -57,24 +62,29 @@ class GameTexturePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 }
                 val producer = registry.createSurfaceProducer()
                 producer.setSize(width, height)
+                val id = producer.id()
                 producer.setCallback(
                     object : TextureRegistry.SurfaceProducer.Callback {
                         override fun onSurfaceAvailable() {
                             val surface: Surface? = producer.surface
                             nativeSetSurface(surface)
+                            surfaceOwnerId = id
                         }
 
                         override fun onSurfaceDestroyed() {
-                            nativeClearSurface()
+                            if (surfaceOwnerId == id) {
+                                nativeClearSurface()
+                                surfaceOwnerId = null
+                            }
                         }
                     },
                 )
-                val id = producer.id()
                 entries[id] = producer
                 activeProducer = producer
                 val surface: Surface? = producer.surface
                 if (surface != null) {
                     nativeSetSurface(surface)
+                    surfaceOwnerId = id
                 }
                 result.success(id)
             }
@@ -87,7 +97,10 @@ class GameTexturePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 }
                 val producer = entries.remove(id)
                 if (producer != null) {
-                    nativeClearSurface()
+                    if (surfaceOwnerId == id) {
+                        nativeClearSurface()
+                        surfaceOwnerId = null
+                    }
                     producer.release()
                     if (activeProducer === producer) {
                         activeProducer = null

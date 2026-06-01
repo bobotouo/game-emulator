@@ -73,28 +73,61 @@ class GameRom {
   );
 }
 
-/// Game library service for managing ROM files
+/// Game library service for managing ROM files.
+///
+/// Shared singleton — home library and netplay must see the same ROM list.
 class GameLibraryService {
+  GameLibraryService._();
+  static final GameLibraryService instance = GameLibraryService._();
+  factory GameLibraryService() => instance;
+
   static const String _storageKey = 'game_library';
   List<GameRom> _games = [];
   final _gamesController = StreamController<List<GameRom>>.broadcast();
   Future<void> _thumbnailQueue = Future.value();
+  Future<void>? _initFuture;
+  bool _hydrated = false;
+  bool _maintenanceStarted = false;
 
   List<GameRom> get games => List.unmodifiable(_games);
   Stream<List<GameRom>> get gamesStream => _gamesController.stream;
 
-  /// Initialize and load saved games
-  Future<void> init() async {
-    await _loadGames();
+  /// Initialize and load saved games.
+  Future<void> init({bool refreshThumbnails = true}) {
+    return _initFuture ??= _initImpl(refreshThumbnails).whenComplete(() {
+      _initFuture = null;
+    });
+  }
+
+  Future<void> _initImpl(bool refreshThumbnails) async {
+    if (!_hydrated) {
+      await _loadGames();
+      _hydrated = true;
+    }
+    _notifyGamesChanged();
+    _startDeferredMaintenance(refreshThumbnails);
+  }
+
+  void _startDeferredMaintenance(bool refreshThumbnails) {
+    if (_maintenanceStarted) {
+      return;
+    }
+    _maintenanceStarted = true;
+    unawaited(_runDeferredMaintenance(refreshThumbnails));
+  }
+
+  Future<void> _runDeferredMaintenance(bool refreshThumbnails) async {
     await _repairStoredRomPaths();
     await _backfillMissingMd5();
     final before = _games.length;
     _dedupeGames();
     if (_games.length != before) {
       await _saveGames();
+      _notifyGamesChanged();
     }
-    _notifyGamesChanged();
-    _refreshThumbnails();
+    if (refreshThumbnails) {
+      _refreshThumbnails();
+    }
   }
 
   /// Pick and add a ROM file
@@ -182,24 +215,18 @@ class GameLibraryService {
     _notifyGamesChanged();
   }
 
-  /// Update game last played time
+  /// Update game last played time (in-memory immediately, disk write in background).
   Future<void> updateLastPlayed(String gameId) async {
     final index = _games.indexWhere((g) => g.id == gameId);
     if (index >= 0) {
       final game = _games[index];
-      _games[index] = GameRom(
-        id: game.id,
-        name: game.name,
-        path: game.path,
-        extension: game.extension,
-        md5: game.md5,
-        thumbnailPath: game.thumbnailPath,
-        addedAt: game.addedAt,
+      _games[index] = _copyGame(
+        game,
         lastPlayedAt: DateTime.now(),
         playCount: game.playCount + 1,
       );
-      await _saveGames();
       _notifyGamesChanged();
+      unawaited(_saveGames());
     }
   }
 
@@ -210,6 +237,88 @@ class GameLibraryService {
     } catch (e) {
       return null;
     }
+  }
+
+  /// Find a library entry by ROM MD5 hash.
+  GameRom? findGameByMd5(String md5Hash) {
+    if (md5Hash.isEmpty) {
+      return null;
+    }
+    try {
+      return _games.firstWhere((g) => g.md5 == md5Hash);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Whether a playable ROM with the given MD5 exists locally.
+  Future<bool> hasLocalRom(String md5Hash) async {
+    final game = findGameByMd5(md5Hash);
+    if (game == null) {
+      return false;
+    }
+    return (await resolvePlayableRomPath(game.path, md5: md5Hash)) != null;
+  }
+
+  /// Save a received ROM into the library folder, replacing same-name files.
+  Future<AddGameResult?> importNetplayRom({
+    required List<int> bytes,
+    required String fileName,
+  }) async {
+    if (bytes.isEmpty) {
+      throw Exception('ROM 数据为空');
+    }
+
+    final romsDir = await StoragePathsService.getRomsDirectory();
+    final destPath = _netplayRomDestPath(romsDir.path, fileName);
+    await File(destPath).writeAsBytes(bytes, flush: true);
+
+    final destName = destPath.split(Platform.pathSeparator).last;
+    final existingIndex = _games.indexWhere((game) {
+      final name = game.path.split(Platform.pathSeparator).last;
+      return game.path == destPath || name == destName;
+    });
+    if (existingIndex >= 0) {
+      final md5Hash = await _computeFileMd5(destPath);
+      final duplicateByMd5 = await _findDuplicateByMd5(md5Hash);
+      final existing = _games[existingIndex];
+
+      if (duplicateByMd5 != null && duplicateByMd5.id != existing.id) {
+        _games.removeAt(existingIndex);
+        await _ensureGamePathPersisted(duplicateByMd5.id, destPath);
+        final updated = getGame(duplicateByMd5.id) ?? duplicateByMd5;
+        _notifyGamesChanged();
+        if (!_hasValidThumbnail(updated)) {
+          _queueGenerateThumbnail(updated);
+        }
+        return AddGameResult(game: updated, isDuplicate: true);
+      }
+
+      final updated = _copyGame(existing, path: destPath, md5: md5Hash);
+      _games[existingIndex] = updated;
+      await _saveGames();
+      _notifyGamesChanged();
+      _queueGenerateThumbnail(updated);
+      return AddGameResult(game: updated, isDuplicate: true);
+    }
+
+    return addGameFromPath(destPath);
+  }
+
+  String _netplayRomDestPath(String romsDirPath, String fileName) {
+    final safeName = _safeRomFileName(fileName.split(RegExp(r'[/\\]')).last);
+    var extension = '.${safeName.split('.').last.toLowerCase()}';
+    if (!supportedRomExtensions.contains(extension)) {
+      throw Exception('不支持的 ROM 格式: $extension');
+    }
+
+    var destName = safeName;
+    if (!destName.toLowerCase().endsWith(extension)) {
+      destName = '$destName$extension';
+    }
+
+    var destPath = '$romsDirPath/$destName';
+    return destPath;
   }
 
   /// Check if ROM file exists
@@ -223,12 +332,8 @@ class GameLibraryService {
       return path;
     }
 
-    if (!Platform.isIOS) {
-      return null;
-    }
-
     final resolved = await _findRomInLibrary(
-      fileName: path.split('/').last,
+      fileName: path.split(Platform.pathSeparator).last,
       md5: md5,
     );
     if (resolved == null) {
@@ -268,17 +373,7 @@ class GameLibraryService {
           continue;
         }
         final existingMd5 = await _computeFileMd5(game.path);
-        _games[i] = GameRom(
-          id: game.id,
-          name: game.name,
-          path: game.path,
-          extension: game.extension,
-          md5: existingMd5,
-          thumbnailPath: game.thumbnailPath,
-          addedAt: game.addedAt,
-          lastPlayedAt: game.lastPlayedAt,
-          playCount: game.playCount,
-        );
+        _games[i] = _copyGame(game, md5: existingMd5);
         if (existingMd5 == md5Hash) {
           await _saveGames();
           return _games[i];
@@ -303,17 +398,7 @@ class GameLibraryService {
           continue;
         }
         final hash = await _computeFileMd5(game.path);
-        _games[i] = GameRom(
-          id: game.id,
-          name: game.name,
-          path: game.path,
-          extension: game.extension,
-          md5: hash,
-          thumbnailPath: game.thumbnailPath,
-          addedAt: game.addedAt,
-          lastPlayedAt: game.lastPlayedAt,
-          playCount: game.playCount,
-        );
+        _games[i] = _copyGame(game, md5: hash);
         changed = true;
       } catch (_) {}
     }
@@ -350,17 +435,9 @@ class GameLibraryService {
       if (thumbnailPath != null) {
         final index = _games.indexWhere((g) => g.id == game.id);
         if (index >= 0) {
-          final current = _games[index];
-          _games[index] = GameRom(
-            id: current.id,
-            name: current.name,
-            path: current.path,
-            extension: current.extension,
-            md5: current.md5,
+          _games[index] = _copyGame(
+            _games[index],
             thumbnailPath: thumbnailPath,
-            addedAt: current.addedAt,
-            lastPlayedAt: current.lastPlayedAt,
-            playCount: current.playCount,
           );
           await _saveGames();
           _notifyGamesChanged();
@@ -501,17 +578,27 @@ class GameLibraryService {
     return null;
   }
 
-  GameRom _gameWithPath(GameRom game, String path) => GameRom(
-    id: game.id,
-    name: game.name,
-    path: path,
-    extension: game.extension,
-    md5: game.md5,
-    thumbnailPath: game.thumbnailPath,
-    addedAt: game.addedAt,
-    lastPlayedAt: game.lastPlayedAt,
-    playCount: game.playCount,
-  );
+  GameRom _copyGame(
+    GameRom game, {
+    String? path,
+    String? md5,
+    String? thumbnailPath,
+    DateTime? lastPlayedAt,
+    int? playCount,
+  }) =>
+      GameRom(
+        id: game.id,
+        name: game.name,
+        path: path ?? game.path,
+        extension: game.extension,
+        md5: md5 ?? game.md5,
+        thumbnailPath: thumbnailPath ?? game.thumbnailPath,
+        addedAt: game.addedAt,
+        lastPlayedAt: lastPlayedAt ?? game.lastPlayedAt,
+        playCount: playCount ?? game.playCount,
+      );
+
+  GameRom _gameWithPath(GameRom game, String path) => _copyGame(game, path: path);
 
   String _safeRomFileName(String fileName) {
     return fileName.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_').trim();

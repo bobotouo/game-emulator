@@ -7,7 +7,7 @@ allprojects {
     }
 }
 
-// Match app ndk.abiFilters — avoid building unused ABIs (pdfrx CMake on armeabi-v7a).
+// Match app ndk.abiFilters — avoid building unused ABIs.
 subprojects {
     afterEvaluate {
         extensions.findByType<LibraryExtension>()?.defaultConfig?.ndk?.apply {

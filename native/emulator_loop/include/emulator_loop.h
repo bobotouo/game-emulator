@@ -47,6 +47,9 @@ void emulator_loop_run_frames(emu_retro_run_t retro_run, uint32_t count);
 
 // ── Input (called from Dart on button events) ─────────────────────────────
 void emulator_loop_set_input_bit(int32_t btn_id, bool pressed);
+void emulator_loop_set_input_bit_for_port(unsigned port, int32_t btn_id,
+                                          bool pressed);
+void emulator_loop_set_port_input_mask(unsigned port, uint64_t mask);
 void emulator_loop_clear_inputs(void);
 
 // ── Audio ring buffer ───────────────────────────────────────────────────────
@@ -80,6 +83,10 @@ uint32_t emulator_loop_rumble_weak(void);
 
 // ── Save directory (set from Dart before retro_load_game) ─────────────────
 void emulator_loop_set_save_directory(const char* path);
+
+// ── Controller ports (from RETRO_ENVIRONMENT_SET_CONTROLLER_INFO) ─────────
+void emulator_loop_reset_controller_ports(void);
+unsigned emulator_loop_get_controller_ports(void);
 
 // ── Last rendered frame (valid after retro_run, read from Dart thread) ────
 // Returns RGBA8888 pointer; sets width/height via out-params.

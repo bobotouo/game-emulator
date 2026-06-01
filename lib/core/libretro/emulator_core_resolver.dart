@@ -44,7 +44,7 @@ class EmulatorCoreConfig {
 class EmulatorCoreResolver {
   EmulatorCoreResolver._();
 
-  static const nesExtensions = {'.nes', '.fds', '.unf', '.unif'};
+  static const nesExtensions = {'.nes', '.fc', '.fds', '.unf', '.unif'};
   static const gbaExtensions = {'.gba'};
   static const gbExtensions = {'.gb', '.gbc'};
 
@@ -81,8 +81,17 @@ class EmulatorCoreResolver {
     ...nesExtensions,
   ];
 
-  static EmulatorCoreConfig resolve(String romPath) {
-    final ext = _extensionOf(romPath);
+  static EmulatorCoreConfig resolve(
+    String romPath, {
+    String? fallbackExtension,
+  }) {
+    var ext = _extensionOf(romPath);
+    if (!_isKnownExtension(ext) && fallbackExtension != null) {
+      final normalized = fallbackExtension.trim().toLowerCase();
+      if (normalized.isNotEmpty) {
+        ext = normalized.startsWith('.') ? normalized : '.$normalized';
+      }
+    }
     if (nesExtensions.contains(ext)) {
       return _nes;
     }
@@ -92,8 +101,17 @@ class EmulatorCoreResolver {
     throw UnsupportedError('不支持的 ROM 格式: $ext');
   }
 
-  static Future<String?> resolveCorePath(String romPath) async {
-    final config = resolve(romPath);
+  static bool _isKnownExtension(String ext) {
+    return nesExtensions.contains(ext) ||
+        gbaExtensions.contains(ext) ||
+        gbExtensions.contains(ext);
+  }
+
+  static Future<String?> resolveCorePath(
+    String romPath, {
+    String? fallbackExtension,
+  }) async {
+    final config = resolve(romPath, fallbackExtension: fallbackExtension);
     return resolveCorePathForConfig(config);
   }
 
