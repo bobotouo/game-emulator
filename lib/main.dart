@@ -10,21 +10,20 @@ import 'presentation/screens/multiplayer_lobby_screen.dart';
 import 'presentation/screens/settings_screen.dart';
 import 'core/audio/audio_output_service.dart';
 import 'core/settings/app_settings_service.dart';
-import 'core/storage/storage_paths_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   AppSystemUi.apply();
   await AppSettingsService.instance.init();
   runApp(const ProviderScope(child: GBAEmulatorApp()));
-  unawaited(_bootstrapInBackground());
+  _bootstrapInBackground();
 }
 
 /// Heavy work after UI is up — avoids blocking first frame (white screen).
 Future<void> _bootstrapInBackground() async {
-  await Future<void>.delayed(Duration.zero);
-  unawaited(AudioOutputService.warmUpEngine());
-  await StoragePathsService.ensureStorageAccess();
+  WidgetsBinding.instance.addPostFrameCallback((timeStamp) {
+    unawaited(AudioOutputService.warmUpEngine());
+  });
 }
 
 class GBAEmulatorApp extends StatelessWidget {

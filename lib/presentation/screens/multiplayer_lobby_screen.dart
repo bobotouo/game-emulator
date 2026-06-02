@@ -785,6 +785,9 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
       case '.fc':
       case '.fds':
         return Icons.videogame_asset;
+      case '.zip':
+      case '.7z':
+        return Icons.sports_esports;
       default:
         return Icons.sports_esports_outlined;
     }

@@ -12,6 +12,7 @@ import '../../core/network/room_info.dart';
 import '../../core/settings/app_settings_service.dart';
 import '../../features/game_library/game_library_service.dart';
 import '../theme/app_theme.dart';
+import '../widgets/add_game_loading.dart';
 import '../widgets/game_card.dart';
 import 'netplay_emulator_screen.dart';
 
@@ -790,6 +791,35 @@ class _RoomScreenState extends State<RoomScreen> {
     }
   }
 
+  Future<void> _importRomForRoom() async {
+    try {
+      final result = await runWithAddGameLoading(
+        context,
+        (updateMessage) => _gameLibrary.addGame(onProgress: updateMessage),
+        initialMessage: '正在添加…',
+      );
+      if (!mounted || result == null) {
+        return;
+      }
+      setState(() {
+        _games = _gameLibrary.games;
+        _selectedGameIndex = _games.indexWhere((g) => g.id == result.game.id);
+        if (_selectedGameIndex < 0) {
+          _selectedGameIndex = _games.length - 1;
+        }
+      });
+      _showSnack(
+        result.isDuplicate
+            ? '该游戏已在库中: ${result.game.name}'
+            : '已添加: ${result.game.name}',
+      );
+    } catch (e) {
+      if (mounted) {
+        _showSnack('添加失败: $e');
+      }
+    }
+  }
+
   void _showSnack(String message) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(message)),
@@ -1026,13 +1056,29 @@ class _RoomScreenState extends State<RoomScreen> {
 
     if (_isRoomHost && _games.isEmpty) {
       return Padding(
-        padding: const EdgeInsets.all(32),
-        child: Text(
-          '游戏库为空，请先导入 ROM',
-          textAlign: TextAlign.center,
-          style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                color: AppColors.onSurfaceVariant,
-              ),
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          children: [
+            Text(
+              '游戏库为空',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '与游戏库相同：支持 GBA、FC/NES、街机 ROM（.zip/.7z 整包）',
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: AppColors.onSurfaceVariant,
+                  ),
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: _importRomForRoom,
+              icon: const Icon(Icons.add),
+              label: const Text('添加游戏'),
+            ),
+          ],
         ),
       );
     }

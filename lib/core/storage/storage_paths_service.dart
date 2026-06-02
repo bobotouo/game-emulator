@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -14,10 +15,18 @@ class StoragePathsService {
   static const appFolderName = 'GBAEmulator';
   static const savesFolderName = 'Saves';
   static const romsFolderName = 'ROMs';
+  static const systemFolderName = 'system';
   static const androidPublicRoot = '/storage/emulated/0/$appFolderName';
+
+  /// Bundled arcade BIOS copied into [getSystemDirectory] on first use.
+  static const bundledBiosAssets = [
+    'assets/bios/neogeo.zip',
+    'assets/bios/pgm.zip',
+  ];
 
   static Directory? _saveStatesDir;
   static Directory? _inGameSavesDir;
+  static Directory? _systemDir;
 
   /// Request Android storage permission needed for public folder access.
   static Future<bool> ensureStorageAccess() async {
@@ -66,6 +75,50 @@ class StoragePathsService {
       await dir.create(recursive: true);
     }
     return dir;
+  }
+
+  /// Libretro system directory (BIOS, neogeo.zip, etc.) for arcade cores.
+  static Future<Directory> getSystemDirectory() async {
+    if (_systemDir != null) {
+      return _systemDir!;
+    }
+
+    final root = await _getAccessibleRootDirectory();
+    final dir = Directory('${root.path}/$systemFolderName');
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    await _seedBundledBios(dir);
+    _systemDir = dir;
+    return dir;
+  }
+
+  /// Copy [bundledBiosAssets] into system dir if missing (does not overwrite).
+  static Future<void> _seedBundledBios(Directory systemDir) async {
+    for (final assetPath in bundledBiosAssets) {
+      final name = assetPath.split('/').last;
+      final dest = File('${systemDir.path}/$name');
+      if (await dest.exists()) continue;
+
+      try {
+        final data = await rootBundle.load(assetPath);
+        await dest.writeAsBytes(
+          data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+        );
+      } catch (_) {
+        // Asset not in build (e.g. omitted from pubspec); skip quietly.
+      }
+    }
+  }
+
+  /// Parent folder of [romPath], used as libretro content directory.
+  static Future<String> contentDirectoryForRom(String romPath) async {
+    final parent = Directory(romPath).parent;
+    if (await parent.exists()) {
+      return parent.path;
+    }
+    final roms = await getRomsDirectory();
+    return roms.path;
   }
 
   /// Directory for in-game saves (`.sav` files written by the game itself).

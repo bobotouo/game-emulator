@@ -1,6 +1,6 @@
 # Game Emulator
 
-基于 Flutter 与 libretro 核心的多系统模拟器，当前支持 **GBA / GB / GBC**（[mGBA](https://mgba.io/)）与 **FC / NES**（[FCEUmm](https://github.com/libretro/libretro-fceumm)），具备本地游戏库、自动存档、变速游玩与局域网联机骨架。
+基于 Flutter 与 libretro 核心的多系统模拟器，当前支持 **GBA / GB / GBC**（[mGBA](https://mgba.io/)）、**FC / NES**（[FCEUmm](https://github.com/libretro/libretro-fceumm)）与 **街机**（[FBNeo](https://github.com/finalburnneo/FBNeo) Libretro），具备本地游戏库、自动存档、变速游玩与局域网联机。
 
 ---
 
@@ -25,7 +25,7 @@
 
 | 模块 | 说明 |
 |------|------|
-| **模拟器核心** | 按 ROM 后缀自动选择核心：`.gba`/`.gb`/`.gbc` → mGBA；`.nes`/`.fds` 等 → FCEUmm |
+| **模拟器核心** | `.gba`/`.gb`/`.gbc` → mGBA；`.nes`/`.fds` 等 → FCEUmm；`.zip`/`.7z` → FBNeo |
 | **虚拟手柄** | 触控按键映射，支持触觉反馈与 libretro 震动回调 |
 | **自动存档** | 退出自动保存、进入自动读取；Android 公共目录 / iOS Documents |
 | **游戏库** | ROM 导入、缩略图生成、搜索分类|
@@ -35,7 +35,7 @@
 
 | 模块 | 说明 |
 |------|------|
-| **局域网联机** | FC/NES 已实现局域网联机|
+| **局域网联机** | FC/NES 与街机采用房主仲裁锁步 + 1 帧固定输入延迟 |
 | **性能优化** | 持续调优渲染与音频缓冲，降低发热 |
 
 ### 尚未实现
@@ -44,13 +44,12 @@
 - 金手指（Cheats）
 - 手动多档位存档槽
 - 画面滤镜（扫描线、CRT、像素平滑等 Shader 扩展）
-- 街机（Arcade）与其他 libretro 核心
 - GBA 掌机的联机对战
 ---
 
 ## 未来计划
 
-1. **联机对战** — 完善 GBA和街机的联机
+1. **联机对战** — 完善 GBA 联机
 2. **外设支持** — 蓝牙手柄、键盘映射
 3. **增强体验** — 金手指、作弊码、ROM 信息展示
 4. **画面增强** — Shader 滤镜链（HQ2X / Scanlines / Color correction）
@@ -77,11 +76,10 @@ lib/
 │   ├── screens/         # 各页面
 │   ├── widgets/         # 虚拟手柄、游戏卡片
 │   └── theme/           # 主题
-shaders/
-└── gba_display.frag     # 画面片元着色器
 scripts/
 ├── build_mgba_libretro.sh    # 编译 mGBA 核心
 ├── build_fceumm_libretro.sh  # 编译 FCEUmm 核心
+├── build_fbneo_libretro.sh   # 编译 FBNeo 街机核心
 └── build_all_cores.sh        # 一键编译全部核心
 ```
 
@@ -110,8 +108,22 @@ chmod +x scripts/*.sh
 |------|----------------|----------|
 | mGBA | `libmgba_libretro.so` | `mgba_libretro_ios.dylib` |
 | FCEUmm | `libfceumm_libretro.so` | `fceumm_libretro_ios.dylib` |
+| FBNeo | `libfbneo_libretro.so` | `fbneo_libretro_ios.dylib` |
+
+街机 ROM 请使用 `.zip` / `.7z` 整包导入。BIOS 可放在 `assets/bios/`（随应用打包，首次运行会复制到 `GBAEmulator/system/`），也可手动放入该 `system/` 目录。
 
 iOS 需在 Xcode 中将 `Frameworks` 下的 dylib 设为 **Embed & Sign**。
+
+### 局域网联机（Lockstep）
+
+FC/NES 与街机双人联机采用 **房主仲裁严格帧同步**：
+
+- 房主按帧号组包 `FRAME_BUNDLE`，双方在同一帧上调用 `retro_run`
+- 客人通过 `FRAME_INPUT` 上报按键（无帧号）；房主将输入写入 **当前模拟帧 + 1** 的调度表
+- 固定 **1 帧输入延迟**（约 16 ms @ 60 fps），给网络留出缓冲
+- 会话开始走 `LOCKSTEP_READY` / `LOCKSTEP_START` 握手
+
+GBA 联机尚未实现。
 
 ---
 
@@ -119,7 +131,8 @@ iOS 需在 Xcode 中将 `Frameworks` 下的 dylib 设为 **Embed & Sign**。
 
 - **模拟核心：** 
 [mGBA](https://github.com/mgba-emu/mgba)（GBA/GB/GBC）
-[FCEUmm](https://github.com/libretro/libretro-fceumm)（NES/FC）
+[FCEUmm](https://github.com/libretro/libretro-fceumm)（NES/FC）  
+[FBNeo](https://github.com/finalburnneo/FBNeo)（Arcade）
 ---
 
 ## 快速开始
@@ -141,6 +154,7 @@ flutter run
 
 - **[mGBA](https://mgba.io/)** — GBA / GB / GBC 模拟核心（MPL 2.0）
 - **[FCEUmm](https://github.com/libretro/libretro-fceumm)** — FC / NES 模拟核心（GPL-2.0）
+- **[FBNeo](https://github.com/finalburnneo/FBNeo)** — 街机模拟核心（GPL-2.0+）
 - **[libretro](https://www.libretro.com/)** — 统一的模拟器 API 规范
 - 以及其他开源依赖的作者与社区贡献者
 

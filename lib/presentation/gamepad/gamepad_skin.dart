@@ -23,6 +23,10 @@ class GamepadSkin {
     this.colorXDark = const Color(0xFF2B6CB0),
     this.colorY = const Color(0xFFFFB020),
     this.colorYDark = const Color(0xFFC77800),
+    this.colorC = const Color(0xFF43A047),
+    this.colorCDark = const Color(0xFF2E7D32),
+    this.colorD = const Color(0xFF1E88E5),
+    this.colorDDark = const Color(0xFF1565C0),
     this.colorShoulder = AppColors.surfaceContainerHigh,
     this.colorShoulderDark = AppColors.surfaceContainer,
     this.labelFontFamily,
@@ -47,6 +51,10 @@ class GamepadSkin {
   final Color colorXDark;
   final Color colorY;
   final Color colorYDark;
+  final Color colorC;
+  final Color colorCDark;
+  final Color colorD;
+  final Color colorDDark;
   final Color colorShoulder;
   final Color colorShoulderDark;
   final String? labelFontFamily;
@@ -62,6 +70,10 @@ class GamepadSkin {
         return colorX;
       case 'Y':
         return colorY;
+      case 'C':
+        return colorC;
+      case 'D':
+        return colorD;
       case 'L':
       case 'R':
         return colorShoulder;
@@ -80,6 +92,10 @@ class GamepadSkin {
         return colorXDark;
       case 'Y':
         return colorYDark;
+      case 'C':
+        return colorCDark;
+      case 'D':
+        return colorDDark;
       case 'L':
       case 'R':
         return colorShoulderDark;
@@ -91,7 +107,10 @@ class GamepadSkin {
   Color faceButtonText(String label) {
     switch (label) {
       case 'B':
-        return AppColors.onSecondary;
+        return const Color(0xFF1A1400);
+      case 'C':
+      case 'D':
+        return Colors.white;
       case 'L':
       case 'R':
         return AppColors.onSurface;

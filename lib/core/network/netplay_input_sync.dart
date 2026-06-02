@@ -18,13 +18,22 @@ int inputStateToMask(Map<int, bool> state) {
   return mask;
 }
 
+/// FC/NES and arcade use host-authoritative lockstep netplay.
 bool isHostAuthoritativeNetplayExtension(String? extension) {
   if (extension == null || extension.isEmpty) {
     return false;
   }
   final normalized =
       extension.startsWith('.') ? extension.toLowerCase() : '.${extension.toLowerCase()}';
-  return const {'.nes', '.fc', '.fds', '.unf', '.unif'}.contains(normalized);
+  return const {
+    '.nes',
+    '.fc',
+    '.fds',
+    '.unf',
+    '.unif',
+    '.zip',
+    '.7z',
+  }.contains(normalized);
 }
 
 String? netplayExtensionFromPath(String? path) {

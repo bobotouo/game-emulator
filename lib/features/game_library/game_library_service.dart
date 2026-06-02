@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
@@ -85,6 +86,9 @@ class GameLibraryService {
   List<GameRom> _games = [];
   final _gamesController = StreamController<List<GameRom>>.broadcast();
   Future<void> _thumbnailQueue = Future.value();
+  final Set<String> _cancelledThumbnailGameIds = {};
+  final Map<String, GameRom> _pendingThumbnails = {};
+  Timer? _thumbnailDrainTimer;
   Future<void>? _initFuture;
   bool _hydrated = false;
   bool _maintenanceStarted = false;
@@ -105,7 +109,9 @@ class GameLibraryService {
       _hydrated = true;
     }
     _notifyGamesChanged();
-    _startDeferredMaintenance(refreshThumbnails);
+    if (refreshThumbnails) {
+      _startDeferredMaintenance(refreshThumbnails);
+    }
   }
 
   void _startDeferredMaintenance(bool refreshThumbnails) {
@@ -130,8 +136,10 @@ class GameLibraryService {
     }
   }
 
-  /// Pick and add a ROM file
-  Future<AddGameResult?> addGame() async {
+  /// Pick and add a ROM file. [onProgress] updates status (e.g. arcade load verify).
+  Future<AddGameResult?> addGame({
+    void Function(String message)? onProgress,
+  }) async {
     try {
       // iOS cannot map .gba/.nes to stable UTIs (file_picker skips dyn.* types),
       // so use FileType.any and validate the extension in Dart instead.
@@ -152,7 +160,11 @@ class GameLibraryService {
         throw Exception('无法读取所选文件');
       }
 
-      return addGameFromPath(path);
+      return addGameFromPath(
+        path,
+        fallbackExtension: file.extension,
+        onProgress: onProgress,
+      );
     } catch (e) {
       print('Error adding game: $e');
       rethrow;
@@ -160,34 +172,55 @@ class GameLibraryService {
   }
 
   /// Add game from file path
-  Future<AddGameResult?> addGameFromPath(String path) async {
+  Future<AddGameResult?> addGameFromPath(
+    String path, {
+    String? fallbackExtension,
+    void Function(String message)? onProgress,
+  }) async {
     try {
-      path = await _persistImportedRom(path);
+      final sourcePath = path;
+      if (!await File(sourcePath).exists()) {
+        throw Exception('文件不存在: $sourcePath');
+      }
+
+      final extension = _extensionFromPath(sourcePath, fallbackExtension);
+      if (!EmulatorCoreResolver.isSupportedRomPath('game$extension')) {
+        throw Exception(
+          '不支持的文件格式: $extension。支持：${EmulatorCoreResolver.supportedFormatsHint}',
+        );
+      }
+
+      final isArcade = EmulatorCoreResolver.arcadeExtensions.contains(
+        extension,
+      );
+
+      onProgress?.call(isArcade ? '正在复制街机 ROM…' : '正在复制 ROM…');
+      path = await _persistImportedRom(sourcePath);
       final file = File(path);
       if (!await file.exists()) {
         throw Exception('文件不存在: $path');
       }
 
-      final extension = '.${path.split('.').last.toLowerCase()}';
-      if (!supportedRomExtensions.contains(extension)) {
-        throw Exception('不支持的文件格式: $extension');
-      }
-
+      onProgress?.call('正在校验文件…');
       final fileName = path.split('/').last;
       final name = _extractFileName(fileName);
       final md5Hash = await _computeFileMd5(path);
       final duplicate = await _findDuplicateByMd5(md5Hash);
+      final gameId =
+          duplicate?.id ?? DateTime.now().millisecondsSinceEpoch.toString();
+
       if (duplicate != null) {
         await _ensureGamePathPersisted(duplicate.id, path);
         final updated = getGame(duplicate.id) ?? duplicate;
         if (!_hasValidThumbnail(updated)) {
           _queueGenerateThumbnail(updated);
         }
+        _notifyGamesChanged();
         return AddGameResult(game: updated, isDuplicate: true);
       }
 
       final game = GameRom(
-        id: DateTime.now().millisecondsSinceEpoch.toString(),
+        id: gameId,
         name: name,
         path: path,
         extension: extension,
@@ -209,7 +242,10 @@ class GameLibraryService {
 
   /// Remove a game
   Future<void> removeGame(String gameId) async {
+    _cancelledThumbnailGameIds.add(gameId);
+    await _thumbnailQueue;
     await ThumbnailGenerator.deleteThumbnail(gameId);
+    _cancelledThumbnailGameIds.remove(gameId);
     _games.removeWhere((g) => g.id == gameId);
     await _saveGames();
     _notifyGamesChanged();
@@ -307,9 +343,11 @@ class GameLibraryService {
 
   String _netplayRomDestPath(String romsDirPath, String fileName) {
     final safeName = _safeRomFileName(fileName.split(RegExp(r'[/\\]')).last);
-    var extension = '.${safeName.split('.').last.toLowerCase()}';
-    if (!supportedRomExtensions.contains(extension)) {
-      throw Exception('不支持的 ROM 格式: $extension');
+    final extension = _extensionFromPath(safeName);
+    if (!EmulatorCoreResolver.isSupportedRomPath('game$extension')) {
+      throw Exception(
+        '不支持的 ROM 格式: $extension。支持：${EmulatorCoreResolver.supportedFormatsHint}',
+      );
     }
 
     var destName = safeName;
@@ -351,8 +389,10 @@ class GameLibraryService {
   }
 
   Future<String> _computeFileMd5(String path) async {
-    final digest = await md5.bind(File(path).openRead()).first;
-    return digest.toString();
+    return Isolate.run(() async {
+      final digest = await md5.bind(File(path).openRead()).first;
+      return digest.toString();
+    });
   }
 
   Future<GameRom?> _findDuplicateByMd5(String md5Hash) async {
@@ -426,11 +466,29 @@ class GameLibraryService {
   }
 
   Future<void> _generateThumbnail(GameRom game) async {
+    if (_cancelledThumbnailGameIds.contains(game.id)) {
+      return;
+    }
     try {
+      final cached = await ThumbnailGenerator.resolveCachedPath(game.id);
+      if (cached != null) {
+        final index = _games.indexWhere((g) => g.id == game.id);
+        if (index >= 0 && _games[index].thumbnailPath != cached) {
+          _games[index] = _copyGame(_games[index], thumbnailPath: cached);
+          await _saveGames();
+          _notifyGamesChanged();
+        }
+        return;
+      }
+
       final thumbnailPath = await ThumbnailGenerator.generateThumbnail(
         game.path,
         game.id,
       );
+
+      if (_cancelledThumbnailGameIds.contains(game.id)) {
+        return;
+      }
 
       if (thumbnailPath != null) {
         final index = _games.indexWhere((g) => g.id == game.id);
@@ -442,26 +500,28 @@ class GameLibraryService {
           await _saveGames();
           _notifyGamesChanged();
         }
+      } else {
+        print(
+          'Thumbnail not produced for ${game.name} (${game.path}); '
+          'will retry on next library refresh',
+        );
       }
     } catch (e) {
       print('Error generating thumbnail: $e');
     }
   }
 
-  /// On iOS, copy imports into Documents/ROMs (tmp/Inbox is cleared on restart).
+  /// Copy imports into permanent ROM storage when outside the library folder.
   Future<String> _persistImportedRom(String path) async {
-    if (!Platform.isIOS) {
+    final romsDir = await StoragePathsService.getRomsDirectory();
+    if (path.startsWith(romsDir.path)) {
       return path;
     }
     return _copyRomToLibrary(path);
   }
 
-  /// Fix library entries that still point at ephemeral iOS paths.
+  /// Fix library entries that still point outside permanent ROM storage.
   Future<void> _repairStoredRomPaths() async {
-    if (!Platform.isIOS) {
-      return;
-    }
-
     var changed = false;
     final romsDir = await StoragePathsService.getRomsDirectory();
 
@@ -497,11 +557,10 @@ class GameLibraryService {
     }
   }
 
-  Future<void> _ensureGamePathPersisted(String gameId, String sourcePath) async {
-    if (!Platform.isIOS) {
-      return;
-    }
-
+  Future<void> _ensureGamePathPersisted(
+    String gameId,
+    String sourcePath,
+  ) async {
     final index = _games.indexWhere((g) => g.id == gameId);
     if (index < 0 || !await File(sourcePath).exists()) {
       return;
@@ -585,20 +644,20 @@ class GameLibraryService {
     String? thumbnailPath,
     DateTime? lastPlayedAt,
     int? playCount,
-  }) =>
-      GameRom(
-        id: game.id,
-        name: game.name,
-        path: path ?? game.path,
-        extension: game.extension,
-        md5: md5 ?? game.md5,
-        thumbnailPath: thumbnailPath ?? game.thumbnailPath,
-        addedAt: game.addedAt,
-        lastPlayedAt: lastPlayedAt ?? game.lastPlayedAt,
-        playCount: playCount ?? game.playCount,
-      );
+  }) => GameRom(
+    id: game.id,
+    name: game.name,
+    path: path ?? game.path,
+    extension: game.extension,
+    md5: md5 ?? game.md5,
+    thumbnailPath: thumbnailPath ?? game.thumbnailPath,
+    addedAt: game.addedAt,
+    lastPlayedAt: lastPlayedAt ?? game.lastPlayedAt,
+    playCount: playCount ?? game.playCount,
+  );
 
-  GameRom _gameWithPath(GameRom game, String path) => _copyGame(game, path: path);
+  GameRom _gameWithPath(GameRom game, String path) =>
+      _copyGame(game, path: path);
 
   String _safeRomFileName(String fileName) {
     return fileName.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_').trim();
@@ -644,12 +703,67 @@ class GameLibraryService {
 
   void _refreshThumbnails() {
     for (final game in _games) {
+      if (_hasValidThumbnail(game)) {
+        continue;
+      }
       _queueGenerateThumbnail(game);
     }
   }
 
   void _queueGenerateThumbnail(GameRom game) {
-    _thumbnailQueue = _thumbnailQueue.then((_) => _generateThumbnail(game));
+    if (_hasValidThumbnail(game)) {
+      return;
+    }
+    _pendingThumbnails[game.id] = game;
+    _scheduleThumbnailDrain();
+  }
+
+  /// Coalesce rapid imports; process thumbnails one-by-one off the UI hot path.
+  void _scheduleThumbnailDrain() {
+    _thumbnailDrainTimer?.cancel();
+    _thumbnailDrainTimer = Timer(const Duration(milliseconds: 700), () {
+      _thumbnailDrainTimer = null;
+      _drainPendingThumbnails();
+    });
+  }
+
+  void _drainPendingThumbnails() {
+    if (_pendingThumbnails.isEmpty) {
+      return;
+    }
+    final batch = _pendingThumbnails.values.toList();
+    _pendingThumbnails.clear();
+
+    for (final game in batch) {
+      _thumbnailQueue = _thumbnailQueue.then((_) async {
+        if (_cancelledThumbnailGameIds.contains(game.id)) {
+          return;
+        }
+        if (getGame(game.id) == null) {
+          return;
+        }
+        if (_hasValidThumbnail(game)) {
+          return;
+        }
+        await _generateThumbnail(game);
+        await Future<void>.delayed(const Duration(milliseconds: 450));
+      });
+    }
+  }
+
+  String _extensionFromPath(String path, [String? fallbackExtension]) {
+    var ext = EmulatorCoreResolver.extensionFromPath(path);
+    if (EmulatorCoreResolver.isSupportedRomPath('game$ext')) {
+      return ext;
+    }
+    if (fallbackExtension != null && fallbackExtension.isNotEmpty) {
+      final normalized = fallbackExtension.trim().toLowerCase();
+      ext = normalized.startsWith('.') ? normalized : '.$normalized';
+      if (EmulatorCoreResolver.isSupportedRomPath('game$ext')) {
+        return ext;
+      }
+    }
+    return ext;
   }
 
   bool _hasValidThumbnail(GameRom game) {
@@ -658,6 +772,7 @@ class GameLibraryService {
   }
 
   void dispose() {
+    _thumbnailDrainTimer?.cancel();
     _gamesController.close();
   }
 }

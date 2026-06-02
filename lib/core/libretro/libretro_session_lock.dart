@@ -12,6 +12,9 @@ class LibretroSessionLock {
         completer.complete(await action());
       } catch (error, stackTrace) {
         completer.completeError(error, stackTrace);
+      } finally {
+        // Let libretro cores finish teardown before the next retro_init.
+        await Future<void>.delayed(const Duration(milliseconds: 200));
       }
     });
     return completer.future;

@@ -5,6 +5,7 @@ import 'package:ffi/ffi.dart';
 import '../storage/storage_paths_service.dart';
 import '../audio/audio_debug.dart';
 import '../emulator_loop/emulator_loop_ffi.dart' as emu_loop;
+import 'emulator_core_resolver.dart';
 import 'libretro_bindings.dart';
 
 /// Callback types kept for API compatibility; no longer used in hot path.
@@ -38,6 +39,11 @@ class LibretroCore {
 
   Pointer<Utf8>? _saveDirectoryNative;
 
+  /// FBNeo path-only loads keep [retro_game_info.path] for the whole session.
+  Pointer<Utf8>? _romPathNative;
+
+  EmulatorCoreConfig? _activeConfig;
+
   /// Get core info
   String get coreName => _coreName;
   String get coreVersion => _coreVersion;
@@ -52,6 +58,10 @@ class LibretroCore {
   /// Native function pointer for retro_run – passed to the native game loop.
   Pointer<NativeFunction<retro_run_native>> get retroRunPtr =>
       _bindings.retroRunPtr;
+
+  LibretroBindings get bindings => _bindings;
+
+  int get serializeStateSize => _bindings.retroSerializeSize();
 
   /// Replace all hot-path libretro callbacks with pure-C implementations that
   /// are safe to call from a non-Dart thread. Call this AFTER retro_load_game.
@@ -139,15 +149,40 @@ class LibretroCore {
     _framebuffer = calloc.allocate<Uint8>(_framebufferSize);
   }
 
-  /// Load a ROM file
-  bool loadGame(String romPath) {
+  /// Load a ROM file using [config] (path-only for arcade / FBNeo).
+  bool loadGame(String romPath, {required EmulatorCoreConfig config}) {
     if (!_initialized) return false;
 
     final file = File(romPath);
     if (!file.existsSync()) return false;
 
+    _activeConfig = config;
+    if (config.loadViaPathOnly) {
+      return loadGameFromBytes(Uint8List(0), romPath, config: config);
+    }
+
     final romBytes = file.readAsBytesSync();
-    return loadGameFromBytes(romBytes, romPath);
+    return loadGameFromBytes(romBytes, romPath, config: config);
+  }
+
+  /// Prepare libretro directories before [retro_load_game].
+  Future<void> prepareForGame(
+    String romPath,
+    EmulatorCoreConfig config,
+  ) async {
+    _activeConfig = config;
+    final saveDir = await StoragePathsService.getInGameSavesDirectory();
+    if (_saveDirectoryNative != null) {
+      malloc.free(_saveDirectoryNative!);
+    }
+    _saveDirectoryNative = saveDir.path.toNativeUtf8();
+    emu_loop.setSaveDirectory(saveDir.path);
+
+    final systemDir = await StoragePathsService.getSystemDirectory();
+    emu_loop.setSystemDirectory(systemDir.path);
+
+    final contentDir = await StoragePathsService.contentDirectoryForRom(romPath);
+    emu_loop.setContentDirectory(contentDir);
   }
 
   /// Prepare save directory path for libretro cores (battery saves).
@@ -157,49 +192,74 @@ class LibretroCore {
       malloc.free(_saveDirectoryNative!);
     }
     _saveDirectoryNative = dir.path.toNativeUtf8();
-    // Also pass the path to the C environment callback handler so it can
-    // respond to RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY from any thread.
     emu_loop.setSaveDirectory(dir.path);
   }
 
-  /// Load ROM from bytes
-  bool loadGameFromBytes(Uint8List romBytes, String? path) {
+  void _releaseRomPathNative() {
+    if (_romPathNative != null) {
+      malloc.free(_romPathNative!);
+      _romPathNative = null;
+    }
+  }
+
+  /// Load ROM from bytes (or path-only when [config.loadViaPathOnly]).
+  bool loadGameFromBytes(
+    Uint8List romBytes,
+    String? path, {
+    EmulatorCoreConfig? config,
+  }) {
     if (!_initialized) return false;
+
+    final active = config ?? _activeConfig;
+    final pathOnly = active?.loadViaPathOnly ?? false;
 
     emu_loop.resetControllerPortCount();
 
     final gameInfo = calloc<retro_game_info>();
     Pointer<Utf8>? pathNative;
+    Pointer<Uint8>? romData;
 
-    if (path != null) {
+    if (pathOnly && path != null) {
+      _releaseRomPathNative();
+      pathNative = path.toNativeUtf8();
+      _romPathNative = pathNative;
+      gameInfo.ref.path = pathNative;
+    } else if (path != null) {
       pathNative = path.toNativeUtf8();
       gameInfo.ref.path = pathNative;
     } else {
       gameInfo.ref.path = nullptr;
     }
 
-    // Allocate memory for ROM data
-    final romData = calloc.allocate<Uint8>(romBytes.length);
-    romData.asTypedList(romBytes.length).setAll(0, romBytes);
-
-    gameInfo.ref.data = romData.cast<Void>();
-    gameInfo.ref.size = romBytes.length;
+    if (pathOnly && path != null) {
+      gameInfo.ref.data = nullptr;
+      gameInfo.ref.size = 0;
+    } else {
+      romData = calloc.allocate<Uint8>(romBytes.length);
+      romData.asTypedList(romBytes.length).setAll(0, romBytes);
+      gameInfo.ref.data = romData.cast<Void>();
+      gameInfo.ref.size = romBytes.length;
+    }
     gameInfo.ref.meta = nullptr;
 
     final result = _bindings.retroLoadGame(gameInfo);
 
-    calloc.free(romData);
-    if (pathNative != null) {
+    if (romData != null) {
+      calloc.free(romData);
+    }
+    // Path-only cores (FBNeo) retain gameInfo.path until retro_unload_game.
+    if (!pathOnly && pathNative != null) {
       malloc.free(pathNative);
     }
     calloc.free(gameInfo);
 
     _gameLoaded = result;
 
-    // Query AV info after game is loaded
     if (result) {
       _queryAvInfo();
       _configureJoypadPorts();
+    } else if (pathOnly) {
+      _releaseRomPathNative();
     }
 
     return result;
@@ -210,13 +270,13 @@ class LibretroCore {
     if (!_initialized || !_gameLoaded) {
       return;
     }
+    final nesPort2 = _activeConfig?.nesStylePort2Gamepad ?? false;
     _bindings.retroSetControllerPortDevice(
       port,
-      port == 1 ? RETRO_DEVICE_GAMEPAD : RETRO_DEVICE_JOYPAD,
+      nesPort2 && port == 1 ? RETRO_DEVICE_GAMEPAD : RETRO_DEVICE_JOYPAD,
     );
   }
 
-  /// fceumm needs port 1 as RETRO_DEVICE_GAMEPAD (513) for 2P co-op.
   void configureMultiplayerJoypads() {
     enableJoypadPort(0);
     enableJoypadPort(1);
@@ -302,13 +362,17 @@ class LibretroCore {
     if (!_initialized || !_gameLoaded) return;
     _bindings.retroUnloadGame();
     _gameLoaded = false;
+    _releaseRomPathNative();
   }
 
   /// Dispose resources
   void dispose() {
     if (_initialized) {
+      emu_loop.flushAudioRing();
       if (_gameLoaded) {
-        _bindings.retroUnloadGame();
+        unloadGame();
+      } else {
+        _releaseRomPathNative();
       }
       _bindings.retroDeinit();
       _initialized = false;
@@ -324,7 +388,6 @@ class LibretroCore {
       malloc.free(_saveDirectoryNative!);
       _saveDirectoryNative = null;
     }
-
+    _releaseRomPathNative();
   }
-
 }

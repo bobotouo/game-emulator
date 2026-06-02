@@ -45,6 +45,12 @@ bool emulator_loop_is_running(void);
 // Safe only while emulator_loop_start() has not been called yet.
 void emulator_loop_run_frames(emu_retro_run_t retro_run, uint32_t count);
 
+/// One [retro_run] + netplay snapshot; holds the global core mutex.
+void emulator_loop_advance_frame(emu_retro_run_t retro_run);
+
+/// Block until the native loop thread has exited (after [emulator_loop_stop]).
+bool emulator_loop_wait_until_stopped(void);
+
 // ── Input (called from Dart on button events) ─────────────────────────────
 void emulator_loop_set_input_bit(int32_t btn_id, bool pressed);
 void emulator_loop_set_input_bit_for_port(unsigned port, int32_t btn_id,
@@ -81,17 +87,40 @@ uint64_t emulator_loop_rumble_sequence(void);
 uint32_t emulator_loop_rumble_strong(void);
 uint32_t emulator_loop_rumble_weak(void);
 
-// ── Save directory (set from Dart before retro_load_game) ─────────────────
+// ── Libretro directories (set from Dart before retro_load_game) ───────────
 void emulator_loop_set_save_directory(const char* path);
+void emulator_loop_set_system_directory(const char* path);
+void emulator_loop_set_content_directory(const char* path);
 
 // ── Controller ports (from RETRO_ENVIRONMENT_SET_CONTROLLER_INFO) ─────────
 void emulator_loop_reset_controller_ports(void);
 unsigned emulator_loop_get_controller_ports(void);
 
+// When false, video refresh only updates the thumbnail buffer (no GPU Surface).
+void emulator_loop_set_present_to_texture(bool enable);
+// When true, rollback resimulation suppresses video/audio callback output.
+void emulator_loop_set_silent_frame_output(bool enable);
+
 // ── Last rendered frame (valid after retro_run, read from Dart thread) ────
 // Returns RGBA8888 pointer; sets width/height via out-params.
 // Returns NULL if no frame has been rendered yet.
 const uint8_t* emulator_loop_last_frame(int32_t* width_out, int32_t* height_out);
+
+/// Increments only when video_refresh receives non-null pixel data.
+uint64_t emulator_loop_last_frame_serial(void);
+
+// ── Netplay rollback snapshots (same thread as retro_run only) ────────────
+typedef bool (*emu_snapshot_fn)(void* data, size_t size);
+typedef bool (*emu_restore_fn)(void* data, size_t size);
+
+void emulator_loop_on_retro_frame_completed(void);
+
+void emulator_loop_netplay_begin(emu_snapshot_fn serialize, emu_restore_fn restore,
+                                 size_t state_size, int32_t max_frames);
+void emulator_loop_netplay_end(void);
+bool emulator_loop_netplay_load_frame(uint64_t frame);
+uint64_t emulator_loop_netplay_sim_frame(void);
+void emulator_loop_netplay_set_sim_frame(uint64_t frame);
 
 #ifdef __cplusplus
 }

@@ -4,7 +4,8 @@ import 'dart:io';
 enum EmulatorSystem {
   gba('GBA', 'Game Boy Advance'),
   gb('GB', 'Game Boy / Color'),
-  nes('NES', 'FC / NES');
+  nes('NES', 'FC / NES'),
+  arcade('Arcade', '街机 / FBNeo');
 
   const EmulatorSystem(this.shortName, this.label);
 
@@ -21,6 +22,8 @@ class EmulatorCoreConfig {
     required this.defaultWidth,
     required this.defaultHeight,
     required this.desktopFileNames,
+    this.loadViaPathOnly = false,
+    this.nesStylePort2Gamepad = false,
   });
 
   final EmulatorSystem system;
@@ -33,6 +36,12 @@ class EmulatorCoreConfig {
 
   /// Basenames searched on desktop / iOS (in order).
   final List<String> desktopFileNames;
+
+  /// Arcade cores (FBNeo) load ROM sets from disk path, not memory buffers.
+  final bool loadViaPathOnly;
+
+  /// fceumm needs port 1 as RETRO_DEVICE_GAMEPAD (513) for 2P co-op.
+  final bool nesStylePort2Gamepad;
 
   String get nativeLibraryLabel =>
       Platform.isAndroid ? androidLibraryName : iosLibraryName;
@@ -47,6 +56,7 @@ class EmulatorCoreResolver {
   static const nesExtensions = {'.nes', '.fc', '.fds', '.unf', '.unif'};
   static const gbaExtensions = {'.gba'};
   static const gbExtensions = {'.gb', '.gbc'};
+  static const arcadeExtensions = {'.zip', '.7z'};
 
   static const _gba = EmulatorCoreConfig(
     system: EmulatorSystem.gba,
@@ -70,8 +80,23 @@ class EmulatorCoreResolver {
     desktopFileNames: [
       'fceumm_libretro_ios.dylib',
       'fceumm_libretro.dylib',
-      'libfceumm_libretro.dylib',
+      'libfceumm_libretro.so',
     ],
+    nesStylePort2Gamepad: true,
+  );
+
+  static const _fbneo = EmulatorCoreConfig(
+    system: EmulatorSystem.arcade,
+    androidLibraryName: 'libfbneo_libretro.so',
+    iosLibraryName: 'fbneo_libretro_ios.dylib',
+    defaultWidth: 384,
+    defaultHeight: 224,
+    desktopFileNames: [
+      'fbneo_libretro_ios.dylib',
+      'fbneo_libretro.dylib',
+      'libfbneo_libretro.so',
+    ],
+    loadViaPathOnly: true,
   );
 
   /// All ROM extensions allowed in the game library file picker.
@@ -79,6 +104,7 @@ class EmulatorCoreResolver {
     ...gbaExtensions,
     ...gbExtensions,
     ...nesExtensions,
+    ...arcadeExtensions,
   ];
 
   static EmulatorCoreConfig resolve(
@@ -95,6 +121,9 @@ class EmulatorCoreResolver {
     if (nesExtensions.contains(ext)) {
       return _nes;
     }
+    if (arcadeExtensions.contains(ext)) {
+      return _fbneo;
+    }
     if (gbaExtensions.contains(ext) || gbExtensions.contains(ext)) {
       return _gba;
     }
@@ -104,8 +133,27 @@ class EmulatorCoreResolver {
   static bool _isKnownExtension(String ext) {
     return nesExtensions.contains(ext) ||
         gbaExtensions.contains(ext) ||
-        gbExtensions.contains(ext);
+        gbExtensions.contains(ext) ||
+        arcadeExtensions.contains(ext);
   }
+
+  /// Lowercase extension including dot, e.g. `.zip`.
+  static String extensionFromPath(String path) => _extensionOf(path);
+
+  /// Whether [path] has a supported ROM extension.
+  static bool isSupportedRomPath(String path) =>
+      _isKnownExtension(extensionFromPath(path));
+
+  /// Resolve platform from stored [extension] (with or without leading dot).
+  static EmulatorSystem systemForExtension(String extension) {
+    final ext = extension.trim().toLowerCase();
+    final normalized = ext.startsWith('.') ? ext : '.$ext';
+    return resolve('game$normalized').system;
+  }
+
+  /// Human-readable list for import errors / empty states.
+  static String get supportedFormatsHint =>
+      'GBA (.gba)、GB/GBC (.gb/.gbc)、FC/NES (.nes/.fc 等)、街机（FBNeo ROM set 的 .zip/.7z）';
 
   static Future<String?> resolveCorePath(
     String romPath, {
@@ -153,7 +201,6 @@ class EmulatorCoreResolver {
     final roots = <String>{};
     var dir = File(Platform.resolvedExecutable).parent;
 
-    // Walk up to Runner.app (or *.app) and collect Frameworks folders.
     for (var i = 0; i < 6; i++) {
       if (dir.path.endsWith('.app')) {
         roots.add('${dir.path}/Frameworks');

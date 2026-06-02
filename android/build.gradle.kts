@@ -1,3 +1,4 @@
+import com.android.build.gradle.AppExtension
 import com.android.build.gradle.LibraryExtension
 
 allprojects {
@@ -10,6 +11,10 @@ allprojects {
 // Match app ndk.abiFilters — avoid building unused ABIs.
 subprojects {
     afterEvaluate {
+        extensions.findByType<AppExtension>()?.defaultConfig?.ndk?.apply {
+            abiFilters.clear()
+            abiFilters.add("arm64-v8a")
+        }
         extensions.findByType<LibraryExtension>()?.defaultConfig?.ndk?.apply {
             abiFilters.clear()
             abiFilters.add("arm64-v8a")

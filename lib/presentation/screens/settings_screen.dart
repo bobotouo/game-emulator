@@ -388,6 +388,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
         return 'GBA 肩键';
       case 'nes':
         return 'NES';
+      case 'arcade':
+        return '街机';
       case 'snes':
         return 'SNES';
       case 'minimal':
@@ -407,6 +409,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
         return 'GBA · 含 L/R 肩键';
       case 'nes':
         return 'NES · 十字键 + A/B';
+      case 'arcade':
+        return '街机 · 摇杆 + A–D + COIN/START';
       case 'snes':
         return 'SNES · 含 X/Y 与肩键';
       case 'minimal':

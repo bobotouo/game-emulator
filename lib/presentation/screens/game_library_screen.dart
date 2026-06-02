@@ -5,7 +5,9 @@ import 'package:flutter/material.dart';
 import '../theme/app_theme.dart';
 import '../widgets/game_card.dart';
 import '../widgets/immersive_scroll_page.dart';
+import '../../core/libretro/emulator_core_resolver.dart';
 import '../../features/game_library/game_library_service.dart';
+import '../widgets/add_game_loading.dart';
 import 'emulator_screen.dart';
 
 class GameLibraryScreen extends StatefulWidget {
@@ -46,7 +48,7 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
 
   Future<void> _loadGames() async {
     setState(() => _isLoading = true);
-    await _libraryService.init();
+    await _libraryService.init(refreshThumbnails: !Platform.isAndroid);
     setState(() {
       _games = _libraryService.games;
       _isLoading = false;
@@ -55,7 +57,15 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
 
   Future<void> _addGame() async {
     try {
-      final result = await _libraryService.addGame();
+      await Future<void>.delayed(Duration.zero);
+      if (!mounted) {
+        return;
+      }
+      final result = await runWithAddGameLoading(
+        context,
+        (updateMessage) => _libraryService.addGame(onProgress: updateMessage),
+        initialMessage: '正在添加…',
+      );
       if (result == null) return;
 
       setState(() {
@@ -120,8 +130,7 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
     Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (context) =>
-            EmulatorScreen(romPath: romPath, gameId: gameId),
+        builder: (context) => EmulatorScreen(romPath: romPath, gameId: gameId),
       ),
     ).then((_) {
       if (mounted) {
@@ -167,7 +176,7 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
         filtered = _games.where((g) => g.lastPlayedAt != null).toList()
           ..sort((a, b) => b.lastPlayedAt!.compareTo(a.lastPlayedAt!));
       default:
-        filtered = List<GameRom>.from(_games);
+        filtered = _games.where(_matchesPlatformCategory).toList();
     }
 
     final query = _searchQuery.trim().toLowerCase();
@@ -178,6 +187,23 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
     return filtered
         .where((game) => game.name.toLowerCase().contains(query))
         .toList();
+  }
+
+  bool _matchesPlatformCategory(GameRom game) {
+    if (_selectedCategory == '全部') {
+      return true;
+    }
+    try {
+      final system = EmulatorCoreResolver.systemForExtension(game.extension);
+      return switch (_selectedCategory) {
+        'GBA' => system == EmulatorSystem.gba,
+        'FC/NES' => system == EmulatorSystem.nes,
+        '街机' => system == EmulatorSystem.arcade,
+        _ => true,
+      };
+    } catch (_) {
+      return false;
+    }
   }
 
   @override
@@ -246,7 +272,13 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
             child: ListView(
               scrollDirection: Axis.horizontal,
               padding: const EdgeInsets.symmetric(horizontal: 16),
-              children: [_buildCategoryChip('全部'), _buildCategoryChip('最近游玩')],
+              children: [
+                _buildCategoryChip('全部'),
+                _buildCategoryChip('GBA'),
+                _buildCategoryChip('FC/NES'),
+                _buildCategoryChip('街机'),
+                _buildCategoryChip('最近游玩'),
+              ],
             ),
           ),
         ),
@@ -303,12 +335,7 @@ class _GameLibraryScreenState extends State<GameLibraryScreen> {
             ),
           ),
           const SizedBox(height: 8),
-          Text(
-            isSearchResult ? '换个名字试试' : '点击右上角 + 添加 ROM 文件',
-            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-              color: AppColors.onSurfaceVariant.withValues(alpha: 0.7),
-            ),
-          ),
+
           if (!isSearchResult) ...[
             const SizedBox(height: 24),
             ElevatedButton.icon(

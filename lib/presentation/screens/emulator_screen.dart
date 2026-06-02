@@ -21,18 +21,21 @@ import '../../core/emulator_loop/emulator_loop_ffi.dart' as emu_loop;
 import '../../core/network/netplay_emulator_session.dart';
 import '../../core/network/netplay_input_sync.dart';
 import '../../core/network/netplay_lockstep.dart';
+import '../../core/network/netplay_rollback.dart';
 import '../../core/network/netplay_service.dart';
 import '../widgets/netplay_player_bar.dart';
 
 class EmulatorScreen extends StatefulWidget {
   final String romPath;
   final String? gameId;
+
   /// Library extension (e.g. `.nes`) when [romPath] has no usable suffix.
   final String? romExtension;
   final NetplayEmulatorSession? netplaySession;
   final NetplayService? netplayService;
   final bool isNetplayHost;
-  /// FC/NES lockstep: both sides load ROM, frame-sync inputs from load.
+
+  /// FC/NES / arcade host-authoritative lockstep netplay.
   final bool useLockstepNetplay;
   final Uint8List? resumeSaveState;
 
@@ -92,6 +95,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   final Map<int, bool> _inputState = {};
 
   NetplayLockstepRunner? _lockstepRunner;
+  NetplayRollbackRunner? _rollbackRunner;
   StreamSubscription<LockstepStartConfig>? _lockstepStartSub;
   StreamSubscription<void>? _gameplayPeerLeftSub;
   StreamSubscription<int>? _gameSpeedSub;
@@ -100,6 +104,9 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       widget.useLockstepNetplay &&
       _isNetplay &&
       (widget.netplaySession?.localPlayerSlot ?? 0) > 0;
+
+  bool get _usesRollbackNetplay =>
+      _usesLockstepNetplay && _coreConfig.system == EmulatorSystem.nes;
 
   bool get _isNetplayHost => widget.isNetplayHost;
 
@@ -119,6 +126,16 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     } catch (_) {
       return null;
     }
+  }
+
+  String _loadFailureMessage() {
+    if (_coreConfig.system == EmulatorSystem.arcade) {
+      return '无法加载街机游戏。请确认：\n'
+          '· 这是 FBNeo 兼容的完整 ROM set（.zip/.7z）\n'
+          '· ROM 版本与机种名称匹配\n'
+          '· 所需 BIOS 已放在 system 目录（如 neogeo.zip）';
+    }
+    return '加载游戏失败';
   }
 
   @override
@@ -152,10 +169,12 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
 
     if (_isNetplay && widget.netplayService != null) {
       _speed = widget.netplayService!.gameSpeed;
-      _gameSpeedSub =
-          widget.netplayService!.onGameSpeedChanged.listen(_applySpeed);
-      _gameplayPeerLeftSub =
-          widget.netplayService!.onGameplayPeerLeft.listen((_) {
+      _gameSpeedSub = widget.netplayService!.onGameSpeedChanged.listen(
+        _applySpeed,
+      );
+      _gameplayPeerLeftSub = widget.netplayService!.onGameplayPeerLeft.listen((
+        _,
+      ) {
         unawaited(_handleGameplayPeerLeft());
       });
     }
@@ -192,6 +211,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
 
     _cancelSessionTimers();
     _lockstepRunner?.stop();
+    _rollbackRunner?.stop();
     _lockstepStartSub?.cancel();
     _lockstepStartSub = null;
     _gameplayPeerLeftSub?.cancel();
@@ -279,12 +299,13 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
         widget.romPath,
         corePath: corePath,
         gameId: widget.gameId,
+        coreConfig: _coreConfig,
         startLoop: false,
         restoreSaveState: !_isNetplay,
       );
       if (!loaded) {
         setState(() {
-          _errorMessage = '加载游戏失败';
+          _errorMessage = _loadFailureMessage();
           _isLoading = false;
         });
         return;
@@ -300,6 +321,12 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       }
 
       _syncFrameDimensionsFromCore();
+      final lastFrame = emu_loop.captureLastFrame();
+      if (lastFrame != null) {
+        _frameWidth = lastFrame.width;
+        _frameHeight = lastFrame.height;
+        _frameBufferManager?.ensureSize(_frameWidth, _frameHeight);
+      }
       _emulatorService.core?.bindDisplayBuffer(_frameBufferManager!.pixels);
 
       if (_useNativeTexture) {
@@ -307,7 +334,9 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       }
 
       final coreRate = _emulatorService.core?.sampleRate ?? 0.0;
-      final reported = Platform.isIOS ? emu_loop.getReportedSampleRate() : coreRate;
+      final reported = Platform.isIOS
+          ? emu_loop.getReportedSampleRate()
+          : coreRate;
       emu_loop.flushAudioRing();
       final audioRate = Platform.isIOS
           ? (reported > 0 ? reported : 32768.0).clamp(8000.0, 192000.0)
@@ -319,17 +348,19 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       await _audioOutputService.initialize(sampleRate: audioRate);
 
       if (_usesLockstepNetplay) {
+        emu_loop.setPresentToTexture(true);
         _emulatorService.core?.switchToNativeCallbacks();
-        await _startLockstepNetplay(
-          fps: _emulatorService.core?.fps ?? 60.0,
-        );
+        _presentLockstepWarmupFrame();
+        await _startLockstepNetplay(fps: _emulatorService.core?.fps ?? 60.0);
       } else {
         _emulatorService.startGameLoop();
 
         // iOS: AVAudioEngine pulls PCM on a real-time thread (no Dart drain).
         if (!_audioOutputService.usesNativeAudio) {
           _audioDrainTimer?.cancel();
-          _audioDrainTimer = Timer.periodic(const Duration(milliseconds: 16), (_) {
+          _audioDrainTimer = Timer.periodic(const Duration(milliseconds: 16), (
+            _,
+          ) {
             final samples = emu_loop.drainAudio(maxSamples: 8192);
             if (samples != null && samples.isNotEmpty) {
               _audioOutputService.addSamples(samples);
@@ -392,6 +423,22 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     }
   }
 
+  /// [loadAndStart] warmup runs before [GameTexture] exists; push one frame after texture is ready.
+  void _presentLockstepWarmupFrame() {
+    final runPtr = _emulatorService.core?.retroRunPtr;
+    if (runPtr == null) {
+      return;
+    }
+    emu_loop.advanceEmulatorFrame(runPtr);
+    if (_useNativeTexture) {
+      return;
+    }
+    final capture = emu_loop.captureLastFrame();
+    if (capture != null) {
+      _frameBufferManager?.updateFrom(capture.rgba);
+    }
+  }
+
   Future<void> _startLockstepNetplay({required double fps}) async {
     final netplay = widget.netplayService;
     final session = widget.netplaySession;
@@ -409,25 +456,40 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       initialSlots.add(slot);
     }
 
-    _lockstepRunner = NetplayLockstepRunner(
-      localSlot: session.localPlayerSlot,
-      isHost: widget.isNetplayHost,
-      requiredSlots: initialSlots,
-      retroRunPtr: core.retroRunPtr,
-      onSendInput: (slot, buttons) {
-        netplay.sendFrameInput(
-          slot: slot,
-          buttons: buttons,
-        );
-      },
-      onFrameComplete: widget.isNetplayHost
-          ? (frame, inputs) {
-              netplay.publishFrameBundle(frame: frame, inputs: inputs);
-            }
-          : null,
-      onFrameAdvanced: _onLockstepFrame,
-    );
-    netplay.configureLockstepRunner(_lockstepRunner!);
+    if (_usesRollbackNetplay && core.serializeStateSize > 0) {
+      _rollbackRunner = NetplayRollbackRunner(
+        localSlot: session.localPlayerSlot,
+        requiredSlots: initialSlots,
+        retroRunPtr: core.retroRunPtr,
+        serializePtr: core.bindings.retroSerializePtr,
+        restorePtr: core.bindings.retroUnserializePtr,
+        stateSize: core.serializeStateSize,
+        onSendInput: (frame, slot, buttons) {
+          netplay.sendFrameInput(frame: frame, slot: slot, buttons: buttons);
+        },
+        onFrameAdvanced: _onLockstepFrame,
+      );
+      netplay.configureRollbackRunner(_rollbackRunner!);
+      _rollbackRunner!.setSpeed(_speed);
+    } else {
+      _lockstepRunner = NetplayLockstepRunner(
+        localSlot: session.localPlayerSlot,
+        isHost: widget.isNetplayHost,
+        requiredSlots: initialSlots,
+        retroRunPtr: core.retroRunPtr,
+        onSendInput: (frame, slot, buttons) {
+          netplay.sendFrameInput(frame: frame, slot: slot, buttons: buttons);
+        },
+        onFrameComplete: widget.isNetplayHost
+            ? (frame, inputs) {
+                netplay.publishFrameBundle(frame: frame, inputs: inputs);
+              }
+            : null,
+        onFrameAdvanced: _onLockstepFrame,
+      );
+      netplay.configureLockstepRunner(_lockstepRunner!);
+      _lockstepRunner!.setSpeed(_speed);
+    }
 
     if (session.maxPlayers >= 2) {
       core.configureMultiplayerJoypads();
@@ -435,15 +497,43 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
 
     _lockstepStartSub = netplay.onLockstepStart.listen((config) {
       _lockstepRunner?.setRequiredSlots(config.requiredSlots.toSet());
+      _rollbackRunner?.setRequiredSlots(config.requiredSlots.toSet());
       if (session.maxPlayers >= 2) {
         core.configureMultiplayerJoypads();
       }
     });
 
-    netplay.signalLockstepReady(
-      fps: fps,
-      requiredSlots: initialSlots,
-    );
+    await _syncInitialNetplayState();
+    netplay.signalLockstepReady(fps: fps, requiredSlots: initialSlots);
+  }
+
+  Future<void> _syncInitialNetplayState() async {
+    final netplay = widget.netplayService;
+    if (netplay == null || !_usesLockstepNetplay) {
+      return;
+    }
+
+    if (widget.isNetplayHost) {
+      final state = await _emulatorService.saveState(persistToDisk: false);
+      if (state != null && state.isNotEmpty) {
+        await netplay.sendSaveStateToPlayablePeers(state);
+      }
+      return;
+    }
+
+    var state = netplay.takeResumeSaveState();
+    if (state == null || state.isEmpty) {
+      try {
+        state = await netplay.onSaveStateReceived.first.timeout(
+          const Duration(seconds: 3),
+        );
+      } on Object {
+        state = null;
+      }
+    }
+    if (state != null && state.isNotEmpty) {
+      await _emulatorService.loadState(state);
+    }
   }
 
   void _onLockstepFrame() {
@@ -471,6 +561,10 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   }
 
   void _onInputUpdate(Map<int, bool> state) {
+    if (_usesRollbackNetplay && _rollbackRunner != null) {
+      _rollbackRunner!.updateLocalButtons(inputStateToMask(state));
+      return;
+    }
     if (_usesLockstepNetplay && _lockstepRunner != null) {
       _lockstepRunner!.updateLocalButtons(inputStateToMask(state));
       return;
@@ -542,6 +636,8 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     if (_speed != clamped) {
       setState(() => _speed = clamped);
     }
+    _lockstepRunner?.setSpeed(clamped);
+    _rollbackRunner?.setSpeed(clamped);
     _emulatorService.speed = clamped;
     _audioOutputService.setSpeed(clamped.toDouble());
   }
@@ -638,7 +734,10 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
 
     return LayoutBuilder(
       builder: (context, constraints) {
-        final controlHeight = (constraints.maxHeight * 0.40).clamp(220.0, 340.0);
+        final controlHeight = (constraints.maxHeight * 0.40).clamp(
+          220.0,
+          340.0,
+        );
 
         return Column(
           children: [
@@ -651,10 +750,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
                   : _buildPortraitGameArea(),
             ),
             if (_isRunning)
-              SizedBox(
-                height: controlHeight,
-                child: _buildGamepad(),
-              ),
+              SizedBox(height: controlHeight, child: _buildGamepad()),
           ],
         );
       },
@@ -783,52 +879,52 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         color: Colors.transparent,
         child: Row(
-        children: [
-          IconButton(
-            icon: const Icon(Icons.arrow_back),
-            onPressed: _exitGame,
-            color: AppColors.onSurface,
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              _gameName,
-              style: Theme.of(
-                context,
-              ).textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
+          children: [
+            IconButton(
+              icon: const Icon(Icons.arrow_back),
+              onPressed: _exitGame,
+              color: AppColors.onSurface,
             ),
-          ),
-          // Action Buttons
-          IconButton(
-            icon: Icon(_isPaused ? Icons.play_arrow : Icons.pause),
-            onPressed: _togglePause,
-            color: AppColors.onSurface,
-          ),
-          if (_canAdjustSpeed)
-            TextButton(
-              onPressed: _cycleSpeed,
+            const SizedBox(width: 8),
+            Expanded(
               child: Text(
-                '${_speed}x',
-                style: const TextStyle(
-                  color: AppColors.secondary,
-                  fontWeight: FontWeight.w700,
-                ),
+                _gameName,
+                style: Theme.of(
+                  context,
+                ).textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
               ),
             ),
-          PopupMenuButton<String>(
-            icon: const Icon(Icons.more_vert, color: AppColors.onSurface),
-            onSelected: (value) {
-              if (value == 'reset') {
-                _reset();
-              }
-            },
-            itemBuilder: (context) => [
-              const PopupMenuItem(value: 'reset', child: Text('重置游戏')),
-            ],
-          ),
-        ],
+            // Action Buttons
+            IconButton(
+              icon: Icon(_isPaused ? Icons.play_arrow : Icons.pause),
+              onPressed: _togglePause,
+              color: AppColors.onSurface,
+            ),
+            if (_canAdjustSpeed)
+              TextButton(
+                onPressed: _cycleSpeed,
+                child: Text(
+                  '${_speed}x',
+                  style: const TextStyle(
+                    color: AppColors.secondary,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            PopupMenuButton<String>(
+              icon: const Icon(Icons.more_vert, color: AppColors.onSurface),
+              onSelected: (value) {
+                if (value == 'reset') {
+                  _reset();
+                }
+              },
+              itemBuilder: (context) => [
+                const PopupMenuItem(value: 'reset', child: Text('重置游戏')),
+              ],
+            ),
+          ],
         ),
       ),
     );
@@ -953,9 +1049,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
           return Padding(
             padding: const EdgeInsets.symmetric(horizontal: horizontalPad),
             child: _buildGameFrame(
-              child: _buildGameViewportStack(
-                onFullscreen: _enterFullscreen,
-              ),
+              child: _buildGameViewportStack(onFullscreen: _enterFullscreen),
             ),
           );
         }
@@ -974,9 +1068,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
             width: displayWidth,
             height: displayHeight,
             child: _buildGameFrame(
-              child: _buildGameViewportStack(
-                onFullscreen: _enterFullscreen,
-              ),
+              child: _buildGameViewportStack(onFullscreen: _enterFullscreen),
             ),
           ),
         );
@@ -1024,10 +1116,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
           ),
         ],
       ),
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(10.5),
-        child: child,
-      ),
+      child: ClipRRect(borderRadius: BorderRadius.circular(10.5), child: child),
     );
   }
 

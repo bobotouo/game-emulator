@@ -328,8 +328,12 @@ class GameCard extends StatelessWidget {
       case '.gb':
         return Icons.gamepad_outlined;
       case '.nes':
+      case '.fc':
       case '.fds':
         return Icons.videogame_asset;
+      case '.zip':
+      case '.7z':
+        return Icons.sports_esports;
       default:
         return Icons.insert_drive_file;
     }

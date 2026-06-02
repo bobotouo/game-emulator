@@ -30,7 +30,18 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags += "-std=c++17"
+                abiFilters += listOf("arm64-v8a")
             }
+        }
+    }
+
+    packaging {
+        jniLibs {
+            excludes += listOf(
+                "lib/armeabi-v7a/**",
+                "lib/x86/**",
+                "lib/x86_64/**",
+            )
         }
     }
 

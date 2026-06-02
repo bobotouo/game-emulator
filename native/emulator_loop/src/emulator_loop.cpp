@@ -4,7 +4,10 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <climits>
+#include <mutex>
 
 static void AudioLog(const char* fmt, ...) {
   char buf[512];
@@ -20,6 +23,8 @@ static void AudioLog(const char* fmt, ...) {
 #define _RETRO_ENV_SET_PIXEL_FORMAT    10
 #define _RETRO_ENV_GET_RUMBLE_INTERFACE 23
 #define _RETRO_ENV_GET_SAVE_DIRECTORY  31
+#define _RETRO_ENV_GET_SYSTEM_DIRECTORY 9
+#define _RETRO_ENV_GET_CONTENT_DIRECTORY 2
 #define _RETRO_ENV_SET_SYSTEM_AV_INFO  14
 #define _RETRO_ENV_GET_TARGET_SAMPLE_RATE 67
 #define _RETRO_ENV_SET_CONTROLLER_INFO 35
@@ -61,8 +66,10 @@ struct retro_system_av_info {
 // ── Pixel format ─────────────────────────────────────────────────────────
 static std::atomic<int32_t> gPixelFormat{EMU_PIXEL_FORMAT_XRGB8888};
 
-// ── Save directory ────────────────────────────────────────────────────────
+// ── Libretro directories ────────────────────────────────────────────────────
 static char gSaveDirBuf[4096] = {0};
+static char gSystemDirBuf[4096] = {0};
+static char gContentDirBuf[4096] = {0};
 
 // ── Audio ring buffer (lock-free SPSC) ────────────────────────────────────
 static const int32_t kAudioRing = 49152;  // int16 samples (~0.5s at 48 kHz stereo)
@@ -97,6 +104,8 @@ static std::atomic<uint64_t> gInputMaskByPort[4] = {};
 // ── Frame counter ─────────────────────────────────────────────────────────
 static std::atomic<uint64_t> gFrameCount{0};
 
+static std::mutex gCoreMutex;
+
 // ── Rumble state ──────────────────────────────────────────────────────────
 static std::atomic<uint32_t> gRumbleStrong{0};
 static std::atomic<uint32_t> gRumbleWeak{0};
@@ -113,6 +122,9 @@ struct retro_rumble_interface {
 static uint8_t gConvBuf[512 * 512 * 4];
 static std::atomic<int32_t> gLastW{0};
 static std::atomic<int32_t> gLastH{0};
+static std::atomic<uint64_t> gFrameSerial{0};
+static std::atomic<bool> gPresentToTexture{true};
+static std::atomic<bool> gSilentFrameOutput{false};
 
 #if defined(__APPLE__) && TARGET_OS_IOS
 // Libretro XRGB8888 memory layout is B,G,R,x — write BGRA directly into IOSurface.
@@ -253,8 +265,50 @@ static void Convert0rgb1555(const uint8_t* src, uint8_t* dst,
 
 // ── Pure-C callbacks ──────────────────────────────────────────────────────
 
+#if defined(__APPLE__) && TARGET_OS_IOS
+static bool PresentConvBufToIOSurface(int32_t w, int32_t h) {
+  if (w <= 0 || h <= 0) return false;
+  uint8_t* dst = nullptr;
+  int32_t dstPitch = 0;
+  int32_t texW = 0;
+  int32_t texH = 0;
+  if (!game_texture_ios_lock_back_buffer(&dst, &dstPitch, &texW, &texH)) {
+    return false;
+  }
+  if (texW < w || texH < h) {
+    game_texture_ios_cancel_back_buffer_lock();
+    return false;
+  }
+  const int32_t rowBytes = w * 4;
+  for (int32_t y = 0; y < h; ++y) {
+    std::memcpy(dst + y * dstPitch, gConvBuf + y * rowBytes, rowBytes);
+  }
+  if (texW > w) {
+    const uint8_t pad[4] = {0, 0, 0, 255};
+    for (int32_t y = 0; y < h; ++y) {
+      uint8_t* row = dst + y * dstPitch;
+      for (int32_t x = w; x < texW; ++x) {
+        std::memcpy(row + x * 4, pad, 4);
+      }
+    }
+  }
+  if (texH > h) {
+    const uint8_t pad[4] = {0, 0, 0, 255};
+    for (int32_t y = h; y < texH; ++y) {
+      uint8_t* row = dst + y * dstPitch;
+      for (int32_t x = 0; x < texW; ++x) {
+        std::memcpy(row + x * 4, pad, 4);
+      }
+    }
+  }
+  game_texture_ios_commit_back_buffer();
+  return true;
+}
+#endif
+
 static void C_VideoRefresh(const void* data, unsigned width, unsigned height, size_t pitch) {
   if (!data || !width || !height) return;
+  if (gSilentFrameOutput.load(std::memory_order_relaxed)) return;
 
   const uint8_t* src = static_cast<const uint8_t*>(data);
   const int32_t w = (int32_t)width;
@@ -264,13 +318,7 @@ static void C_VideoRefresh(const void* data, unsigned width, unsigned height, si
 
   gLastW.store(w, std::memory_order_relaxed);
   gLastH.store(h, std::memory_order_relaxed);
-
-#if defined(__APPLE__) && TARGET_OS_IOS
-  if (PresentToIOSurface(src, w, h, srcPitch, fmt)) {
-    gFrameCount.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-#endif
+  gFrameSerial.fetch_add(1, std::memory_order_relaxed);
 
   if (w * h * 4 > (int32_t)sizeof(gConvBuf)) return;
 
@@ -282,13 +330,24 @@ static void C_VideoRefresh(const void* data, unsigned width, unsigned height, si
     Convert0rgb1555(src, gConvBuf, w, h, srcPitch);
   }
 
-#if !defined(__APPLE__) || !TARGET_OS_IOS
-  game_texture_upload_rgba(gConvBuf, w, h, w * 4);
+#if defined(__APPLE__) && TARGET_OS_IOS
+  if (gPresentToTexture.load(std::memory_order_relaxed)) {
+    if (PresentToIOSurface(src, w, h, srcPitch, fmt) ||
+        PresentConvBufToIOSurface(w, h)) {
+      gFrameCount.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+  }
+#else
+  if (gPresentToTexture.load(std::memory_order_relaxed)) {
+    game_texture_upload_rgba(gConvBuf, w, h, w * 4);
+  }
 #endif
   gFrameCount.fetch_add(1, std::memory_order_relaxed);
 }
 
 static size_t C_AudioBatch(const int16_t* data, size_t frames) {
+  if (gSilentFrameOutput.load(std::memory_order_relaxed)) return frames;
   static std::atomic<bool> gLoggedFirstBatch{false};
   if (!gLoggedFirstBatch.exchange(true)) {
     AudioLog("first audio_batch: frames=%zu (stereo pairs)", frames);
@@ -298,6 +357,7 @@ static size_t C_AudioBatch(const int16_t* data, size_t frames) {
 }
 
 static void C_AudioSingle(int16_t left, int16_t right) {
+  if (gSilentFrameOutput.load(std::memory_order_relaxed)) return;
   int16_t samples[2] = {left, right};
   AudioWrite(samples, 2);
 }
@@ -354,6 +414,20 @@ static unsigned C_Environment(unsigned cmd, void* data) {
   if (cmd == _RETRO_ENV_GET_SAVE_DIRECTORY) {
     if (data && gSaveDirBuf[0] != '\0') {
       *(const char**)data = gSaveDirBuf;
+      return 1;
+    }
+    return 0;
+  }
+  if (cmd == _RETRO_ENV_GET_SYSTEM_DIRECTORY) {
+    if (data && gSystemDirBuf[0] != '\0') {
+      *(const char**)data = gSystemDirBuf;
+      return 1;
+    }
+    return 0;
+  }
+  if (cmd == _RETRO_ENV_GET_CONTENT_DIRECTORY) {
+    if (data && gContentDirBuf[0] != '\0') {
+      *(const char**)data = gContentDirBuf;
       return 1;
     }
     return 0;
@@ -462,6 +536,14 @@ uint32_t emulator_loop_rumble_weak(void) {
   return gRumbleWeak.load(std::memory_order_acquire);
 }
 
+void emulator_loop_set_present_to_texture(bool enable) {
+  gPresentToTexture.store(enable, std::memory_order_release);
+}
+
+void emulator_loop_set_silent_frame_output(bool enable) {
+  gSilentFrameOutput.store(enable, std::memory_order_release);
+}
+
 const uint8_t* emulator_loop_last_frame(int32_t* width_out, int32_t* height_out) {
   int32_t w = gLastW.load(std::memory_order_relaxed);
   int32_t h = gLastH.load(std::memory_order_relaxed);
@@ -471,12 +553,34 @@ const uint8_t* emulator_loop_last_frame(int32_t* width_out, int32_t* height_out)
   return gConvBuf;
 }
 
+uint64_t emulator_loop_last_frame_serial(void) {
+  return gFrameSerial.load(std::memory_order_acquire);
+}
+
 void emulator_loop_set_save_directory(const char* path) {
   if (path) {
     strncpy(gSaveDirBuf, path, sizeof(gSaveDirBuf) - 1);
     gSaveDirBuf[sizeof(gSaveDirBuf) - 1] = '\0';
   } else {
     gSaveDirBuf[0] = '\0';
+  }
+}
+
+void emulator_loop_set_system_directory(const char* path) {
+  if (path) {
+    strncpy(gSystemDirBuf, path, sizeof(gSystemDirBuf) - 1);
+    gSystemDirBuf[sizeof(gSystemDirBuf) - 1] = '\0';
+  } else {
+    gSystemDirBuf[0] = '\0';
+  }
+}
+
+void emulator_loop_set_content_directory(const char* path) {
+  if (path) {
+    strncpy(gContentDirBuf, path, sizeof(gContentDirBuf) - 1);
+    gContentDirBuf[sizeof(gContentDirBuf) - 1] = '\0';
+  } else {
+    gContentDirBuf[0] = '\0';
   }
 }
 
@@ -542,6 +646,124 @@ void emulator_loop_reset_controller_ports(void) {
 
 unsigned emulator_loop_get_controller_ports(void) {
   return gControllerPortCount.load(std::memory_order_acquire);
+}
+
+// ── Netplay snapshot ring (retro_run thread only) ─────────────────────────
+
+static std::atomic<bool> gNetplayActive{false};
+static emu_snapshot_fn gNetplaySerialize = nullptr;
+static emu_restore_fn gNetplayRestore = nullptr;
+static size_t gNetplaySnapSize = 0;
+static int32_t gNetplaySnapDepth = 8;
+static uint8_t** gNetplaySnapBufs = nullptr;
+static uint64_t* gNetplaySnapTags = nullptr;
+static std::atomic<uint64_t> gNetplaySimFrame{0};
+
+static void NetplayFreeRing(void) {
+  if (gNetplaySnapBufs != nullptr) {
+    for (int32_t i = 0; i < gNetplaySnapDepth; ++i) {
+      std::free(gNetplaySnapBufs[i]);
+    }
+    std::free(gNetplaySnapBufs);
+    gNetplaySnapBufs = nullptr;
+  }
+  if (gNetplaySnapTags != nullptr) {
+    std::free(gNetplaySnapTags);
+    gNetplaySnapTags = nullptr;
+  }
+}
+
+static void NetplaySaveStartOfFrame(uint64_t frameTag) {
+  if (!gNetplayActive.load(std::memory_order_relaxed) || !gNetplaySerialize ||
+      gNetplaySnapBufs == nullptr || gNetplaySnapSize == 0 || gNetplaySnapDepth <= 0) {
+    return;
+  }
+  const int32_t slot =
+      (int32_t)(frameTag % static_cast<uint64_t>(gNetplaySnapDepth));
+  if (gNetplaySerialize(gNetplaySnapBufs[slot], gNetplaySnapSize)) {
+    gNetplaySnapTags[slot] = frameTag;
+  }
+}
+
+void emulator_loop_on_retro_frame_completed(void) {
+  if (!gNetplayActive.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const uint64_t completed =
+      gNetplaySimFrame.load(std::memory_order_relaxed);
+  NetplaySaveStartOfFrame(completed + 1);
+  gNetplaySimFrame.store(completed + 1, std::memory_order_relaxed);
+}
+
+void emulator_loop_advance_frame(emu_retro_run_t retro_run) {
+  if (!retro_run) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(gCoreMutex);
+  retro_run();
+  emulator_loop_on_retro_frame_completed();
+}
+
+void emulator_loop_netplay_begin(emu_snapshot_fn serialize, emu_restore_fn restore,
+                                 size_t state_size, int32_t max_frames) {
+  emulator_loop_netplay_end();
+  if (!serialize || !restore || state_size == 0 || max_frames <= 0) {
+    return;
+  }
+  gNetplaySerialize = serialize;
+  gNetplayRestore = restore;
+  gNetplaySnapSize = state_size;
+  gNetplaySnapDepth = max_frames;
+  gNetplaySnapBufs =
+      static_cast<uint8_t**>(std::calloc(static_cast<size_t>(max_frames), sizeof(uint8_t*)));
+  gNetplaySnapTags =
+      static_cast<uint64_t*>(std::calloc(static_cast<size_t>(max_frames), sizeof(uint64_t)));
+  if (!gNetplaySnapBufs || !gNetplaySnapTags) {
+    NetplayFreeRing();
+    return;
+  }
+  for (int32_t i = 0; i < max_frames; ++i) {
+    gNetplaySnapBufs[i] = static_cast<uint8_t*>(std::malloc(state_size));
+    gNetplaySnapTags[i] = UINT64_MAX;
+    if (!gNetplaySnapBufs[i]) {
+      NetplayFreeRing();
+      return;
+    }
+  }
+  gNetplayActive.store(true, std::memory_order_release);
+  gNetplaySimFrame.store(0, std::memory_order_relaxed);
+  NetplaySaveStartOfFrame(0);
+}
+
+void emulator_loop_netplay_end(void) {
+  gNetplayActive.store(false, std::memory_order_release);
+  gNetplaySerialize = nullptr;
+  gNetplayRestore = nullptr;
+  gNetplaySnapSize = 0;
+  gNetplaySnapDepth = 8;
+  NetplayFreeRing();
+}
+
+bool emulator_loop_netplay_load_frame(uint64_t frame) {
+  std::lock_guard<std::mutex> lock(gCoreMutex);
+  if (!gNetplayActive.load(std::memory_order_relaxed) || !gNetplayRestore ||
+      gNetplaySnapBufs == nullptr || gNetplaySnapDepth <= 0) {
+    return false;
+  }
+  const int32_t slot =
+      (int32_t)(frame % static_cast<uint64_t>(gNetplaySnapDepth));
+  if (gNetplaySnapTags[slot] != frame) {
+    return false;
+  }
+  return gNetplayRestore(gNetplaySnapBufs[slot], gNetplaySnapSize);
+}
+
+uint64_t emulator_loop_netplay_sim_frame(void) {
+  return gNetplaySimFrame.load(std::memory_order_acquire);
+}
+
+void emulator_loop_netplay_set_sim_frame(uint64_t frame) {
+  gNetplaySimFrame.store(frame, std::memory_order_relaxed);
 }
 
 } // extern "C"

@@ -14,6 +14,7 @@ import 'lan_network_checker.dart';
 import '../emulator_loop/emulator_loop_ffi.dart' as emu_loop;
 import 'netplay_lockstep.dart';
 import 'netplay_protocol.dart';
+import 'netplay_rollback.dart';
 import 'netplay_room_state.dart';
 import 'netplay_status.dart';
 import 'player_info.dart';
@@ -37,6 +38,7 @@ class NetplayService {
   Timer? _mdnsScanTimer;
 
   MDnsClient? _mdnsClient;
+
   /// mDNS browse is off until we also publish room services via Bonjour.
   bool _mdnsEnabled = false;
   String? _cachedLocalIp;
@@ -59,6 +61,7 @@ class NetplayService {
   bool _sendingRom = false;
 
   NetplayLockstepRunner? _lockstepRunner;
+  NetplayRollbackRunner? _rollbackRunner;
   Set<int> _lockstepRequiredSlots = {1};
   final Set<String> _lockstepReadyPeers = {};
   double _lockstepFps = 60.0;
@@ -72,8 +75,7 @@ class NetplayService {
   final _lockstepStartController =
       StreamController<LockstepStartConfig>.broadcast();
   final _gameplayPeerLeftController = StreamController<void>.broadcast();
-  final _saveStateReceivedController =
-      StreamController<Uint8List>.broadcast();
+  final _saveStateReceivedController = StreamController<Uint8List>.broadcast();
   final _playerSlotAssignedController = StreamController<int>.broadcast();
   final _hostPromotedController = StreamController<RoomInfo>.broadcast();
   final _gameSpeedController = StreamController<int>.broadcast();
@@ -86,8 +88,10 @@ class NetplayService {
   final _playerUpdatedController = StreamController<PlayerInfo>.broadcast();
   final _playerLeftController = StreamController<String>.broadcast();
   final _messageController = StreamController<NetplayMessage>.broadcast();
-  final _romProgressController = StreamController<RomTransferProgress>.broadcast();
-  final _startGameController = StreamController<NetplayStartGameEvent>.broadcast();
+  final _romProgressController =
+      StreamController<RomTransferProgress>.broadcast();
+  final _startGameController =
+      StreamController<NetplayStartGameEvent>.broadcast();
   final _connectionStateController = StreamController<bool>.broadcast();
   final _roomStateController = StreamController<NetplayRoomState>.broadcast();
 
@@ -102,17 +106,19 @@ class NetplayService {
   Stream<PlayerInfo> get onPlayerUpdated => _playerUpdatedController.stream;
   Stream<String> get onPlayerLeft => _playerLeftController.stream;
   Stream<NetplayMessage> get onMessage => _messageController.stream;
-  Stream<RomTransferProgress> get onRomProgress => _romProgressController.stream;
+  Stream<RomTransferProgress> get onRomProgress =>
+      _romProgressController.stream;
   Stream<NetplayStartGameEvent> get onStartGame => _startGameController.stream;
-  Stream<bool> get onConnectionStateChanged => _connectionStateController.stream;
-  Stream<NetplayRoomState> get onRoomStateChanged => _roomStateController.stream;
+  Stream<bool> get onConnectionStateChanged =>
+      _connectionStateController.stream;
+  Stream<NetplayRoomState> get onRoomStateChanged =>
+      _roomStateController.stream;
   Stream<LockstepStartConfig> get onLockstepStart =>
       _lockstepStartController.stream;
   Stream<void> get onGameplayPeerLeft => _gameplayPeerLeftController.stream;
   Stream<Uint8List> get onSaveStateReceived =>
       _saveStateReceivedController.stream;
-  Stream<int> get onPlayerSlotAssigned =>
-      _playerSlotAssignedController.stream;
+  Stream<int> get onPlayerSlotAssigned => _playerSlotAssignedController.stream;
   Stream<RoomInfo> get onHostPromoted => _hostPromotedController.stream;
   Stream<int> get onGameSpeedChanged => _gameSpeedController.stream;
   int get gameSpeed => _gameSpeed;
@@ -120,6 +126,7 @@ class NetplayService {
   bool get isPlayableParticipant => _isHost || _localPlayerSlot > 0;
 
   NetplayLockstepRunner? get lockstepRunner => _lockstepRunner;
+  NetplayRollbackRunner? get rollbackRunner => _rollbackRunner;
   bool get awaitingReplacement => _awaitingReplacement;
   bool get isHostPromotionPending => _hostPromotionPending;
   Uint8List? takeResumeSaveState() {
@@ -240,10 +247,7 @@ class NetplayService {
     }
   }
 
-  Future<bool> joinRoom(
-    RoomInfo room, {
-    String? playerName,
-  }) async {
+  Future<bool> joinRoom(RoomInfo room, {String? playerName}) async {
     await _resetConnections(keepDiscovery: false);
     _isHost = false;
     _localPlayerName = playerName ?? 'Player 2';
@@ -275,10 +279,7 @@ class NetplayService {
         onError: (_) => _handlePeerClosed(peer.id),
       );
 
-      _sendToPeer(
-        peer.id,
-        NetplayMessage.join(playerName: _localPlayerName!),
-      );
+      _sendToPeer(peer.id, NetplayMessage.join(playerName: _localPlayerName!));
       _sendToHost(NetplayMessage.ping(DateTime.now().millisecondsSinceEpoch));
       _setStatus(NetplayStatus.inLobby);
       _connectionStateController.add(true);
@@ -567,12 +568,13 @@ class NetplayService {
     }
 
     if (_hostedRoom != null) {
-      _hostedRoom = _hostedRoom!.copyWith(inGame: true, awaitingReplacement: false);
+      _hostedRoom = _hostedRoom!.copyWith(
+        inGame: true,
+        awaitingReplacement: false,
+      );
       _broadcastRoomState();
     }
-    _broadcast(
-      NetplayMessage.startGame(gameMd5: gameMd5, gameId: gameId),
-    );
+    _broadcast(NetplayMessage.startGame(gameMd5: gameMd5, gameId: gameId));
     _startGameController.add(
       NetplayStartGameEvent(gameMd5: gameMd5, gameId: gameId),
     );
@@ -664,6 +666,8 @@ class NetplayService {
       return;
     }
     _gameSpeed = clamped;
+    _lockstepRunner?.setSpeed(clamped);
+    _rollbackRunner?.setSpeed(clamped);
     if (broadcast) {
       _broadcast(NetplayMessage.gameSpeed(speed: clamped));
     }
@@ -746,18 +750,10 @@ class NetplayService {
       _broadcastRoomState();
     }
     _broadcast(
-      NetplayMessage.startGame(
-        gameMd5: gameMd5,
-        gameId: gameId,
-        resume: true,
-      ),
+      NetplayMessage.startGame(gameMd5: gameMd5, gameId: gameId, resume: true),
     );
     _startGameController.add(
-      NetplayStartGameEvent(
-        gameMd5: gameMd5,
-        gameId: gameId,
-        resume: true,
-      ),
+      NetplayStartGameEvent(gameMd5: gameMd5, gameId: gameId, resume: true),
     );
     _setStatus(NetplayStatus.gaming);
     _broadcast(NetplayMessage.gameSpeed(speed: _gameSpeed));
@@ -774,10 +770,7 @@ class NetplayService {
         await sendSaveStateToPeer(peerId: peerId, bytes: bytes);
         final resumeRoom = _hostedRoom;
         if (resumeRoom != null) {
-          resumeGame(
-            gameMd5: resumeRoom.gameMd5,
-            gameId: resumeRoom.gameCode,
-          );
+          resumeGame(gameMd5: resumeRoom.gameMd5, gameId: resumeRoom.gameCode);
         }
         return;
       }
@@ -792,10 +785,7 @@ class NetplayService {
     if (!_isHost || bytes.isEmpty) {
       return;
     }
-    _sendToPeer(
-      peerId,
-      NetplayMessage.saveStateBegin(size: bytes.length),
-    );
+    _sendToPeer(peerId, NetplayMessage.saveStateBegin(size: bytes.length));
     const chunkSize = NetplayRomTransfer.chunkSize;
     for (var offset = 0; offset < bytes.length; offset += chunkSize) {
       final end = min(offset + chunkSize, bytes.length);
@@ -804,8 +794,25 @@ class NetplayService {
     _sendToPeer(peerId, NetplayMessage.saveStateEnd());
   }
 
+  Future<void> sendSaveStateToPlayablePeers(Uint8List bytes) async {
+    if (!_isHost || bytes.isEmpty) {
+      return;
+    }
+    for (final peer in _peers.values) {
+      if (peer.playerSlot > 0) {
+        await sendSaveStateToPeer(peerId: peer.id, bytes: bytes);
+      }
+    }
+  }
+
   void configureLockstepRunner(NetplayLockstepRunner runner) {
     _lockstepRunner = runner;
+    _rollbackRunner = null;
+  }
+
+  void configureRollbackRunner(NetplayRollbackRunner runner) {
+    _rollbackRunner = runner;
+    _lockstepRunner = null;
   }
 
   /// Both sides call after [retro_load_game] — lockstep begins when all ready.
@@ -825,25 +832,23 @@ class NetplayService {
   }
 
   void sendFrameInput({
+    required int frame,
     required int slot,
     required int buttons,
   }) {
     if (_isHost) {
+      _broadcast(
+        NetplayMessage.frameInput(frame: frame, slot: slot, buttons: buttons),
+      );
       return;
     }
     _safeSendToHost(
-      NetplayMessage.frameInput(
-        slot: slot,
-        buttons: buttons,
-      ),
+      NetplayMessage.frameInput(frame: frame, slot: slot, buttons: buttons),
     );
   }
 
   /// Host publishes one authoritative input bundle; both cores consume it.
-  void publishFrameBundle({
-    required int frame,
-    required Map<int, int> inputs,
-  }) {
+  void publishFrameBundle({required int frame, required Map<int, int> inputs}) {
     if (!_isHost) {
       return;
     }
@@ -854,11 +859,16 @@ class NetplayService {
 
   void _stopLockstep() {
     _lockstepRunner?.stop();
+    _rollbackRunner?.stop();
     _lockstepReadyPeers.clear();
   }
 
   void _tryStartLockstep() {
     if (!_isHost) {
+      return;
+    }
+    if ((_lockstepRunner?.isRunning ?? false) ||
+        (_rollbackRunner?.isRunning ?? false)) {
       return;
     }
 
@@ -885,11 +895,15 @@ class NetplayService {
         frame: config.startFrame,
         fps: config.fps,
         slots: config.requiredSlots,
+        inputDelayFrames: config.inputDelayFrames,
       ),
     );
     _lockstepRunner?.setRequiredSlots(_lockstepRequiredSlots);
+    _lockstepRunner?.setInputDelayFrames(config.inputDelayFrames);
+    _rollbackRunner?.setRequiredSlots(_lockstepRequiredSlots);
     _lockstepStartController.add(config);
     _lockstepRunner?.start(fps: config.fps, startFrame: config.startFrame);
+    _rollbackRunner?.start(fps: config.fps, startFrame: config.startFrame);
   }
 
   void _handleLockstepReady(String peerId, double fps) {
@@ -905,20 +919,34 @@ class NetplayService {
   void _handleLockstepStart(LockstepStartConfig config) {
     _lockstepRequiredSlots = config.requiredSlots.toSet();
     _lockstepRunner?.setRequiredSlots(_lockstepRequiredSlots);
+    _lockstepRunner?.setInputDelayFrames(config.inputDelayFrames);
+    _rollbackRunner?.setRequiredSlots(_lockstepRequiredSlots);
     _lockstepStartController.add(config);
-    _lockstepRunner?.start(
-      fps: config.fps,
-      startFrame: config.startFrame,
-    );
+    _lockstepRunner?.start(fps: config.fps, startFrame: config.startFrame);
+    _rollbackRunner?.start(fps: config.fps, startFrame: config.startFrame);
   }
 
   void _handleFrameInput(String peerId, NetplayMessage message) {
-    if (!_isHost) {
-      return;
-    }
     final slot = (message.payload['slot'] as num?)?.toInt() ?? 0;
     final buttons = (message.payload['buttons'] as num?)?.toInt() ?? 0;
-    _lockstepRunner?.receiveRemoteInput(slot, buttons);
+    final runner = _lockstepRunner;
+    final fallbackFrame =
+        (runner?.frame ?? _rollbackRunner?.frame ?? 0) +
+        (runner?.inputDelayFrames ?? kDefaultNetplayInputDelayFrames);
+    final frame = (message.payload['frame'] as num?)?.toInt() ?? fallbackFrame;
+
+    if (!_isHost) {
+      _rollbackRunner?.receiveRemoteInput(frame, slot, buttons);
+      return;
+    }
+    runner?.receiveRemoteInput(frame, slot, buttons);
+    _rollbackRunner?.receiveRemoteInput(frame, slot, buttons);
+    if (_isHost) {
+      _broadcastExcept(
+        peerId,
+        NetplayMessage.frameInput(frame: frame, slot: slot, buttons: buttons),
+      );
+    }
   }
 
   void _handleFrameBundle(NetplayMessage message) {
@@ -960,10 +988,12 @@ class NetplayService {
     _closeUdpResponder();
     _broadcast(NetplayMessage.leave());
     unawaited(_repeatRoomClosedAnnouncement(roomSnapshot));
-    unawaited(Future<void>(() async {
-      await Future<void>.delayed(const Duration(milliseconds: 300));
-      await _resetConnections(notifyDisconnected: false);
-    }));
+    unawaited(
+      Future<void>(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        await _resetConnections(notifyDisconnected: false);
+      }),
+    );
   }
 
   String? _findHostSuccessor() {
@@ -1029,7 +1059,9 @@ class NetplayService {
       return;
     }
     final playerName =
-        message.payload['playerName'] as String? ?? _localPlayerName ?? 'Player 1';
+        message.payload['playerName'] as String? ??
+        _localPlayerName ??
+        'Player 1';
     final parsed = RoomInfo.fromJson(
       Map<String, dynamic>.from(roomRaw),
       hostIp: '0.0.0.0',
@@ -1042,10 +1074,7 @@ class NetplayService {
     _peers.clear();
 
     _localPlayerName = playerName;
-    await _resetConnections(
-      keepDiscovery: false,
-      notifyDisconnected: false,
-    );
+    await _resetConnections(keepDiscovery: false, notifyDisconnected: false);
 
     final ok = await createRoom(
       roomTemplate: roomTemplate,
@@ -1199,8 +1228,9 @@ class NetplayService {
       return;
     }
 
-    final playablePeers =
-        _peers.values.where((peer) => peer.playerSlot > 0).length;
+    final playablePeers = _peers.values
+        .where((peer) => peer.playerSlot > 0)
+        .length;
 
     _hostedRoom = room.copyWith(
       currentPlayers: min(1 + playablePeers, room.maxPlayers),
@@ -1289,21 +1319,10 @@ class NetplayService {
       return;
     }
     peer.playerSlot = slot;
-    _sendToPeer(
-      peerId,
-      NetplayMessage.joinAck(
-        slot: slot,
-        playerId: peerId,
-      ),
-    );
+    _sendToPeer(peerId, NetplayMessage.joinAck(slot: slot, playerId: peerId));
     _broadcastRoomState();
     _playerJoinedController.add(
-      PlayerInfo(
-        id: peerId,
-        name: peer.playerName,
-        isHost: false,
-        slot: slot,
-      ),
+      PlayerInfo(id: peerId, name: peer.playerName, isHost: false, slot: slot),
     );
   }
 
@@ -1369,10 +1388,7 @@ class NetplayService {
           if (_isHost) {
             _sendToPeer(
               peerId,
-              NetplayMessage.joinAck(
-                slot: slot,
-                playerId: peerId,
-              ),
+              NetplayMessage.joinAck(slot: slot, playerId: peerId),
             );
             _broadcastRoomState();
             _sendToPeer(
@@ -1394,12 +1410,7 @@ class NetplayService {
             }
           }
           _playerJoinedController.add(
-            PlayerInfo(
-              id: peerId,
-              name: name,
-              isHost: false,
-              slot: slot,
-            ),
+            PlayerInfo(id: peerId, name: name, isHost: false, slot: slot),
           );
         }
       case NetplayMessageType.joinAck:
@@ -1455,15 +1466,20 @@ class NetplayService {
         if (!_isHost) {
           final frame = message.payload['frame'] as int? ?? 0;
           final fps = (message.payload['fps'] as num?)?.toDouble() ?? 60.0;
-          final slots = (message.payload['slots'] as List?)
+          final slots =
+              (message.payload['slots'] as List?)
                   ?.map((e) => e as int)
                   .toList() ??
               const [1, 2];
+          final inputDelay =
+              (message.payload['inputDelay'] as num?)?.toInt() ??
+              kDefaultNetplayInputDelayFrames;
           _handleLockstepStart(
             LockstepStartConfig(
               startFrame: frame,
               fps: fps,
               requiredSlots: slots,
+              inputDelayFrames: inputDelay.clamp(0, 8),
             ),
           );
         }
@@ -1515,11 +1531,7 @@ class NetplayService {
           if (NetplayWire.hasInlineRomData(message.payload)) {
             try {
               final bytes = base64Decode(message.payload['data'] as String);
-              _handleRomComplete(
-                peerId,
-                Uint8List.fromList(bytes),
-                message,
-              );
+              _handleRomComplete(peerId, Uint8List.fromList(bytes), message);
             } catch (_) {
               _setStatus(NetplayStatus.inLobby);
             }
@@ -1549,8 +1561,7 @@ class NetplayService {
       return;
     }
 
-    final md5Hash =
-        (beginMeta.payload['md5'] as String? ?? '').toLowerCase();
+    final md5Hash = (beginMeta.payload['md5'] as String? ?? '').toLowerCase();
     final fileName = NetplayWire.decodeRomFileName(beginMeta.payload);
     _romProgressController.add(
       RomTransferProgress(
@@ -1579,9 +1590,7 @@ class NetplayService {
       _syncHostedRoomCounts();
       _broadcastRoomState();
     }
-    if (!_isHost &&
-        peerId == _joinedRoom?.hostIp &&
-        !_hostPromotionPending) {
+    if (!_isHost && peerId == _joinedRoom?.hostIp && !_hostPromotionPending) {
       unawaited(_resetConnections());
     }
   }
@@ -1613,6 +1622,19 @@ class NetplayService {
       }
     } else {
       _safeSocketAdd(_clientSocket, bytes);
+    }
+  }
+
+  void _broadcastExcept(String excludedPeerId, NetplayMessage message) {
+    if (!_isHost) {
+      return;
+    }
+    final bytes = NetplayLineCodec.encode(message);
+    for (final peer in _peers.values) {
+      if (peer.id == excludedPeerId) {
+        continue;
+      }
+      _safeSocketAdd(peer.socket, bytes);
     }
   }
 
@@ -1662,7 +1684,9 @@ class NetplayService {
         final message = utf8.decode(datagram.data).trim();
         if (message == udpDiscover || message.startsWith(udpMagic)) {
           _syncHostedRoomCounts();
-          final payload = utf8.encode('$udpMagic${_hostedRoom!.toUdpPayload()}');
+          final payload = utf8.encode(
+            '$udpMagic${_hostedRoom!.toUdpPayload()}',
+          );
           try {
             socket.send(payload, datagram.address, datagram.port);
           } on SocketException {
@@ -1808,46 +1832,46 @@ class NetplayService {
 
       await for (final PtrResourceRecord ptr
           in _mdnsClient!.lookup<PtrResourceRecord>(
-        ResourceRecordQuery.serverPointer('$serviceType.local'),
-      )) {
-      final serviceName = ptr.domainName;
-      String? target;
-      int? srvPort;
+            ResourceRecordQuery.serverPointer('$serviceType.local'),
+          )) {
+        final serviceName = ptr.domainName;
+        String? target;
+        int? srvPort;
 
-      await for (final SrvResourceRecord srv
-          in _mdnsClient!.lookup<SrvResourceRecord>(
-        ResourceRecordQuery.service(serviceName),
-      )) {
-        target = srv.target;
-        srvPort = srv.port;
-      }
+        await for (final SrvResourceRecord srv
+            in _mdnsClient!.lookup<SrvResourceRecord>(
+              ResourceRecordQuery.service(serviceName),
+            )) {
+          target = srv.target;
+          srvPort = srv.port;
+        }
 
-      final txt = <String, String>{};
-      await for (final TxtResourceRecord txtRecord
-          in _mdnsClient!.lookup<TxtResourceRecord>(
-        ResourceRecordQuery.text(serviceName),
-      )) {
-        _parseTxtRecord(txtRecord.text, txt);
-      }
+        final txt = <String, String>{};
+        await for (final TxtResourceRecord txtRecord
+            in _mdnsClient!.lookup<TxtResourceRecord>(
+              ResourceRecordQuery.text(serviceName),
+            )) {
+          _parseTxtRecord(txtRecord.text, txt);
+        }
 
-      if (target == null || srvPort == null) {
-        continue;
-      }
+        if (target == null || srvPort == null) {
+          continue;
+        }
 
-      final hostIp = await _resolveMdnsHost(target);
-      if (hostIp == null) {
-        continue;
-      }
+        final hostIp = await _resolveMdnsHost(target);
+        if (hostIp == null) {
+          continue;
+        }
 
-      final room = RoomInfo.fromTxtRecord(
-        hostIp: hostIp,
-        port: srvPort,
-        txt: txt,
-      );
-      if (room.roomId.isNotEmpty) {
-        _emitRoomFound(room);
+        final room = RoomInfo.fromTxtRecord(
+          hostIp: hostIp,
+          port: srvPort,
+          txt: txt,
+        );
+        if (room.roomId.isNotEmpty) {
+          _emitRoomFound(room);
+        }
       }
-    }
     } catch (_) {
       _mdnsEnabled = false;
       _mdnsScanTimer?.cancel();
@@ -1861,8 +1885,8 @@ class NetplayService {
     final normalized = hostName.endsWith('.') ? hostName : '$hostName.';
     await for (final IPAddressResourceRecord record
         in _mdnsClient!.lookup<IPAddressResourceRecord>(
-      ResourceRecordQuery.addressIPv4(normalized),
-    )) {
+          ResourceRecordQuery.addressIPv4(normalized),
+        )) {
       return record.address.address;
     }
     return null;

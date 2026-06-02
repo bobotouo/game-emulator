@@ -234,6 +234,13 @@ class LibretroBindings {
   Pointer<NativeFunction<retro_run_native>> get retroRunPtr =>
       _lib.lookup<NativeFunction<retro_run_native>>('retro_run');
 
+  /// Native serialize/unserialize (netplay snapshot ring on the retro_run thread).
+  Pointer<NativeFunction<retro_serialize_native>> get retroSerializePtr =>
+      _lib.lookup<NativeFunction<retro_serialize_native>>('retro_serialize');
+
+  Pointer<NativeFunction<retro_unserialize_native>> get retroUnserializePtr =>
+      _lib.lookup<NativeFunction<retro_unserialize_native>>('retro_unserialize');
+
   void _bindFunctions() {
     retroInit = _lib.lookupFunction<retro_init_native, retro_init_dart>(
       'retro_init',

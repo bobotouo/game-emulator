@@ -12,6 +12,7 @@ static dispatch_queue_t gEmuQueue = nil;
 static std::atomic<bool> gRunning{false};
 static std::atomic<bool> gPaused{false};
 static std::atomic<int32_t> gSpeed{1};
+static dispatch_semaphore_t gStopDone = nil;
 
 extern "C" {
 
@@ -24,6 +25,7 @@ void emulator_loop_start(emu_retro_run_t retro_run, double fps) {
   dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(
       DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
   gEmuQueue = dispatch_queue_create("com.emulator.loop", attr);
+  gStopDone = dispatch_semaphore_create(0);
 
   dispatch_async(gEmuQueue, ^{
     mach_timebase_info_data_t tb;
@@ -41,7 +43,7 @@ void emulator_loop_start(emu_retro_run_t retro_run, double fps) {
         const int32_t speed = gSpeed.load(std::memory_order_relaxed);
         const int32_t runs = speed < 1 ? 1 : (speed > 5 ? 5 : speed);
         for (int32_t i = 0; i < runs; ++i) {
-          retro_run();
+          emulator_loop_advance_frame(retro_run);
         }
       }
 
@@ -55,13 +57,25 @@ void emulator_loop_start(emu_retro_run_t retro_run, double fps) {
       }
     }
 
+    if (gStopDone != nil) {
+      dispatch_semaphore_signal(gStopDone);
+    }
     gEmuQueue = nil;
   });
 }
 
 void emulator_loop_stop(void) {
-  gRunning.store(false, std::memory_order_relaxed);
-  // The loop will exit at the next iteration; no need to join.
+  if (!gRunning.exchange(false)) {
+    return;
+  }
+  dispatch_semaphore_t sem = gStopDone;
+  if (sem != nil) {
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+  }
+}
+
+bool emulator_loop_wait_until_stopped(void) {
+  return !gRunning.load(std::memory_order_acquire);
 }
 
 void emulator_loop_set_paused(bool paused) {
@@ -82,12 +96,17 @@ void emulator_loop_run_frames(emu_retro_run_t retro_run, uint32_t count) {
   if (!retro_run || count == 0) return;
   if (gRunning.load(std::memory_order_relaxed)) return;
 
-  dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
-  dispatch_sync(q, ^{
-    for (uint32_t i = 0; i < count; ++i) {
-      retro_run();
-    }
-  });
+  if (gEmuQueue != nil) {
+    dispatch_sync(gEmuQueue, ^{
+      for (uint32_t i = 0; i < count; ++i) {
+        emulator_loop_advance_frame(retro_run);
+      }
+    });
+    return;
+  }
+  for (uint32_t i = 0; i < count; ++i) {
+    emulator_loop_advance_frame(retro_run);
+  }
 }
 
 } // extern "C"

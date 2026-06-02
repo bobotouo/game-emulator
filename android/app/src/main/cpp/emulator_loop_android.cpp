@@ -24,7 +24,7 @@ static void* EmuThreadFn(void*) {
       const int32_t speed = gSpeed.load(std::memory_order_relaxed);
       const int32_t runs = speed < 1 ? 1 : (speed > 5 ? 5 : speed);
       for (int32_t i = 0; i < runs; ++i) {
-        gRetroRun();
+        emulator_loop_advance_frame(gRetroRun);
       }
     }
 
@@ -69,6 +69,10 @@ void emulator_loop_stop(void) {
   gRetroRun = nullptr;
 }
 
+bool emulator_loop_wait_until_stopped(void) {
+  return !gRunning.load(std::memory_order_acquire);
+}
+
 void emulator_loop_set_paused(bool paused) {
   gPaused.store(paused, std::memory_order_relaxed);
 }
@@ -88,7 +92,7 @@ void emulator_loop_run_frames(emu_retro_run_t retro_run, uint32_t count) {
   if (gRunning.load(std::memory_order_relaxed)) return;
 
   for (uint32_t i = 0; i < count; ++i) {
-    retro_run();
+    emulator_loop_advance_frame(retro_run);
   }
 }
 

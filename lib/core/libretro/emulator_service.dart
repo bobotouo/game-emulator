@@ -5,12 +5,15 @@ import 'package:flutter/foundation.dart';
 import '../storage/storage_paths_service.dart';
 import '../audio/audio_debug.dart';
 import '../emulator_loop/emulator_loop_ffi.dart' as emu_loop;
+import 'emulator_core_resolver.dart';
 import 'libretro_core.dart';
+import 'libretro_core_registry.dart';
 import 'libretro_session_lock.dart';
 
 /// Emulator service managing the core lifecycle
 class EmulatorService {
   LibretroCore? _core;
+  String? _registryCorePath;
   bool _running = false;
   bool _paused = false;
   int _speed = 1;
@@ -57,8 +60,14 @@ class EmulatorService {
   /// Initialize the emulator with a core file
   /// Initialize the emulator with a core file (prefer [loadAndStart] with [corePath]).
   Future<bool> initialize(String corePath) async {
-    _core = LibretroCore();
-    return _core!.initialize(corePath);
+    await _releaseCore();
+    try {
+      _core = LibretroCoreRegistry.acquire(corePath);
+      _registryCorePath = corePath;
+      return true;
+    } on StateError {
+      return false;
+    }
   }
 
   /// Load and start a ROM, optionally restoring auto-save if present.
@@ -66,21 +75,30 @@ class EmulatorService {
     String romPath, {
     String? corePath,
     String? gameId,
+    EmulatorCoreConfig? coreConfig,
     bool startLoop = true,
     bool restoreSaveState = true,
   }) async {
     return LibretroSessionLock.runExclusive(() async {
-      if (_core == null) {
-        if (corePath == null) {
-          return false;
-        }
-        _core = LibretroCore();
-        if (!_core!.initialize(corePath)) {
-          return false;
-        }
+      if (corePath == null) {
+        return false;
       }
 
-      await _core!.prepareSaveDirectory();
+      await _releaseCore();
+
+      try {
+        _core = LibretroCoreRegistry.acquire(corePath);
+        _registryCorePath = corePath;
+      } on StateError {
+        await _releaseCore();
+        return false;
+      }
+
+      final config = coreConfig ?? EmulatorCoreResolver.resolve(romPath);
+      if (_core!.isGameLoaded) {
+        _core!.unloadGame();
+      }
+      await _core!.prepareForGame(romPath, config);
       if (Platform.isIOS) {
         final deviceHz = emu_loop.prepareAudioOutputRate(48000);
         final targetHz = deviceHz.round().clamp(8000, 192000);
@@ -89,8 +107,9 @@ class EmulatorService {
           'before loadGame: device=$deviceHz Hz mGBA_target=$targetHz (core resamples)',
         );
       }
-      final success = _core!.loadGame(romPath);
+      final success = _core!.loadGame(romPath, config: config);
       if (!success) {
+        await _releaseCore();
         return false;
       }
 
@@ -113,11 +132,8 @@ class EmulatorService {
       );
 
       final runPtr = _core!.retroRunPtr;
-      if (!restored) {
-        emu_loop.runSyncFrames(runPtr, 2);
-      } else {
-        emu_loop.runSyncFrames(runPtr, 1);
-      }
+      final warmupBurst = _warmupBurstFramesFor(config.system, restored);
+      emu_loop.runSyncFrames(runPtr, warmupBurst);
 
       if (startLoop) {
         startGameLoop();
@@ -127,6 +143,21 @@ class EmulatorService {
   }
 
   int get controllerPortCount => emu_loop.getControllerPortCount();
+
+  static int _warmupBurstFramesFor(EmulatorSystem system, bool restored) {
+    if (restored) {
+      return 1;
+    }
+    switch (system) {
+      case EmulatorSystem.arcade:
+        return 48;
+      case EmulatorSystem.nes:
+        return 60;
+      case EmulatorSystem.gba:
+      case EmulatorSystem.gb:
+        return 30;
+    }
+  }
 
   /// Load from bytes and start
   Future<bool> loadFromBytesAndStart(Uint8List romBytes, String? path) async {
@@ -162,6 +193,7 @@ class EmulatorService {
     _lastFrameCount = _readFrameCounter();
 
     // Start the native loop (platform-specific: GCD on iOS, pthread on Android).
+    emu_loop.setPresentToTexture(true);
     emu_loop.setEmulationSpeed(_speed);
     emu_loop.startNativeLoop(core.retroRunPtr, fps);
 
@@ -354,14 +386,41 @@ class EmulatorService {
   /// Dispose resources
   void dispose() {
     stop();
-    final core = _core;
-    _core = null;
-    if (core != null) {
-      unawaited(
-        LibretroSessionLock.runExclusive(() async {
-          core.dispose();
-        }),
-      );
+    unawaited(
+      LibretroSessionLock.runExclusive(() async {
+        await _releaseCore();
+      }),
+    );
+  }
+
+  Future<void> _releaseCore() async {
+    _fpsTracker?.cancel();
+    _fpsTracker = null;
+    if (_running) {
+      emu_loop.stopNativeLoop();
     }
+    _running = false;
+    _paused = false;
+    _speed = 1;
+
+    _core = null;
+    _currentRomPath = null;
+    _currentGameId = null;
+
+    final corePath = _registryCorePath;
+    _registryCorePath = null;
+    if (corePath != null) {
+      LibretroCoreRegistry.release(corePath);
+    }
+    emu_loop.setPresentToTexture(false);
+    _resetNativeSessionState();
+  }
+
+  void _resetNativeSessionState() {
+    emu_loop.clearInputs();
+    emu_loop.flushAudioRing();
+    emu_loop.resetControllerPortCount();
+    emu_loop.setEmulationSpeed(1);
+    emu_loop.resetLibretroProbeSession();
   }
 }

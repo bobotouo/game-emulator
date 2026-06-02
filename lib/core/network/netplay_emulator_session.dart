@@ -33,15 +33,16 @@ class NetplayEmulatorSession {
       }
     }
 
-    if (isHost && slots[0] == null) {
+    if (slots[0] == null) {
       PlayerInfo? hostPlayer;
       for (final player in roster) {
-        if (player.isHost) {
+        if (player.isHost || player.slot == 1) {
           hostPlayer = player;
           break;
         }
       }
-      slots[0] = hostPlayer ??
+      slots[0] =
+          hostPlayer ??
           const PlayerInfo(
             id: 'host',
             name: '房主',
@@ -49,6 +50,19 @@ class NetplayEmulatorSession {
             isReady: true,
             slot: 1,
           );
+    }
+
+    if (!isHost &&
+        localSlot >= 1 &&
+        localSlot <= maxPlayers &&
+        slots[localSlot - 1] == null) {
+      slots[localSlot - 1] = PlayerInfo(
+        id: netplay.localPlayerId ?? 'local',
+        name: '我',
+        isHost: false,
+        isReady: true,
+        slot: localSlot,
+      );
     }
 
     return NetplayEmulatorSession(

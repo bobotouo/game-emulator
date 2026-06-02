@@ -43,7 +43,7 @@ dependencies:
   flutter_soloud: ^4.0.6
   vibration: ^3.1.8
   crypto: ^3.0.7
-
+  image: ^4.9.1
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -66,11 +66,10 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
-  shaders:
-    - shaders/gba_display.frag
-
   assets:
     - assets/gamepad/dpad_cross.svg
+    - assets/bios/neogeo.zip
+    - assets/bios/pgm.zip
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

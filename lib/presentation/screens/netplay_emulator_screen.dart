@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import '../../core/network/lan_service.dart';
 import 'emulator_screen.dart';
 
-/// Multiplayer game screen — FC/NES uses lockstep netplay.
+/// Multiplayer game screen — FC/NES / arcade use host lockstep netplay.
 class NetplayEmulatorScreen extends StatefulWidget {
   const NetplayEmulatorScreen({
     super.key,

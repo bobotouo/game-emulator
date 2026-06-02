@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'netplay_lockstep.dart';
+
 /// JSON control messages exchanged over the netplay TCP channel.
 abstract final class NetplayMessageType {
   static const join = 'JOIN';
@@ -41,18 +43,15 @@ class NetplayMessage {
   }
 
   static NetplayMessage join({required String playerName}) =>
-      NetplayMessage(NetplayMessageType.join, {
-        'playerName': playerName,
-      });
+      NetplayMessage(NetplayMessageType.join, {'playerName': playerName});
 
   static NetplayMessage joinAck({
     required int slot,
     required String playerId,
-  }) =>
-      NetplayMessage(NetplayMessageType.joinAck, {
-        'slot': slot,
-        'playerId': playerId,
-      });
+  }) => NetplayMessage(NetplayMessageType.joinAck, {
+    'slot': slot,
+    'playerId': playerId,
+  });
 
   static NetplayMessage roomState(Map<String, dynamic> state) =>
       NetplayMessage(NetplayMessageType.roomState, state);
@@ -77,27 +76,25 @@ class NetplayMessage {
       'fileName': base64Encode(utf8.encode(safeName)),
       'fileNameEncoding': 'base64',
       'md5': md5.toLowerCase(),
-      if (dataB64 != null) ...{
-        'encoding': 'base64',
-        'data': dataB64,
-      },
+      if (dataB64 != null) ...{'encoding': 'base64', 'data': dataB64},
     });
   }
 
-  static NetplayMessage romEnd() => const NetplayMessage(NetplayMessageType.romEnd);
+  static NetplayMessage romEnd() =>
+      const NetplayMessage(NetplayMessageType.romEnd);
 
   static NetplayMessage startGame({
     required String gameMd5,
     required String gameId,
     bool resume = false,
-  }) =>
-      NetplayMessage(NetplayMessageType.startGame, {
-        'gameMd5': gameMd5,
-        'gameId': gameId,
-        if (resume) 'resume': true,
-      });
+  }) => NetplayMessage(NetplayMessageType.startGame, {
+    'gameMd5': gameMd5,
+    'gameId': gameId,
+    if (resume) 'resume': true,
+  });
 
-  static NetplayMessage leave() => const NetplayMessage(NetplayMessageType.leave);
+  static NetplayMessage leave() =>
+      const NetplayMessage(NetplayMessageType.leave);
 
   static NetplayMessage ping(int sentAtMs) =>
       NetplayMessage(NetplayMessageType.ping, {'sentAt': sentAtMs});
@@ -112,30 +109,31 @@ class NetplayMessage {
     required int frame,
     required double fps,
     required List<int> slots,
-  }) =>
-      NetplayMessage(NetplayMessageType.lockstepStart, {
-        'frame': frame,
-        'fps': fps,
-        'slots': slots,
-      });
+    int inputDelayFrames = kDefaultNetplayInputDelayFrames,
+  }) => NetplayMessage(NetplayMessageType.lockstepStart, {
+    'frame': frame,
+    'fps': fps,
+    'slots': slots,
+    'inputDelay': inputDelayFrames,
+  });
 
   static NetplayMessage frameInput({
+    required int frame,
     required int slot,
     required int buttons,
-  }) =>
-      NetplayMessage(NetplayMessageType.frameInput, {
-        'slot': slot,
-        'buttons': buttons,
-      });
+  }) => NetplayMessage(NetplayMessageType.frameInput, {
+    'frame': frame,
+    'slot': slot,
+    'buttons': buttons,
+  });
 
   static NetplayMessage frameBundle({
     required int frame,
     required Map<int, int> inputs,
-  }) =>
-      NetplayMessage(NetplayMessageType.frameBundle, {
-        'frame': frame,
-        'inputs': inputs.map((slot, mask) => MapEntry('$slot', mask)),
-      });
+  }) => NetplayMessage(NetplayMessageType.frameBundle, {
+    'frame': frame,
+    'inputs': inputs.map((slot, mask) => MapEntry('$slot', mask)),
+  });
 
   static NetplayMessage saveStateBegin({required int size}) =>
       NetplayMessage(NetplayMessageType.saveStateBegin, {'size': size});
@@ -150,24 +148,21 @@ class NetplayMessage {
     required Map<String, dynamic> room,
     required String playerName,
     int gameSpeed = 1,
-  }) =>
-      NetplayMessage(NetplayMessageType.hostPromote, {
-        'room': room,
-        'playerName': playerName,
-        'gameSpeed': gameSpeed.clamp(1, 5),
-      });
+  }) => NetplayMessage(NetplayMessageType.hostPromote, {
+    'room': room,
+    'playerName': playerName,
+    'gameSpeed': gameSpeed.clamp(1, 5),
+  });
 
-  static NetplayMessage gameSpeed({required int speed}) =>
-      NetplayMessage(NetplayMessageType.gameSpeed, {
-        'speed': speed.clamp(1, 5),
-      });
+  static NetplayMessage gameSpeed({required int speed}) => NetplayMessage(
+    NetplayMessageType.gameSpeed,
+    {'speed': speed.clamp(1, 5)},
+  );
 }
 
 class NetplayLineCodec {
   static Uint8List encode(NetplayMessage message) {
-    return Uint8List.fromList(
-      utf8.encode('${jsonEncode(message.toJson())}\n'),
-    );
+    return Uint8List.fromList(utf8.encode('${jsonEncode(message.toJson())}\n'));
   }
 
   static NetplayMessage? tryDecodeLine(String line) {
@@ -230,7 +225,8 @@ class NetplayStreamParser {
   void feed(
     Uint8List chunk, {
     required void Function(NetplayMessage message) onMessage,
-    required void Function(Uint8List bytes, NetplayMessage beginMeta) onRomComplete,
+    required void Function(Uint8List bytes, NetplayMessage beginMeta)
+    onRomComplete,
     void Function(Uint8List bytes)? onSaveStateComplete,
   }) {
     _buffer.addAll(chunk);
@@ -292,8 +288,7 @@ class NetplayStreamParser {
         if (!NetplayWire.hasInlineRomData(message.payload)) {
           _receivingRom = true;
           _activeRomBegin = message;
-          _romBytesRemaining =
-              (message.payload['size'] as num?)?.toInt() ?? 0;
+          _romBytesRemaining = (message.payload['size'] as num?)?.toInt() ?? 0;
           _romBuffer.clear();
         }
         onMessage(message);

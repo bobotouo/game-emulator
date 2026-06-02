@@ -5,6 +5,7 @@ import '../gamepad/gamepad_skin.dart';
 import '../theme/app_theme.dart';
 import '../../core/haptics/haptic_service.dart';
 import '../../core/libretro/libretro_bindings.dart';
+import 'arcade_joystick.dart';
 import 'cross_dpad.dart';
 
 typedef InputUpdateCallback = void Function(Map<int, bool> state);
@@ -184,6 +185,21 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
   }
 
   Widget _buildDpad() {
+    if (widget.layout.useJoystickVisual) {
+      return ArcadeJoystick(
+        size: _dpadSize,
+        ringColor: _skin.barButtonFill.withValues(alpha: 0.96),
+        knobColor: _skin.joystickInner,
+        activeBorderColor: _skin.joystickActiveBorder,
+        up: _inputState[RETRO_DEVICE_ID_JOYPAD_UP] == true,
+        down: _inputState[RETRO_DEVICE_ID_JOYPAD_DOWN] == true,
+        left: _inputState[RETRO_DEVICE_ID_JOYPAD_LEFT] == true,
+        right: _inputState[RETRO_DEVICE_ID_JOYPAD_RIGHT] == true,
+        onDirectionsChanged: _onDpadDirections,
+        onDirectionsCleared: _clearDpad,
+      );
+    }
+
     return CrossDpad(
       size: _dpadSize,
       idleColor: _skin.barButtonFill.withValues(alpha: 0.96),
@@ -204,26 +220,41 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
         mainAxisSize: MainAxisSize.min,
         children: [
           _buildBarButton(
-            label: 'SELECT',
+            label: widget.layout.centerLeftLabel,
             button: RETRO_DEVICE_ID_JOYPAD_SELECT,
+            width: widget.layout.resolvedCenterStyle.buttonWidth,
+            height: widget.layout.resolvedCenterStyle.buttonHeight,
           ),
           const SizedBox(width: 12),
-          _buildBarButton(label: 'START', button: RETRO_DEVICE_ID_JOYPAD_START),
+          _buildBarButton(
+            label: widget.layout.centerRightLabel,
+            button: RETRO_DEVICE_ID_JOYPAD_START,
+            width: widget.layout.resolvedCenterStyle.buttonWidth,
+            height: widget.layout.resolvedCenterStyle.buttonHeight,
+          ),
         ],
       );
     }
 
+    final center = widget.layout.resolvedCenterStyle;
     return Transform.rotate(
-      angle: -0.14,
+      angle: center.tiltRadians,
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           _buildBarButton(
-            label: 'SELECT',
+            label: widget.layout.centerLeftLabel,
             button: RETRO_DEVICE_ID_JOYPAD_SELECT,
+            width: center.buttonWidth,
+            height: center.buttonHeight,
           ),
-          SizedBox(height: widget.layout.compact ? 8 : 10),
-          _buildBarButton(label: 'START', button: RETRO_DEVICE_ID_JOYPAD_START),
+          SizedBox(height: center.buttonSpacing),
+          _buildBarButton(
+            label: widget.layout.centerRightLabel,
+            button: RETRO_DEVICE_ID_JOYPAD_START,
+            width: center.buttonWidth,
+            height: center.buttonHeight,
+          ),
         ],
       ),
     );
@@ -283,9 +314,24 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
     );
   }
 
-  Widget _buildBarButton({required String label, required int button}) {
+  Widget _buildBarButton({
+    required String label,
+    required int button,
+    double? width,
+    double? height,
+  }) {
     final isPressed = _inputState[button] == true;
-    final width = label.length <= 1 ? 56.0 : 72.0;
+    width ??= label.length <= 1
+        ? 56.0
+        : label.length <= 2
+        ? 56.0
+        : 72.0;
+    height ??= 24.0;
+    final fontSize = label.length <= 1
+        ? 11.0
+        : label.runes.length > 4
+        ? 9.0
+        : 10.0;
 
     return GestureDetector(
       onTapDown: (_) => _updateInput(button, true),
@@ -294,7 +340,7 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 50),
         width: width,
-        height: 24,
+        height: height,
         alignment: Alignment.center,
         transform: Matrix4.translationValues(0, isPressed ? 1.5 : 0, 0),
         decoration: BoxDecoration(
@@ -316,7 +362,7 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
         child: Text(
           label,
           style: TextStyle(
-            fontSize: label.length <= 1 ? 11 : 8,
+            fontSize: fontSize,
             fontWeight: FontWeight.w700,
             color: _skin.barLabel.withValues(alpha: 0.82),
           ),
@@ -346,7 +392,7 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
             left: 0,
             bottom: 4,
             child: _buildActionButton(
-              label: 'B',
+              label: widget.layout.labelForFace('B'),
               button: RETRO_DEVICE_ID_JOYPAD_B,
               diameter: size,
             ),
@@ -355,7 +401,7 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
             right: 0,
             top: 4,
             child: _buildActionButton(
-              label: 'A',
+              label: widget.layout.labelForFace('A'),
               button: RETRO_DEVICE_ID_JOYPAD_A,
               diameter: size,
             ),
@@ -366,8 +412,18 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
   }
 
   Widget _buildFourFaceButtons() {
-    final size = widget.layout.compact ? 46.0 : 52.0;
-    final area = widget.layout.compact ? 120.0 : 132.0;
+    final isArcade = widget.layout.id == 'arcade';
+    final size = isArcade
+        ? 50.0
+        : widget.layout.compact
+        ? 46.0
+        : 52.0;
+    final area = isArcade
+        ? 142.0
+        : widget.layout.compact
+        ? 120.0
+        : 132.0;
+    final mid = area / 2 - size / 2;
 
     return SizedBox(
       width: area,
@@ -376,36 +432,36 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
         children: [
           Positioned(
             top: 0,
-            left: area / 2 - size / 2,
+            left: mid,
             child: _buildActionButton(
-              label: 'Y',
+              label: widget.layout.labelForFace('Y'),
               button: RETRO_DEVICE_ID_JOYPAD_Y,
               diameter: size,
             ),
           ),
           Positioned(
             left: 0,
-            top: area / 2 - size / 2,
+            top: mid,
             child: _buildActionButton(
-              label: 'X',
+              label: widget.layout.labelForFace('X'),
               button: RETRO_DEVICE_ID_JOYPAD_X,
               diameter: size,
             ),
           ),
           Positioned(
             right: 0,
-            top: area / 2 - size / 2,
+            top: mid,
             child: _buildActionButton(
-              label: 'A',
+              label: widget.layout.labelForFace('A'),
               button: RETRO_DEVICE_ID_JOYPAD_A,
               diameter: size,
             ),
           ),
           Positioned(
             bottom: 0,
-            left: area / 2 - size / 2,
+            left: mid,
             child: _buildActionButton(
-              label: 'B',
+              label: widget.layout.labelForFace('B'),
               button: RETRO_DEVICE_ID_JOYPAD_B,
               diameter: size,
             ),
@@ -415,16 +471,55 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
     );
   }
 
+  ({Color base, Color dark, Color text})? _arcadeFacePalette(String label) {
+    if (widget.layout.id != 'arcade') {
+      return null;
+    }
+    switch (label) {
+      case 'A':
+        return (
+          base: const Color(0xFFE53935),
+          dark: const Color(0xFFB71C1C),
+          text: Colors.white,
+        );
+      case 'B':
+        return (
+          base: const Color(0xFFFDD835),
+          dark: const Color(0xFFF9A825),
+          text: const Color(0xFF1A1400),
+        );
+      case 'C':
+        return (
+          base: const Color(0xFF43A047),
+          dark: const Color(0xFF2E7D32),
+          text: Colors.white,
+        );
+      case 'D':
+        return (
+          base: const Color(0xFF1E88E5),
+          dark: const Color(0xFF1565C0),
+          text: Colors.white,
+        );
+      default:
+        return null;
+    }
+  }
+
   Widget _buildActionButton({
     required String label,
     required int button,
     required double diameter,
   }) {
     final isPressed = _inputState[button] == true;
-    final baseColor = _skin.faceButtonColor(label);
-    final darkColor = _skin.faceButtonDark(label);
-    final textColor = _skin.faceButtonText(label);
-    final fontSize = widget.layout.compact ? 18.0 : 21.0;
+    final arcadePalette = _arcadeFacePalette(label);
+    final baseColor = arcadePalette?.base ?? _skin.faceButtonColor(label);
+    final darkColor = arcadePalette?.dark ?? _skin.faceButtonDark(label);
+    final textColor = arcadePalette?.text ?? _skin.faceButtonText(label);
+    final fontSize = widget.layout.id == 'arcade'
+        ? 20.0
+        : widget.layout.compact
+        ? 18.0
+        : 21.0;
 
     return GestureDetector(
       onTapDown: (_) => _updateInput(button, true),
