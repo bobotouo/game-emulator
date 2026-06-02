@@ -2,16 +2,20 @@
 
 基于 Flutter 与 libretro 核心的多系统模拟器，当前支持 **GBA / GB / GBC**（[mGBA](https://mgba.io/)）与 **FC / NES**（[FCEUmm](https://github.com/libretro/libretro-fceumm)），具备本地游戏库、自动存档、变速游玩与局域网联机骨架。
 
-**仓库地址：** https://github.com/bobotouo/game-emulator
-
 ---
 
 ## 平台支持
 
 | 平台 | 状态 | 说明 |
 |------|------|------|
-| **Android** |
-| **iOS** | 
+| **Android** | 支持
+| **iOS** | 支持
+
+---
+
+## 截图
+
+![截图](./doc/test1.gif)
 
 ---
 

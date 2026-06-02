@@ -690,23 +690,34 @@ class _RoomScreenState extends State<RoomScreen> {
     }
 
     if (exitToLobby == true) {
-      if (_isRoomHost) {
-        widget.netplayService.exitGameAndHandoffHost();
-      } else {
-        widget.netplayService.exitGameAndLeaveRoom();
-      }
       Navigator.pop(context, true);
       return;
     }
 
-    if (_isRoomHost && !widget.netplayService.isConnected) {
-      _leaveRoom(notifyHost: false);
+    if (widget.netplayService.consumeExitingForReplacement()) {
+      if (_isRoomHost) {
+        widget.netplayService.exitGameAndHandoffHost();
+        if (mounted) {
+          Navigator.pop(context, true);
+        }
+        return;
+      }
+    }
+
+    if (!widget.netplayService.isConnected) {
+      if (mounted) {
+        Navigator.pop(context, true);
+      }
       return;
     }
 
-    if (widget.netplayService.awaitingReplacement) {
-      setState(() {});
-    }
+    setState(() {
+      _roomLive = true;
+      _isReady = false;
+      _promotedToHost =
+          _promotedToHost || widget.netplayService.isHost;
+    });
+    _syncPlayersFromService();
   }
 
   Future<bool> _ensureGuestPlayerSlot() async {

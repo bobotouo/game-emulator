@@ -66,7 +66,7 @@ class _NetplayEmulatorScreenState extends State<NetplayEmulatorScreen> {
     _roomStateSub?.cancel();
     _hostPromotedSub?.cancel();
     if (widget.netplayService.consumeDeferGameExitToRoomScreen()) {
-      // Room screen handles leave / return to lobby.
+      // Returned to team room — room screen handles session state.
     } else if (widget.netplayService.consumeExitingForReplacement()) {
       // Host keeps the room open while waiting for a replacement player.
     } else if (widget.netplayService.consumeHostPromotionExit()) {

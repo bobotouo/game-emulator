@@ -169,11 +169,10 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     if (state != null && state.isNotEmpty) {
       widget.netplayService?.stashResumeSaveState(state);
     }
-    widget.netplayService?.markExitingForReplacement();
     await _endSession();
     widget.netplayService?.markDeferGameExitToRoomScreen();
     if (mounted) {
-      Navigator.of(context).pop(true);
+      Navigator.of(context).pop(false);
     }
   }
 
@@ -502,22 +501,24 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   }
 
   Future<void> _exitGame() async {
-    if (_isNetplay &&
-        widget.isNetplayHost &&
-        widget.netplayService != null &&
-        widget.netplayService!.clients.isNotEmpty) {
-      final state = await _emulatorService.saveState(persistToDisk: false);
-      if (state != null && state.isNotEmpty) {
-        widget.netplayService!.stashResumeSaveState(state);
+    if (_isNetplay && widget.netplayService != null) {
+      final netplay = widget.netplayService!;
+      if (_isNetplayHost && netplay.clients.isNotEmpty) {
+        final state = await _emulatorService.saveState(persistToDisk: false);
+        if (state != null && state.isNotEmpty) {
+          netplay.stashResumeSaveState(state);
+        }
+        netplay.markExitingForReplacement();
+      } else if (!_isNetplayHost) {
+        netplay.exitGameAndLeaveRoom();
+      } else {
+        netplay.endGame();
       }
-      widget.netplayService!.markExitingForReplacement();
-    }
-    if (_isNetplay) {
-      widget.netplayService?.markDeferGameExitToRoomScreen();
+      netplay.markDeferGameExitToRoomScreen();
     }
     await _endSession();
     if (mounted) {
-      Navigator.of(context).pop(_isNetplay ? true : null);
+      Navigator.of(context).pop(_isNetplay ? false : null);
     }
   }
 

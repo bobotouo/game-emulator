@@ -722,6 +722,12 @@ class NetplayService {
   void exitGameAndLeave() {
     _stopLockstep();
     _safeSendToHost(NetplayMessage.gameExit());
+    if (_joinedRoom != null) {
+      _joinedRoom = _joinedRoom!.copyWith(
+        inGame: false,
+        awaitingReplacement: false,
+      );
+    }
     if (_status == NetplayStatus.gaming) {
       _setStatus(NetplayStatus.inLobby);
     }
@@ -1592,6 +1598,9 @@ class NetplayService {
       );
     }
     _syncHostedRoomCounts();
+    if (_status == NetplayStatus.gaming) {
+      _setStatus(NetplayStatus.inLobby);
+    }
     _broadcastRoomState();
     _gameplayPeerLeftController.add(null);
   }
