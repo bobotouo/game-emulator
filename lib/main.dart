@@ -14,7 +14,6 @@ import 'core/settings/app_settings_service.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   AppSystemUi.apply();
-  await AppSettingsService.instance.init();
   runApp(const ProviderScope(child: GBAEmulatorApp()));
   _bootstrapInBackground();
 }
@@ -22,6 +21,7 @@ Future<void> main() async {
 /// Heavy work after UI is up — avoids blocking first frame (white screen).
 Future<void> _bootstrapInBackground() async {
   WidgetsBinding.instance.addPostFrameCallback((timeStamp) {
+    unawaited(AppSettingsService.instance.init());
     unawaited(AudioOutputService.warmUpEngine());
   });
 }

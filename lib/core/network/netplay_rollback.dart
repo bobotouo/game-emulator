@@ -86,7 +86,7 @@ class NetplayRollbackRunner {
   }
 
   void setSpeed(int speed) {
-    _speed = speed.clamp(1, 5);
+    _speed = speed.clamp(1, 3);
     if (_running) {
       _scheduleTick();
     }

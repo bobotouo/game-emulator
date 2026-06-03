@@ -81,7 +81,7 @@ class NetplayLockstepRunner {
   int get inputDelayFrames => _inputDelayFrames;
 
   void setSpeed(int speed) {
-    final next = speed.clamp(1, 5);
+    final next = speed.clamp(1, 3);
     if (_speed == next) {
       return;
     }

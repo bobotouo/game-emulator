@@ -45,11 +45,12 @@ class EmulatorService {
     final h = baseHeight;
     return h > 0 ? baseWidth / h : 4 / 3;
   }
+
   String? get currentRomPath => _currentRomPath;
   LibretroCore? get core => _core;
 
   set speed(int value) {
-    final clamped = value.clamp(1, 5);
+    final clamped = value.clamp(1, 3);
     if (_speed == clamped) return;
     _speed = clamped;
     if (_running) {
@@ -168,7 +169,9 @@ class EmulatorService {
       final deviceHz = emu_loop.prepareAudioOutputRate(48000);
       final targetHz = deviceHz.round().clamp(8000, 192000);
       emu_loop.setTargetSampleRate(targetHz);
-      logAudio('before loadGameFromBytes: device=$deviceHz Hz mGBA_target=$targetHz');
+      logAudio(
+        'before loadGameFromBytes: device=$deviceHz Hz mGBA_target=$targetHz',
+      );
     }
     final success = _core!.loadGameFromBytes(romBytes, path);
     if (success) {
@@ -223,6 +226,11 @@ class EmulatorService {
   void pause() {
     _paused = true;
     emu_loop.setLoopPaused(true);
+  }
+
+  void pauseAndWaitForCore() {
+    pause();
+    emu_loop.runWithCoreLock(() {});
   }
 
   void resume() {
@@ -300,9 +308,7 @@ class EmulatorService {
       return false;
     }
 
-    debugPrint(
-      'Loading save state from ${file.path} (${state.length} bytes)',
-    );
+    debugPrint('Loading save state from ${file.path} (${state.length} bytes)');
 
     final runPtr = _core?.retroRunPtr;
     for (var attempt = 0; attempt < 6; attempt++) {
@@ -333,7 +339,7 @@ class EmulatorService {
       return;
     }
 
-    pause();
+    pauseAndWaitForCore();
 
     await saveState();
   }

@@ -47,6 +47,8 @@ void emulator_loop_run_frames(emu_retro_run_t retro_run, uint32_t count);
 
 /// One [retro_run] + netplay snapshot; holds the global core mutex.
 void emulator_loop_advance_frame(emu_retro_run_t retro_run);
+void emulator_loop_core_lock(void);
+void emulator_loop_core_unlock(void);
 
 /// Block until the native loop thread has exited (after [emulator_loop_stop]).
 bool emulator_loop_wait_until_stopped(void);
@@ -108,6 +110,7 @@ const uint8_t* emulator_loop_last_frame(int32_t* width_out, int32_t* height_out)
 
 /// Increments only when video_refresh receives non-null pixel data.
 uint64_t emulator_loop_last_frame_serial(void);
+void emulator_loop_reset_video_state(void);
 
 // ── Netplay rollback snapshots (same thread as retro_run only) ────────────
 typedef bool (*emu_snapshot_fn)(void* data, size_t size);

@@ -345,7 +345,10 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
         'emulator_screen init audio: av_info.sampleRate=$coreRate '
         'reported=$reported -> startNativeAudio($audioRate) ring=${emu_loop.audioAvailable()}',
       );
-      await _audioOutputService.initialize(sampleRate: audioRate);
+      await _audioOutputService.initialize(
+        sampleRate: audioRate,
+        volume: _coreAudioVolume,
+      );
 
       if (_usesLockstepNetplay) {
         emu_loop.setPresentToTexture(true);
@@ -621,18 +624,18 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       if (!_canAdjustSpeed || widget.netplayService == null) {
         return;
       }
-      final next = _speed >= 5 ? 1 : _speed + 1;
+      final next = _speed >= 3 ? 1 : _speed + 1;
       widget.netplayService!.setGameSpeed(next);
       return;
     }
     setState(() {
-      _speed = _speed >= 5 ? 1 : _speed + 1;
+      _speed = _speed >= 3 ? 1 : _speed + 1;
     });
     _applySpeed(_speed);
   }
 
   void _applySpeed(int speed) {
-    final clamped = speed.clamp(1, 5);
+    final clamped = speed.clamp(1, 3);
     if (_speed != clamped) {
       setState(() => _speed = clamped);
     }
@@ -1193,6 +1196,9 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
 
   bool get _isDisplayStretched =>
       _displayAspectRatio == AppSettingsService.aspectStretch;
+
+  double get _coreAudioVolume =>
+      _coreConfig.system == EmulatorSystem.arcade ? 2.0 : 1.5;
 
   double get _targetAspectRatio {
     switch (_displayAspectRatio) {

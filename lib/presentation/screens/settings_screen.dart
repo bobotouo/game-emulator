@@ -62,9 +62,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final bottomInset = kBottomNavigationBarHeight +
-        MediaQuery.paddingOf(context).bottom +
-        16;
+    final bottomInset =
+        kBottomNavigationBarHeight + MediaQuery.paddingOf(context).bottom + 16;
 
     return ImmersiveScrollPage(
       title: '设置',
@@ -73,109 +72,109 @@ class _SettingsScreenState extends State<SettingsScreen> {
           padding: EdgeInsets.fromLTRB(16, 8, 16, bottomInset),
           sliver: SliverList(
             delegate: SliverChildListDelegate([
-          _buildSectionHeader(context, '模拟器设置'),
-          _buildSettingsCard(
-            children: [
-              _buildSwitchTile(
-                icon: Icons.vibration,
-                title: '触觉反馈',
-                subtitle: '支持震动的游戏触发震动时，允许手机震动',
-                value: _settings.hapticFeedbackEnabled,
-                onChanged: _settings.setHapticFeedbackEnabled,
+              _buildSectionHeader(context, '模拟器设置'),
+              _buildSettingsCard(
+                children: [
+                  _buildSwitchTile(
+                    icon: Icons.vibration,
+                    title: '触觉反馈',
+                    subtitle: '支持震动的游戏触发震动时，允许手机震动',
+                    value: _settings.hapticFeedbackEnabled,
+                    onChanged: _settings.setHapticFeedbackEnabled,
+                  ),
+                  _buildDivider(),
+                  _buildSwitchTile(
+                    icon: Icons.touch_app,
+                    title: '按键反馈',
+                    subtitle: '点击虚拟按键时轻微震动',
+                    value: _settings.buttonFeedbackEnabled,
+                    onChanged: _settings.setButtonFeedbackEnabled,
+                  ),
+                  _buildDivider(),
+                  _buildAspectRatioTile(),
+                  _buildDivider(),
+                  _buildBrightnessTile(),
+                  _buildDivider(),
+                  _buildGamepadSkinManagementTile(),
+                  _buildDivider(),
+                  _buildGamepadLayoutTile(),
+                  _buildDivider(),
+                  _buildStaticTile(
+                    icon: Icons.bluetooth,
+                    title: '蓝牙手柄',
+                    subtitle: '暂未接入',
+                    trailing: const Switch(value: false, onChanged: null),
+                  ),
+                ],
               ),
-              _buildDivider(),
-              _buildSwitchTile(
-                icon: Icons.touch_app,
-                title: '按键反馈',
-                subtitle: '点击虚拟按键时轻微震动',
-                value: _settings.buttonFeedbackEnabled,
-                onChanged: _settings.setButtonFeedbackEnabled,
+              const SizedBox(height: 24),
+              _buildSectionHeader(context, '网络设置'),
+              _buildSettingsCard(
+                children: [
+                  _buildSwitchTile(
+                    icon: Icons.wifi,
+                    title: '联机设置',
+                    subtitle: _settings.networkEnabled ? '已开启局域网联机' : '已关闭',
+                    value: _settings.networkEnabled,
+                    onChanged: _settings.setNetworkEnabled,
+                  ),
+                  _buildDivider(),
+                  _buildStaticTile(
+                    icon: Icons.language,
+                    title: '本机 IP',
+                    subtitle: _localIp,
+                  ),
+                  _buildDivider(),
+                  _buildStaticTile(
+                    icon: Icons.settings_ethernet,
+                    title: '联机端口 (TCP)',
+                    subtitle: '发现端口: ${_settings.networkPort + 1}',
+                    trailing: IconButton(
+                      icon: const Icon(Icons.edit, size: 18),
+                      tooltip: '修改 TCP 端口',
+                      color: AppColors.onSurfaceVariant,
+                      onPressed: _editPort,
+                    ),
+                    onTap: _editPort,
+                  ),
+                ],
               ),
-              _buildDivider(),
-              _buildAspectRatioTile(),
-              _buildDivider(),
-              _buildBrightnessTile(),
-              _buildDivider(),
-              _buildGamepadSkinManagementTile(),
-              _buildDivider(),
-              _buildGamepadLayoutTile(),
-              _buildDivider(),
-              _buildStaticTile(
-                icon: Icons.bluetooth,
-                title: '蓝牙手柄',
-                subtitle: '暂未接入',
-                trailing: const Switch(value: false, onChanged: null),
+              const SizedBox(height: 24),
+              _buildSectionHeader(context, '存档管理'),
+              _buildSettingsCard(
+                children: [
+                  _buildStaticTile(
+                    icon: Icons.folder,
+                    title: '存档位置',
+                    subtitle: _saveLocation,
+                  ),
+                  _buildDivider(),
+                  _buildStaticTile(
+                    icon: Icons.info_outline,
+                    title: '存档说明',
+                    subtitle: '退出游戏时自动保存进度，再次进入自动读取。文件名与游戏 ROM 同名，如 口袋妖怪.state',
+                  ),
+                ],
               ),
-            ],
-          ),
-          const SizedBox(height: 24),
-          _buildSectionHeader(context, '网络设置'),
-          _buildSettingsCard(
-            children: [
-              _buildSwitchTile(
-                icon: Icons.wifi,
-                title: '联机设置',
-                subtitle: _settings.networkEnabled ? '已开启局域网联机' : '已关闭',
-                value: _settings.networkEnabled,
-                onChanged: _settings.setNetworkEnabled,
+              const SizedBox(height: 24),
+              _buildSectionHeader(context, '关于'),
+              _buildSettingsCard(
+                children: [
+                  _buildStaticTile(
+                    icon: Icons.info_outline,
+                    title: '版本',
+                    subtitle: '1.0.0',
+                  ),
+                  _buildDivider(),
+                  _buildStaticTile(
+                    icon: Icons.description_outlined,
+                    title: '介绍说明',
+                    subtitle:
+                        '本应用用于管理和运行本地游戏（GBA / NES 等），支持游戏库、存档、局域网联机和虚拟手柄。',
+                  ),
+                ],
               ),
-              _buildDivider(),
-              _buildStaticTile(
-                icon: Icons.language,
-                title: '本机 IP',
-                subtitle: _localIp,
-              ),
-              _buildDivider(),
-              _buildStaticTile(
-                icon: Icons.settings_ethernet,
-                title: '联机端口 (TCP)',
-                subtitle:
-                    '${_settings.networkPort} · 发现 UDP ${_settings.networkPort + 1}',
-                trailing: IconButton(
-                  icon: const Icon(Icons.edit, size: 18),
-                  tooltip: '修改 TCP 端口',
-                  color: AppColors.onSurfaceVariant,
-                  onPressed: _editPort,
-                ),
-                onTap: _editPort,
-              ),
-            ],
-          ),
-          const SizedBox(height: 24),
-          _buildSectionHeader(context, '存档管理'),
-          _buildSettingsCard(
-            children: [
-              _buildStaticTile(
-                icon: Icons.folder,
-                title: '存档位置',
-                subtitle: _saveLocation,
-              ),
-              _buildDivider(),
-              _buildStaticTile(
-                icon: Icons.info_outline,
-                title: '存档说明',
-                subtitle: '退出游戏时自动保存进度，再次进入自动读取。文件名与游戏 ROM 同名，如 口袋妖怪.state',
-              ),
-            ],
-          ),
-          const SizedBox(height: 24),
-          _buildSectionHeader(context, '关于'),
-          _buildSettingsCard(
-            children: [
-              _buildStaticTile(
-                icon: Icons.info_outline,
-                title: '版本',
-                subtitle: '1.0.0',
-              ),
-              _buildDivider(),
-              _buildStaticTile(
-                icon: Icons.description_outlined,
-                title: '介绍说明',
-                subtitle: '本应用用于管理和运行本地游戏（GBA / NES 等），支持游戏库、存档、局域网联机和虚拟手柄。',
-              ),
-            ],
-          ),
-          const SizedBox(height: 32),
+              const SizedBox(height: 32),
             ]),
           ),
         ),
@@ -330,9 +329,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       trailing: const Icon(Icons.chevron_right),
       onTap: () {
         Navigator.of(context).push(
-          MaterialPageRoute<void>(
-            builder: (_) => const SkinManagementScreen(),
-          ),
+          MaterialPageRoute<void>(builder: (_) => const SkinManagementScreen()),
         );
       },
     );
@@ -484,8 +481,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
             Text(
               '房间发现会自动使用 UDP 端口 = TCP + 1',
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: AppColors.onSurfaceVariant,
-                  ),
+                color: AppColors.onSurfaceVariant,
+              ),
             ),
           ],
         ),

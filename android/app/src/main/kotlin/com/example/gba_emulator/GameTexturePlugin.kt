@@ -8,12 +8,18 @@ import io.flutter.view.TextureRegistry
 
 class GameTexturePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     companion object {
-        init {
-            System.loadLibrary("game_texture")
-        }
-
         @Volatile
         private var activeProducer: TextureRegistry.SurfaceProducer? = null
+        @Volatile
+        private var nativeLoaded = false
+
+        @Synchronized
+        private fun ensureNativeLoaded() {
+            if (!nativeLoaded) {
+                System.loadLibrary("game_texture")
+                nativeLoaded = true
+            }
+        }
 
         @JvmStatic
         fun notifyFrame() {
@@ -60,12 +66,14 @@ class GameTexturePlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                     result.error("no_registry", "texture registry missing", null)
                     return
                 }
+                ensureNativeLoaded()
                 val producer = registry.createSurfaceProducer()
                 producer.setSize(width, height)
                 val id = producer.id()
                 producer.setCallback(
                     object : TextureRegistry.SurfaceProducer.Callback {
                         override fun onSurfaceAvailable() {
+                            ensureNativeLoaded()
                             val surface: Surface? = producer.surface
                             nativeSetSurface(surface)
                             surfaceOwnerId = id

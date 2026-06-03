@@ -56,10 +56,7 @@ class GamepadLayout {
   String get centerRightLabel => centerButtonLabels?.$2 ?? 'START';
 
   GamepadCenterStyle get resolvedCenterStyle =>
-      centerStyle ??
-      GamepadCenterStyle(
-        buttonSpacing: compact ? 8 : 10,
-      );
+      centerStyle ?? GamepadCenterStyle(buttonSpacing: compact ? 8 : 10);
 
   /// Retro face key used in [VirtualGamepad] builders.
   String labelForFace(String retroKey) {
@@ -138,10 +135,10 @@ class GamepadLayouts {
     showSelectStart: true,
     centerButtonLabels: ('COIN', 'START'),
     centerStyle: GamepadCenterStyle(
-      tiltRadians: -0.22,
-      buttonSpacing: 18,
-      buttonWidth: 56,
-      buttonHeight: 20,
+      tiltRadians: -0.28,
+      buttonSpacing: 16,
+      buttonWidth: 55,
+      buttonHeight: 24,
     ),
     showFaceAB: true,
     showFaceXY: true,
@@ -186,9 +183,6 @@ class GamepadLayouts {
   }
 
   static GamepadLayout byId(String id) {
-    return all.firstWhere(
-      (l) => l.id == id,
-      orElse: () => gba,
-    );
+    return all.firstWhere((l) => l.id == id, orElse: () => gba);
   }
 }

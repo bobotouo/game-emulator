@@ -1,5 +1,3 @@
-import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
 
 import '../../core/libretro/libretro_bindings.dart';
@@ -37,8 +35,10 @@ class ArcadeJoystick extends StatefulWidget {
 
 class _ArcadeJoystickState extends State<ArcadeJoystick> {
   Offset _knobOffset = Offset.zero;
+  int? _activePointer;
 
-  static const _deadZone = 0.18;
+  static const _deadZone = 0.16;
+  static const _axisThreshold = 0.34;
 
   void _handlePointer(Offset local, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
@@ -62,21 +62,17 @@ class _ArcadeJoystickState extends State<ArcadeJoystick> {
     };
 
     if (dist >= maxRadius * _deadZone) {
-      final angle = math.atan2(norm.dy, norm.dx);
-      directions[RETRO_DEVICE_ID_JOYPAD_RIGHT] =
-          angle >= -math.pi / 4 && angle <= math.pi / 4;
-      directions[RETRO_DEVICE_ID_JOYPAD_DOWN] =
-          angle > math.pi / 4 && angle < 3 * math.pi / 4;
-      directions[RETRO_DEVICE_ID_JOYPAD_LEFT] =
-          angle >= 3 * math.pi / 4 || angle <= -3 * math.pi / 4;
-      directions[RETRO_DEVICE_ID_JOYPAD_UP] =
-          angle < -math.pi / 4 && angle > -3 * math.pi / 4;
+      directions[RETRO_DEVICE_ID_JOYPAD_RIGHT] = norm.dx > _axisThreshold;
+      directions[RETRO_DEVICE_ID_JOYPAD_LEFT] = norm.dx < -_axisThreshold;
+      directions[RETRO_DEVICE_ID_JOYPAD_DOWN] = norm.dy > _axisThreshold;
+      directions[RETRO_DEVICE_ID_JOYPAD_UP] = norm.dy < -_axisThreshold;
     }
 
     widget.onDirectionsChanged(directions);
   }
 
   void _clear() {
+    _activePointer = null;
     setState(() => _knobOffset = Offset.zero);
     widget.onDirectionsCleared();
   }
@@ -87,10 +83,25 @@ class _ArcadeJoystickState extends State<ArcadeJoystick> {
 
     return Listener(
       behavior: HitTestBehavior.opaque,
-      onPointerDown: (e) => _handlePointer(e.localPosition, Size(widget.size, widget.size)),
-      onPointerMove: (e) => _handlePointer(e.localPosition, Size(widget.size, widget.size)),
-      onPointerUp: (_) => _clear(),
-      onPointerCancel: (_) => _clear(),
+      onPointerDown: (e) {
+        if (_activePointer != null) return;
+        _activePointer = e.pointer;
+        _handlePointer(e.localPosition, Size(widget.size, widget.size));
+      },
+      onPointerMove: (e) {
+        if (_activePointer != e.pointer) return;
+        _handlePointer(e.localPosition, Size(widget.size, widget.size));
+      },
+      onPointerUp: (e) {
+        if (_activePointer == e.pointer) {
+          _clear();
+        }
+      },
+      onPointerCancel: (e) {
+        if (_activePointer == e.pointer) {
+          _clear();
+        }
+      },
       child: SizedBox(
         width: widget.size,
         height: widget.size,
@@ -136,7 +147,9 @@ class _ArcadeJoystickState extends State<ArcadeJoystick> {
                   ),
                   boxShadow: [
                     BoxShadow(
-                      color: Colors.black.withValues(alpha: active ? 0.3 : 0.45),
+                      color: Colors.black.withValues(
+                        alpha: active ? 0.3 : 0.45,
+                      ),
                       blurRadius: active ? 6 : 10,
                       offset: Offset(0, active ? 2 : 5),
                     ),

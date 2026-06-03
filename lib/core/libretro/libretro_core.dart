@@ -166,10 +166,7 @@ class LibretroCore {
   }
 
   /// Prepare libretro directories before [retro_load_game].
-  Future<void> prepareForGame(
-    String romPath,
-    EmulatorCoreConfig config,
-  ) async {
+  Future<void> prepareForGame(String romPath, EmulatorCoreConfig config) async {
     _activeConfig = config;
     final saveDir = await StoragePathsService.getInGameSavesDirectory();
     if (_saveDirectoryNative != null) {
@@ -181,8 +178,15 @@ class LibretroCore {
     final systemDir = await StoragePathsService.getSystemDirectory();
     emu_loop.setSystemDirectory(systemDir.path);
 
-    final contentDir = await StoragePathsService.contentDirectoryForRom(romPath);
+    final contentDir = await StoragePathsService.contentDirectoryForRom(
+      romPath,
+    );
     emu_loop.setContentDirectory(contentDir);
+    if (config.system == EmulatorSystem.arcade) {
+      print(
+        'FBNeo paths: rom=$romPath system=${systemDir.path} content=$contentDir',
+      );
+    }
   }
 
   /// Prepare save directory path for libretro cores (battery saves).
@@ -213,7 +217,7 @@ class LibretroCore {
     final active = config ?? _activeConfig;
     final pathOnly = active?.loadViaPathOnly ?? false;
 
-    emu_loop.resetControllerPortCount();
+    emu_loop.resetLibretroProbeSession();
 
     final gameInfo = calloc<retro_game_info>();
     Pointer<Utf8>? pathNative;
@@ -302,20 +306,22 @@ class LibretroCore {
   Uint8List? saveState() {
     if (!_initialized || !_gameLoaded) return null;
 
-    final size = _bindings.retroSerializeSize();
-    if (size == 0) return null;
+    return emu_loop.runWithCoreLock(() {
+      final size = _bindings.retroSerializeSize();
+      if (size == 0) return null;
 
-    final data = calloc.allocate<Uint8>(size);
-    final success = _bindings.retroSerialize(data.cast<Void>(), size);
+      final data = calloc.allocate<Uint8>(size);
+      final success = _bindings.retroSerialize(data.cast<Void>(), size);
 
-    if (success) {
-      final result = Uint8List.fromList(data.asTypedList(size));
+      if (success) {
+        final result = Uint8List.fromList(data.asTypedList(size));
+        calloc.free(data);
+        return result;
+      }
+
       calloc.free(data);
-      return result;
-    }
-
-    calloc.free(data);
-    return null;
+      return null;
+    });
   }
 
   /// Load state
@@ -338,29 +344,35 @@ class LibretroCore {
       return false;
     }
 
-    final data = calloc.allocate<Uint8>(size);
-    data.asTypedList(size).setAll(0, state);
+    return emu_loop.runWithCoreLock(() {
+      final data = calloc.allocate<Uint8>(size);
+      data.asTypedList(size).setAll(0, state);
 
-    final success = _bindings.retroUnserialize(data.cast<Void>(), size);
-    calloc.free(data);
+      final success = _bindings.retroUnserialize(data.cast<Void>(), size);
+      calloc.free(data);
 
-    if (!success) {
-      onError?.call('retro_unserialize returned false');
-    }
+      if (!success) {
+        onError?.call('retro_unserialize returned false');
+      }
 
-    return success;
+      return success;
+    });
   }
 
   /// Reset the game
   void reset() {
     if (!_initialized || !_gameLoaded) return;
-    _bindings.retroReset();
+    emu_loop.runWithCoreLock(() {
+      _bindings.retroReset();
+    });
   }
 
   /// Unload game
   void unloadGame() {
     if (!_initialized || !_gameLoaded) return;
-    _bindings.retroUnloadGame();
+    emu_loop.runWithCoreLock(() {
+      _bindings.retroUnloadGame();
+    });
     _gameLoaded = false;
     _releaseRomPathNative();
   }

@@ -30,8 +30,14 @@ class VirtualGamepad extends StatefulWidget {
 
 class _VirtualGamepadState extends State<VirtualGamepad> {
   final Map<int, bool> _inputState = {};
+  final Map<int, Set<int>> _arcadePointerButtons = {};
 
-  double get _dpadSize => widget.layout.compact ? 100.0 : 116.0;
+  double get _dpadSize {
+    if (widget.layout.id == 'arcade') {
+      return 96.0;
+    }
+    return widget.layout.compact ? 100.0 : 116.0;
+  }
 
   GamepadSkin get _skin => widget.skin;
 
@@ -111,7 +117,8 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
   @override
   Widget build(BuildContext context) {
     final bottomInset = MediaQuery.paddingOf(context).bottom;
-    final hPad = widget.overlay ? 24.0 : 12.0;
+    final isArcade = widget.layout.id == 'arcade';
+    final hPad = widget.overlay ? (isArcade ? 12.0 : 24.0) : 12.0;
 
     final controls = Padding(
       padding: EdgeInsets.fromLTRB(
@@ -216,23 +223,49 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
 
   Widget _buildCenterButtons() {
     if (widget.overlay) {
+      final center = widget.layout.resolvedCenterStyle;
       return Row(
         mainAxisSize: MainAxisSize.min,
         children: [
           _buildBarButton(
             label: widget.layout.centerLeftLabel,
             button: RETRO_DEVICE_ID_JOYPAD_SELECT,
-            width: widget.layout.resolvedCenterStyle.buttonWidth,
-            height: widget.layout.resolvedCenterStyle.buttonHeight,
+            width: center.buttonWidth,
+            height: center.buttonHeight,
           ),
-          const SizedBox(width: 12),
+          SizedBox(width: widget.layout.id == 'arcade' ? 10 : 12),
           _buildBarButton(
             label: widget.layout.centerRightLabel,
             button: RETRO_DEVICE_ID_JOYPAD_START,
-            width: widget.layout.resolvedCenterStyle.buttonWidth,
-            height: widget.layout.resolvedCenterStyle.buttonHeight,
+            width: center.buttonWidth,
+            height: center.buttonHeight,
           ),
         ],
+      );
+    }
+
+    if (widget.layout.id == 'arcade') {
+      final center = widget.layout.resolvedCenterStyle;
+      return Transform.rotate(
+        angle: center.tiltRadians,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _buildBarButton(
+              label: widget.layout.centerLeftLabel,
+              button: RETRO_DEVICE_ID_JOYPAD_SELECT,
+              width: center.buttonWidth,
+              height: center.buttonHeight,
+            ),
+            SizedBox(height: center.buttonSpacing),
+            _buildBarButton(
+              label: widget.layout.centerRightLabel,
+              button: RETRO_DEVICE_ID_JOYPAD_START,
+              width: center.buttonWidth,
+              height: center.buttonHeight,
+            ),
+          ],
+        ),
       );
     }
 
@@ -372,6 +405,9 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
   }
 
   Widget _buildActionButtons() {
+    if (widget.layout.id == 'arcade') {
+      return _buildArcadeFaceButtons();
+    }
     if (widget.layout.showFaceXY) {
       return _buildFourFaceButtons();
     }
@@ -471,6 +507,130 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
     );
   }
 
+  List<_ArcadeButtonSpec> _arcadeButtonSpecs(
+    double size,
+    double diameter,
+    double offsetX,
+  ) {
+    final r = diameter / 2;
+    return [
+      _ArcadeButtonSpec(
+        label: 'C',
+        button: RETRO_DEVICE_ID_JOYPAD_Y,
+        center: Offset(offsetX + r, r),
+      ),
+      _ArcadeButtonSpec(
+        label: 'D',
+        button: RETRO_DEVICE_ID_JOYPAD_X,
+        center: Offset(offsetX + r + size * 0.42, r),
+      ),
+      _ArcadeButtonSpec(
+        label: 'A',
+        button: RETRO_DEVICE_ID_JOYPAD_B,
+        center: Offset(offsetX + r, r + size * 0.38),
+      ),
+      _ArcadeButtonSpec(
+        label: 'B',
+        button: RETRO_DEVICE_ID_JOYPAD_A,
+        center: Offset(offsetX + r + size * 0.42, r + size * 0.38),
+      ),
+    ];
+  }
+
+  Widget _buildArcadeFaceButtons() {
+    const diameter = 48.0;
+    const areaW = 150.0;
+    const areaH = 108.0;
+    const groupOffsetX = 18.0;
+    final specs = _arcadeButtonSpecs(areaW, diameter, groupOffsetX);
+
+    return Listener(
+      behavior: HitTestBehavior.opaque,
+      onPointerDown: (event) {
+        _setArcadePointerButtons(
+          event.pointer,
+          _hitArcadeButtons(event.localPosition, specs, diameter),
+        );
+      },
+      onPointerMove: (event) {
+        _setArcadePointerButtons(
+          event.pointer,
+          _hitArcadeButtons(event.localPosition, specs, diameter),
+        );
+      },
+      onPointerUp: (event) => _setArcadePointerButtons(event.pointer, const {}),
+      onPointerCancel: (event) =>
+          _setArcadePointerButtons(event.pointer, const {}),
+      child: SizedBox(
+        width: areaW,
+        height: areaH,
+        child: Stack(
+          children: [
+            for (final spec in specs)
+              Positioned(
+                left: spec.center.dx - diameter / 2,
+                top: spec.center.dy - diameter / 2,
+                child: _buildActionButtonVisual(
+                  label: spec.label,
+                  button: spec.button,
+                  diameter: diameter,
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Set<int> _hitArcadeButtons(
+    Offset local,
+    List<_ArcadeButtonSpec> specs,
+    double diameter,
+  ) {
+    // Treat one touch as a finger pad, not a pin-point. Arcade players often
+    // press one button while the finger edge covers adjacent buttons.
+    final radius = diameter * 0.95;
+    final buttons = <int>{};
+    for (final spec in specs) {
+      final distance = (local - spec.center).distance;
+      if (distance <= radius) {
+        buttons.add(spec.button);
+      }
+    }
+    return buttons;
+  }
+
+  void _setArcadePointerButtons(int pointer, Set<int> buttons) {
+    final old = _arcadePointerButtons[pointer] ?? const <int>{};
+    if (_sameButtonSet(old, buttons)) return;
+
+    _arcadePointerButtons.remove(pointer);
+    for (final button in old.difference(buttons)) {
+      if (!_isButtonHeldByAnotherArcadePointer(button)) {
+        _updateInput(button, false);
+      }
+    }
+
+    if (buttons.isNotEmpty) {
+      _arcadePointerButtons[pointer] = Set<int>.from(buttons);
+    }
+    for (final button in buttons.difference(old)) {
+      _updateInput(button, true);
+    }
+  }
+
+  bool _isButtonHeldByAnotherArcadePointer(int button) {
+    return _arcadePointerButtons.values.any((held) => held.contains(button));
+  }
+
+  bool _sameButtonSet(Set<int> a, Set<int> b) {
+    if (a.length != b.length) return false;
+    for (final value in a) {
+      if (!b.contains(value)) return false;
+    }
+    return true;
+  }
+
   ({Color base, Color dark, Color text})? _arcadeFacePalette(String label) {
     if (widget.layout.id != 'arcade') {
       return null;
@@ -510,6 +670,23 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
     required int button,
     required double diameter,
   }) {
+    return GestureDetector(
+      onTapDown: (_) => _updateInput(button, true),
+      onTapUp: (_) => _updateInput(button, false),
+      onTapCancel: () => _updateInput(button, false),
+      child: _buildActionButtonVisual(
+        label: label,
+        button: button,
+        diameter: diameter,
+      ),
+    );
+  }
+
+  Widget _buildActionButtonVisual({
+    required String label,
+    required int button,
+    required double diameter,
+  }) {
     final isPressed = _inputState[button] == true;
     final arcadePalette = _arcadeFacePalette(label);
     final baseColor = arcadePalette?.base ?? _skin.faceButtonColor(label);
@@ -521,64 +698,65 @@ class _VirtualGamepadState extends State<VirtualGamepad> {
         ? 18.0
         : 21.0;
 
-    return GestureDetector(
-      onTapDown: (_) => _updateInput(button, true),
-      onTapUp: (_) => _updateInput(button, false),
-      onTapCancel: () => _updateInput(button, false),
-      child: SizedBox(
-        width: diameter,
-        height: diameter + 4,
-        child: Transform.translate(
-          offset: Offset(0, isPressed ? 2 : 0),
-          child: Container(
-            width: diameter,
-            height: diameter,
-            alignment: Alignment.center,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              gradient: RadialGradient(
-                center: const Alignment(-0.35, -0.45),
-                radius: 0.9,
-                colors: [
-                  baseColor.withValues(alpha: 0.98),
-                  baseColor,
-                  darkColor,
-                ],
-                stops: const [0.0, 0.48, 1.0],
+    return SizedBox(
+      width: diameter,
+      height: diameter + 4,
+      child: Transform.translate(
+        offset: Offset(0, isPressed ? 2 : 0),
+        child: Container(
+          width: diameter,
+          height: diameter,
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            gradient: RadialGradient(
+              center: const Alignment(-0.35, -0.45),
+              radius: 0.9,
+              colors: [baseColor.withValues(alpha: 0.98), baseColor, darkColor],
+              stops: const [0.0, 0.48, 1.0],
+            ),
+            border: Border.all(color: Colors.white.withValues(alpha: 0.20)),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: isPressed ? 0.24 : 0.4),
+                blurRadius: isPressed ? 5 : 10,
+                offset: Offset(0, isPressed ? 3 : 6),
               ),
-              border: Border.all(
-                color: Colors.white.withValues(alpha: 0.20),
+              BoxShadow(
+                color: baseColor.withValues(alpha: isPressed ? 0.12 : 0.20),
+                blurRadius: isPressed ? 8 : 14,
               ),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.black.withValues(alpha: isPressed ? 0.24 : 0.4),
-                  blurRadius: isPressed ? 5 : 10,
-                  offset: Offset(0, isPressed ? 3 : 6),
-                ),
-                BoxShadow(
-                  color: baseColor.withValues(alpha: isPressed ? 0.12 : 0.20),
-                  blurRadius: isPressed ? 8 : 14,
+            ],
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: fontSize,
+              fontWeight: FontWeight.w800,
+              color: textColor.withValues(alpha: 0.96),
+              shadows: [
+                Shadow(
+                  color: Colors.black.withValues(alpha: 0.22),
+                  offset: const Offset(0, 1),
+                  blurRadius: 2,
                 ),
               ],
-            ),
-            child: Text(
-              label,
-              style: TextStyle(
-                fontSize: fontSize,
-                fontWeight: FontWeight.w800,
-                color: textColor.withValues(alpha: 0.96),
-                shadows: [
-                  Shadow(
-                    color: Colors.black.withValues(alpha: 0.22),
-                    offset: const Offset(0, 1),
-                    blurRadius: 2,
-                  ),
-                ],
-              ),
             ),
           ),
         ),
       ),
     );
   }
+}
+
+class _ArcadeButtonSpec {
+  const _ArcadeButtonSpec({
+    required this.label,
+    required this.button,
+    required this.center,
+  });
+
+  final String label;
+  final int button;
+  final Offset center;
 }

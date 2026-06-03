@@ -251,6 +251,23 @@ final stopNativeLoop = emuLoopLib.lookupFunction<_VoidNative, _VoidDart>(
   'emulator_loop_stop',
 );
 
+final _coreLock = emuLoopLib.lookupFunction<_VoidNative, _VoidDart>(
+  'emulator_loop_core_lock',
+);
+
+final _coreUnlock = emuLoopLib.lookupFunction<_VoidNative, _VoidDart>(
+  'emulator_loop_core_unlock',
+);
+
+T runWithCoreLock<T>(T Function() action) {
+  _coreLock();
+  try {
+    return action();
+  } finally {
+    _coreUnlock();
+  }
+}
+
 typedef _PausedNative = Void Function(Bool);
 typedef _PausedDart = void Function(bool);
 final setLoopPaused = emuLoopLib.lookupFunction<_PausedNative, _PausedDart>(
@@ -386,10 +403,15 @@ final _audioFlush = emuLoopLib.lookupFunction<_VoidNative, _VoidDart>(
 
 void flushAudioRing() => _audioFlush();
 
+final _resetVideoState = emuLoopLib.lookupFunction<_VoidNative, _VoidDart>(
+  'emulator_loop_reset_video_state',
+);
+
 /// Reset native state after a short libretro probe (thumbnail / import verify).
 void resetLibretroProbeSession() {
   clearInputs();
   flushAudioRing();
+  _resetVideoState();
   resetControllerPortCount();
   setEmulationSpeed(1);
 }
@@ -447,9 +469,9 @@ final _setAudioPlaybackSpeed = Platform.isIOS
       )
     : null;
 
-/// Fast-forward: run [speed] retro_run calls per frame period (1–5).
+/// Fast-forward: run [speed] retro_run calls per frame period (1–3).
 void setEmulationSpeed(int speed) {
-  final clamped = speed.clamp(1, 5);
+  final clamped = speed.clamp(1, 3);
   _setEmulationSpeed(clamped);
   _setAudioPlaybackSpeed?.call(clamped);
 }
@@ -494,6 +516,8 @@ class FrameCapture {
   const FrameCapture(this.rgba, this.width, this.height);
 }
 
+const int _maxCapturedFrameBytes = 1024 * 1024 * 4;
+
 typedef _FrameSerialNative = Uint64 Function();
 typedef _FrameSerialDart = int Function();
 final _lastFrameSerial = emuLoopLib
@@ -534,9 +558,11 @@ FrameCapture? captureLastFrame() {
     if (ptr == nullptr) return null;
     final w = wPtr.value;
     final h = hPtr.value;
-    if (w <= 0 || h <= 0) return null;
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return null;
+    final byteCount = w * h * 4;
+    if (byteCount <= 0 || byteCount > _maxCapturedFrameBytes) return null;
     // Copy because gConvBuf can be overwritten on the emulation thread.
-    return FrameCapture(Uint8List.fromList(ptr.asTypedList(w * h * 4)), w, h);
+    return FrameCapture(Uint8List.fromList(ptr.asTypedList(byteCount)), w, h);
   } finally {
     calloc.free(wPtr);
     calloc.free(hPtr);

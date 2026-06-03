@@ -151,12 +151,12 @@ class NetplayMessage {
   }) => NetplayMessage(NetplayMessageType.hostPromote, {
     'room': room,
     'playerName': playerName,
-    'gameSpeed': gameSpeed.clamp(1, 5),
+    'gameSpeed': gameSpeed.clamp(1, 3),
   });
 
   static NetplayMessage gameSpeed({required int speed}) => NetplayMessage(
     NetplayMessageType.gameSpeed,
-    {'speed': speed.clamp(1, 5)},
+    {'speed': speed.clamp(1, 3)},
   );
 }
 

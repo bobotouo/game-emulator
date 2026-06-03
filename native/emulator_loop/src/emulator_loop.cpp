@@ -9,6 +9,10 @@
 #include <climits>
 #include <mutex>
 
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
+
 static void AudioLog(const char* fmt, ...) {
   char buf[512];
   va_list args;
@@ -29,8 +33,21 @@ static void AudioLog(const char* fmt, ...) {
 #define _RETRO_ENV_GET_TARGET_SAMPLE_RATE 67
 #define _RETRO_ENV_SET_CONTROLLER_INFO 35
 #define _RETRO_ENV_GET_INPUT_BITMASKS 51
+#define _RETRO_ENV_SET_MESSAGE 6
+#define _RETRO_ENV_GET_LOG_INTERFACE 27
 
 #define RETRO_DEVICE_ID_JOYPAD_MASK 256
+
+struct retro_message {
+  const char* msg;
+  unsigned frames;
+};
+
+typedef void (*retro_log_printf_t)(unsigned level, const char* fmt, ...);
+
+struct retro_log_callback {
+  retro_log_printf_t log;
+};
 
 struct retro_controller_description {
   const char* desc;
@@ -118,13 +135,42 @@ struct retro_rumble_interface {
   retro_set_rumble_state_t set_rumble_state;
 };
 
-// Thumbnail / no-texture fallback only (not used during gameplay on iOS).
-static uint8_t gConvBuf[512 * 512 * 4];
+// Thumbnail / no-texture fallback and Android texture upload buffer.
+// Some arcade cores can report frames larger than handheld defaults.
+static uint8_t gConvBuf[1024 * 1024 * 4];
 static std::atomic<int32_t> gLastW{0};
 static std::atomic<int32_t> gLastH{0};
 static std::atomic<uint64_t> gFrameSerial{0};
 static std::atomic<bool> gPresentToTexture{true};
 static std::atomic<bool> gSilentFrameOutput{false};
+static std::atomic<bool> gLoggedFirstVideoFrame{false};
+
+static const char* LogLevelName(unsigned level) {
+  switch (level) {
+    case 0: return "DEBUG";
+    case 1: return "INFO";
+    case 2: return "WARN";
+    case 3: return "ERROR";
+    default: return "LOG";
+  }
+}
+
+static void LibretroLog(unsigned level, const char* fmt, ...) {
+  if (fmt == nullptr) return;
+  va_list args;
+  va_start(args, fmt);
+#if defined(__ANDROID__)
+  const int priority = level >= 3 ? ANDROID_LOG_ERROR :
+                       level == 2 ? ANDROID_LOG_WARN :
+                       ANDROID_LOG_INFO;
+  __android_log_vprint(priority, "FBNeo", fmt, args);
+#else
+  std::fprintf(stderr, "[FBNeo %s] ", LogLevelName(level));
+  std::vfprintf(stderr, fmt, args);
+  std::fflush(stderr);
+#endif
+  va_end(args);
+}
 
 #if defined(__APPLE__) && TARGET_OS_IOS
 // Libretro XRGB8888 memory layout is B,G,R,x — write BGRA directly into IOSurface.
@@ -316,11 +362,13 @@ static void C_VideoRefresh(const void* data, unsigned width, unsigned height, si
   const int32_t srcPitch = (int32_t)pitch;
   const int fmt = gPixelFormat.load(std::memory_order_relaxed);
 
-  gLastW.store(w, std::memory_order_relaxed);
-  gLastH.store(h, std::memory_order_relaxed);
-  gFrameSerial.fetch_add(1, std::memory_order_relaxed);
-
-  if (w * h * 4 > (int32_t)sizeof(gConvBuf)) return;
+  if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return;
+  const int64_t requiredBytes = (int64_t)w * (int64_t)h * 4;
+  if (requiredBytes <= 0 || requiredBytes > (int64_t)sizeof(gConvBuf)) {
+    gLastW.store(0, std::memory_order_relaxed);
+    gLastH.store(0, std::memory_order_relaxed);
+    return;
+  }
 
   if (fmt == EMU_PIXEL_FORMAT_XRGB8888) {
     ConvertXrgb8888ToRgba(src, gConvBuf, w, h, srcPitch);
@@ -329,6 +377,22 @@ static void C_VideoRefresh(const void* data, unsigned width, unsigned height, si
   } else {
     Convert0rgb1555(src, gConvBuf, w, h, srcPitch);
   }
+
+  if (!gLoggedFirstVideoFrame.exchange(true, std::memory_order_relaxed)) {
+    LibretroLog(
+      1,
+      "first video frame: %dx%d pitch=%d format=%d bytes=%lld\n",
+      w,
+      h,
+      srcPitch,
+      fmt,
+      (long long)requiredBytes
+    );
+  }
+
+  gLastW.store(w, std::memory_order_relaxed);
+  gLastH.store(h, std::memory_order_relaxed);
+  gFrameSerial.fetch_add(1, std::memory_order_relaxed);
 
 #if defined(__APPLE__) && TARGET_OS_IOS
   if (gPresentToTexture.load(std::memory_order_relaxed)) {
@@ -396,6 +460,16 @@ static bool C_SetRumbleState(unsigned port, unsigned effect, uint16_t strength) 
 }
 
 static unsigned C_Environment(unsigned cmd, void* data) {
+  if (cmd == _RETRO_ENV_SET_MESSAGE) {
+    if (data) {
+      const auto* message = static_cast<const retro_message*>(data);
+      if (message->msg != nullptr) {
+        LibretroLog(1, "message: %s\n", message->msg);
+      }
+      return 1;
+    }
+    return 0;
+  }
   if (cmd == _RETRO_ENV_SET_PIXEL_FORMAT) {
     if (data) {
       gPixelFormat.store(*(const int32_t*)data, std::memory_order_relaxed);
@@ -470,6 +544,14 @@ static unsigned C_Environment(unsigned cmd, void* data) {
   }
   if (cmd == _RETRO_ENV_GET_INPUT_BITMASKS) {
     return 1;
+  }
+  if (cmd == _RETRO_ENV_GET_LOG_INTERFACE) {
+    if (data) {
+      auto* callback = static_cast<retro_log_callback*>(data);
+      callback->log = LibretroLog;
+      return 1;
+    }
+    return 0;
   }
   return 0;
 }
@@ -555,6 +637,13 @@ const uint8_t* emulator_loop_last_frame(int32_t* width_out, int32_t* height_out)
 
 uint64_t emulator_loop_last_frame_serial(void) {
   return gFrameSerial.load(std::memory_order_acquire);
+}
+
+void emulator_loop_reset_video_state(void) {
+  gLastW.store(0, std::memory_order_relaxed);
+  gLastH.store(0, std::memory_order_relaxed);
+  gFrameSerial.store(0, std::memory_order_relaxed);
+  gLoggedFirstVideoFrame.store(false, std::memory_order_relaxed);
 }
 
 void emulator_loop_set_save_directory(const char* path) {
@@ -702,6 +791,14 @@ void emulator_loop_advance_frame(emu_retro_run_t retro_run) {
   std::lock_guard<std::mutex> lock(gCoreMutex);
   retro_run();
   emulator_loop_on_retro_frame_completed();
+}
+
+void emulator_loop_core_lock(void) {
+  gCoreMutex.lock();
+}
+
+void emulator_loop_core_unlock(void) {
+  gCoreMutex.unlock();
 }
 
 void emulator_loop_netplay_begin(emu_snapshot_fn serialize, emu_restore_fn restore,

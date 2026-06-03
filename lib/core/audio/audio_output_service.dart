@@ -43,12 +43,10 @@ class AudioOutputService {
   /// Call once from [main] on Android so the first game does not cold-start AAudio.
   static Future<void> warmUpEngine() async {
     if (!Platform.isAndroid) return;
+    if (kDebugMode) return;
     if (SoLoud.instance.isInitialized) return;
     try {
-      await SoLoud.instance.init(
-        sampleRate: 48000,
-        channels: Channels.stereo,
-      );
+      await SoLoud.instance.init(sampleRate: 48000, channels: Channels.stereo);
       logAudio('SoLoud warmUpEngine ok');
     } catch (error, stackTrace) {
       debugPrint('AudioOutputService warmUpEngine: $error\n$stackTrace');
@@ -61,10 +59,7 @@ class AudioOutputService {
     _playing = false;
   }
 
-  Future<void> initialize({
-    required double sampleRate,
-    double volume = 1,
-  }) {
+  Future<void> initialize({required double sampleRate, double volume = 1}) {
     return _enqueue(() async {
       _shuttingDown = false;
       _sampleRate = sampleRate;
@@ -126,7 +121,6 @@ class AudioOutputService {
         paused: _paused,
       );
       _playing = true;
-      _applyPlaySpeed();
     } catch (error, stackTrace) {
       debugPrint('AudioOutputService _startStream: $error\n$stackTrace');
       _stream = null;
@@ -137,24 +131,12 @@ class AudioOutputService {
   }
 
   void setSpeed(double speed) {
-    final next = speed.clamp(1.0, 5.0);
+    final next = speed.clamp(1.0, 3.0);
     if (_speed == next) return;
     _speed = next;
     if (_useNativeAudio) {
       emu_loop.setEmulationSpeed(next.round());
-      return;
     }
-    _applyPlaySpeed();
-  }
-
-  void _applyPlaySpeed() {
-    if (_useNativeAudio || _shuttingDown) return;
-    final handle = _handle;
-    if (!_ready || handle == null || !_playing) return;
-
-    try {
-      SoLoud.instance.setRelativePlaySpeed(handle, _speed);
-    } catch (_) {}
   }
 
   void addSamples(Int16List samples) {
@@ -165,10 +147,7 @@ class AudioOutputService {
     }
 
     final bytes = Uint8List.fromList(
-      samples.buffer.asUint8List(
-        samples.offsetInBytes,
-        samples.lengthInBytes,
-      ),
+      samples.buffer.asUint8List(samples.offsetInBytes, samples.lengthInBytes),
     );
 
     try {

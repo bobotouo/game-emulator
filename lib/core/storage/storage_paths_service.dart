@@ -89,22 +89,30 @@ class StoragePathsService {
       await dir.create(recursive: true);
     }
     await _seedBundledBios(dir);
+    await _seedBundledBios(Directory('${dir.path}/fbneo'));
     _systemDir = dir;
     return dir;
   }
 
-  /// Copy [bundledBiosAssets] into system dir if missing (does not overwrite).
+  /// Copy [bundledBiosAssets] into system dir, repairing stale partial copies.
   static Future<void> _seedBundledBios(Directory systemDir) async {
+    if (!await systemDir.exists()) {
+      await systemDir.create(recursive: true);
+    }
     for (final assetPath in bundledBiosAssets) {
       final name = assetPath.split('/').last;
       final dest = File('${systemDir.path}/$name');
-      if (await dest.exists()) continue;
 
       try {
         final data = await rootBundle.load(assetPath);
-        await dest.writeAsBytes(
-          data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
+        final bytes = data.buffer.asUint8List(
+          data.offsetInBytes,
+          data.lengthInBytes,
         );
+        if (await dest.exists() && await dest.length() == bytes.length) {
+          continue;
+        }
+        await dest.writeAsBytes(bytes, flush: true);
       } catch (_) {
         // Asset not in build (e.g. omitted from pubspec); skip quietly.
       }
@@ -226,7 +234,10 @@ class StoragePathsService {
 
   static String _saveKeyFromRomPath(String romPath) {
     final baseName = _basenameWithoutExtension(romPath);
-    return baseName.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_').trim().toLowerCase();
+    return baseName
+        .replaceAll(RegExp(r'[<>:"/\\|?*]'), '_')
+        .trim()
+        .toLowerCase();
   }
 
   static Future<Directory> _getAccessibleRootDirectory() async {
@@ -248,9 +259,7 @@ class StoragePathsService {
         }
       }
 
-      throw StateError(
-        '无法写入公共存储目录 $androidPublicRoot，请在系统设置中授予「所有文件访问」权限后重试',
-      );
+      throw StateError('无法写入公共存储目录 $androidPublicRoot，请在系统设置中授予「所有文件访问」权限后重试');
     }
 
     if (Platform.isIOS) {

@@ -661,7 +661,7 @@ class NetplayService {
   }
 
   void _publishGameSpeed(int speed, {required bool broadcast}) {
-    final clamped = speed.clamp(1, 5);
+    final clamped = speed.clamp(1, 3);
     if (_gameSpeed == clamped) {
       return;
     }
@@ -1097,7 +1097,7 @@ class NetplayService {
     }
 
     final promotedSpeed = (message.payload['gameSpeed'] as num?)?.toInt() ?? 1;
-    _gameSpeed = promotedSpeed.clamp(1, 5);
+    _gameSpeed = promotedSpeed.clamp(1, 3);
     _gameSpeedController.add(_gameSpeed);
 
     enterLobby();
