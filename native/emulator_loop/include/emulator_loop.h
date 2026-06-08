@@ -7,6 +7,16 @@
 extern "C" {
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define EMU_LOOP_FFI_EXPORT __attribute__((visibility("default"))) __attribute__((used))
+#else
+#define EMU_LOOP_FFI_EXPORT
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC visibility push(default)
+#endif
+
 // ── Pixel format constants (mirrors libretro) ──────────────────────────────
 #define EMU_PIXEL_FORMAT_0RGB1555 0
 #define EMU_PIXEL_FORMAT_XRGB8888 1
@@ -58,7 +68,7 @@ void emulator_loop_set_input_bit(int32_t btn_id, bool pressed);
 void emulator_loop_set_input_bit_for_port(unsigned port, int32_t btn_id,
                                           bool pressed);
 void emulator_loop_set_port_input_mask(unsigned port, uint64_t mask);
-void emulator_loop_clear_inputs(void);
+EMU_LOOP_FFI_EXPORT void emulator_loop_clear_inputs(void);
 
 // ── Audio ring buffer ───────────────────────────────────────────────────────
 int32_t emulator_loop_audio_available(void);
@@ -142,3 +152,9 @@ void emulator_loop_netpacket_push(const uint8_t* data, int32_t size,
 #ifdef __cplusplus
 }
 #endif
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC visibility pop
+#endif
+
+#undef EMU_LOOP_FFI_EXPORT

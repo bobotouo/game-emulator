@@ -7,6 +7,10 @@
 extern "C" {
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC visibility push(default)
+#endif
+
 /// Upload RGBA8888 rows (Android / fallback).
 void game_texture_upload_rgba(const uint8_t* src, int32_t width, int32_t height,
                               int32_t pitch_bytes);
@@ -35,6 +39,10 @@ uint64_t game_texture_ios_presented_frame_count(void);
 
 /// Android: register SurfaceProducer entry (called from Kotlin plugin).
 void game_texture_android_set_active(void* producer_context);
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC visibility pop
+#endif
 
 #ifdef __cplusplus
 }

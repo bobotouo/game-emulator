@@ -3,6 +3,7 @@
 // of Flutter's rendering thread.
 
 #include "emulator_loop.h"
+#include "game_texture.h"
 
 #import <Foundation/Foundation.h>
 #include <mach/mach_time.h>
@@ -13,6 +14,75 @@ static std::atomic<bool> gRunning{false};
 static std::atomic<bool> gPaused{false};
 static std::atomic<int32_t> gSpeed{1};
 static dispatch_semaphore_t gStopDone = nil;
+
+namespace {
+__attribute__((used)) const void* const kKeepDartFfiSymbols[] = {
+    reinterpret_cast<const void*>(&emulator_loop_video_cb),
+    reinterpret_cast<const void*>(&emulator_loop_audio_batch_cb),
+    reinterpret_cast<const void*>(&emulator_loop_audio_single_cb),
+    reinterpret_cast<const void*>(&emulator_loop_input_poll_cb),
+    reinterpret_cast<const void*>(&emulator_loop_input_state_cb),
+    reinterpret_cast<const void*>(&emulator_loop_environment_cb),
+    reinterpret_cast<const void*>(&emulator_loop_set_pixel_format),
+    reinterpret_cast<const void*>(&emulator_loop_start),
+    reinterpret_cast<const void*>(&emulator_loop_stop),
+    reinterpret_cast<const void*>(&emulator_loop_set_paused),
+    reinterpret_cast<const void*>(&emulator_loop_set_speed),
+    reinterpret_cast<const void*>(&emulator_loop_is_running),
+    reinterpret_cast<const void*>(&emulator_loop_run_frames),
+    reinterpret_cast<const void*>(&emulator_loop_advance_frame),
+    reinterpret_cast<const void*>(&emulator_loop_core_lock),
+    reinterpret_cast<const void*>(&emulator_loop_core_unlock),
+    reinterpret_cast<const void*>(&emulator_loop_wait_until_stopped),
+    reinterpret_cast<const void*>(&emulator_loop_set_input_bit),
+    reinterpret_cast<const void*>(&emulator_loop_set_input_bit_for_port),
+    reinterpret_cast<const void*>(&emulator_loop_set_port_input_mask),
+    reinterpret_cast<const void*>(&emulator_loop_clear_inputs),
+    reinterpret_cast<const void*>(&emulator_loop_audio_available),
+    reinterpret_cast<const void*>(&emulator_loop_audio_read),
+    reinterpret_cast<const void*>(&emulator_loop_audio_discard),
+    reinterpret_cast<const void*>(&emulator_loop_audio_flush),
+    reinterpret_cast<const void*>(&emulator_loop_audio_target_samples),
+    reinterpret_cast<const void*>(&emulator_loop_audio_set_target_samples),
+    reinterpret_cast<const void*>(&emulator_loop_set_target_sample_rate),
+    reinterpret_cast<const void*>(&emulator_loop_get_reported_sample_rate),
+    reinterpret_cast<const void*>(&emulator_loop_prepare_audio_output_rate),
+    reinterpret_cast<const void*>(&emulator_loop_audio_start),
+    reinterpret_cast<const void*>(&emulator_loop_audio_stop),
+    reinterpret_cast<const void*>(&emulator_loop_audio_set_paused),
+    reinterpret_cast<const void*>(&emulator_loop_audio_set_playback_speed),
+    reinterpret_cast<const void*>(&emulator_loop_frame_count),
+    reinterpret_cast<const void*>(&emulator_loop_rumble_sequence),
+    reinterpret_cast<const void*>(&emulator_loop_rumble_strong),
+    reinterpret_cast<const void*>(&emulator_loop_rumble_weak),
+    reinterpret_cast<const void*>(&emulator_loop_set_save_directory),
+    reinterpret_cast<const void*>(&emulator_loop_set_system_directory),
+    reinterpret_cast<const void*>(&emulator_loop_set_content_directory),
+    reinterpret_cast<const void*>(&emulator_loop_reset_controller_ports),
+    reinterpret_cast<const void*>(&emulator_loop_get_controller_ports),
+    reinterpret_cast<const void*>(&emulator_loop_set_present_to_texture),
+    reinterpret_cast<const void*>(&emulator_loop_set_silent_frame_output),
+    reinterpret_cast<const void*>(&emulator_loop_last_frame),
+    reinterpret_cast<const void*>(&emulator_loop_last_frame_serial),
+    reinterpret_cast<const void*>(&emulator_loop_reset_video_state),
+    reinterpret_cast<const void*>(&emulator_loop_on_retro_frame_completed),
+    reinterpret_cast<const void*>(&emulator_loop_netplay_begin),
+    reinterpret_cast<const void*>(&emulator_loop_netplay_end),
+    reinterpret_cast<const void*>(&emulator_loop_netplay_load_frame),
+    reinterpret_cast<const void*>(&emulator_loop_netplay_sim_frame),
+    reinterpret_cast<const void*>(&emulator_loop_netplay_set_sim_frame),
+    reinterpret_cast<const void*>(&emulator_loop_set_gpsp_serial_mode),
+    reinterpret_cast<const void*>(&emulator_loop_netpacket_available),
+    reinterpret_cast<const void*>(&emulator_loop_netpacket_start),
+    reinterpret_cast<const void*>(&emulator_loop_netpacket_stop),
+    reinterpret_cast<const void*>(&emulator_loop_netpacket_connect),
+    reinterpret_cast<const void*>(&emulator_loop_netpacket_disconnect),
+    reinterpret_cast<const void*>(&emulator_loop_netpacket_read),
+    reinterpret_cast<const void*>(&emulator_loop_netpacket_push),
+    reinterpret_cast<const void*>(&game_texture_upload_rgba),
+    reinterpret_cast<const void*>(&game_texture_ios_presented_frame_count),
+};
+}
 
 extern "C" {
 
