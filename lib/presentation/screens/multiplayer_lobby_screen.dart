@@ -322,6 +322,9 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
   }
 
   Future<void> _scanInternetDirectRoom() async {
+    if (_joiningRoom) {
+      return;
+    }
     if (!AppSettingsService.instance.networkEnabled) {
       _showNetworkDisabledMessage();
       return;
@@ -351,36 +354,109 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
       return;
     }
 
-    final success = await _netplay.joinInternetDirectRoom(
-      code,
-      playerName: 'Player 2',
-    );
-    if (!mounted) {
-      return;
-    }
-    if (!success) {
-      ScaffoldMessenger.of(
+    _joiningRoom = true;
+    var loadingVisible = false;
+    try {
+      _showInternetDirectJoiningDialog();
+      loadingVisible = true;
+
+      final success = await _netplay.joinInternetDirectRoom(
+        code,
+        playerName: 'Player 2',
+      );
+      if (!mounted) {
+        return;
+      }
+      if (!success) {
+        _hideInternetDirectJoiningDialog(loadingVisible);
+        loadingVisible = false;
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('互联网直连失败')));
+        return;
+      }
+
+      final room = _netplay.joinedRoom ?? code.toRoomInfo();
+      final hasRom = await _gameLibrary.hasLocalRom(room.gameMd5);
+      if (!mounted) {
+        return;
+      }
+
+      _hideInternetDirectJoiningDialog(loadingVisible);
+      loadingVisible = false;
+
+      await Navigator.push<bool>(
         context,
-      ).showSnackBar(const SnackBar(content: Text('互联网直连失败')));
+        MaterialPageRoute(
+          builder: (context) => RoomScreen(
+            netplayService: _netplay,
+            gameLibrary: _gameLibrary,
+            isHost: false,
+            roomInfo: room,
+            hasLocalRom: hasRom,
+          ),
+        ),
+      );
+    } finally {
+      if (mounted && loadingVisible) {
+        _hideInternetDirectJoiningDialog(true);
+      }
+      _joiningRoom = false;
+    }
+  }
+
+  void _showInternetDirectJoiningDialog() {
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      useRootNavigator: true,
+      builder: (context) {
+        return PopScope(
+          canPop: false,
+          child: Dialog(
+            insetPadding: const EdgeInsets.symmetric(horizontal: 48),
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(24, 22, 24, 22),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const SizedBox(
+                    width: 28,
+                    height: 28,
+                    child: CircularProgressIndicator(strokeWidth: 3),
+                  ),
+                  const SizedBox(width: 18),
+                  Flexible(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          '正在加入房间',
+                          style: Theme.of(context).textTheme.titleMedium,
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          '正在建立互联网连接...',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _hideInternetDirectJoiningDialog(bool visible) {
+    if (!visible || !mounted) {
       return;
     }
-
-    final room = _netplay.joinedRoom ?? code.toRoomInfo();
-    final hasRom = await _gameLibrary.hasLocalRom(room.gameMd5);
-    if (!mounted) return;
-
-    await Navigator.push<bool>(
-      context,
-      MaterialPageRoute(
-        builder: (context) => RoomScreen(
-          netplayService: _netplay,
-          gameLibrary: _gameLibrary,
-          isHost: false,
-          roomInfo: room,
-          hasLocalRom: hasRom,
-        ),
-      ),
-    );
+    Navigator.of(context, rootNavigator: true).pop();
   }
 
   Future<void> _joinRoom(RoomInfo room, {bool internetDirect = false}) async {

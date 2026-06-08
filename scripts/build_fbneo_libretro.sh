@@ -113,8 +113,14 @@ build_android() {
     jobs="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
 
     echo -e "${YELLOW}Building FBNeo for $abi (ndk-build)...${NC}"
+    local size_cflags="-Os -ffunction-sections -fdata-sections"
+    local size_ldflags="-Wl,--gc-sections -Wl,--strip-all"
+
     "$ndk_build" -C "$LIBRETRO_DIR/jni" clean APP_ABI="$abi" >/dev/null 2>&1 || true
-    "$ndk_build" -C "$LIBRETRO_DIR/jni" -j"$jobs" APP_ABI="$abi"
+    "$ndk_build" -C "$LIBRETRO_DIR/jni" -j"$jobs" APP_ABI="$abi" \
+        APP_CFLAGS="$size_cflags" \
+        APP_CPPFLAGS="$size_cflags" \
+        APP_LDFLAGS="$size_ldflags"
 
     local src="$LIBRETRO_DIR/libs/$abi/libretro.so"
     if [ ! -f "$src" ]; then
