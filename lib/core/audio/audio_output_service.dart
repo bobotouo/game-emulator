@@ -14,6 +14,7 @@ class AudioOutputService {
   AudioOutputService._();
 
   static final AudioOutputService instance = AudioOutputService._();
+  static const int _streamMaxBufferBytes = 1024 * 1024 * 8;
 
   AudioSource? _stream;
   SoundHandle? _handle;
@@ -64,6 +65,7 @@ class AudioOutputService {
       _shuttingDown = false;
       _sampleRate = sampleRate;
       _volume = volume;
+      _speed = 1;
 
       if (Platform.isIOS) {
         logAudio(
@@ -107,9 +109,9 @@ class AudioOutputService {
 
     try {
       _stream = SoLoud.instance.setBufferStream(
-        maxBufferSizeDuration: const Duration(milliseconds: 1200),
-        bufferingType: BufferingType.released,
-        bufferingTimeNeeds: 0.1,
+        maxBufferSizeBytes: _streamMaxBufferBytes,
+        bufferingType: BufferingType.preserved,
+        bufferingTimeNeeds: 0.05,
         sampleRate: _sampleRate.round(),
         channels: Channels.stereo,
         format: BufferType.s16le,
@@ -136,6 +138,7 @@ class AudioOutputService {
     _speed = next;
     if (_useNativeAudio) {
       emu_loop.setEmulationSpeed(next.round());
+      return;
     }
   }
 
@@ -146,21 +149,89 @@ class AudioOutputService {
       return;
     }
 
+    final outputSamples = _speed > 1.0
+        ? _thinFastForwardSamples(samples)
+        : samples;
     final bytes = Uint8List.fromList(
-      samples.buffer.asUint8List(samples.offsetInBytes, samples.lengthInBytes),
+      outputSamples.buffer.asUint8List(
+        outputSamples.offsetInBytes,
+        outputSamples.lengthInBytes,
+      ),
     );
 
     try {
       SoLoud.instance.addAudioDataStream(stream, bytes);
     } on SoLoudStreamEndedAlreadyCppException {
-      // Do not restart AAudio on Android — causes SIGSEGV on some devices.
-      _mutedByError = true;
-      _ready = false;
+      _restartStreamAfterError();
     } on SoLoudPcmBufferFullCppException {
-      // Drop when saturated.
+      _resetPreservedStream();
     } catch (error, stackTrace) {
       _mutedByError = true;
       debugPrint('AudioOutputService addSamples: $error\n$stackTrace');
+    }
+  }
+
+  Int16List _thinFastForwardSamples(Int16List samples) {
+    final step = _speed.round().clamp(1, 3);
+    if (step <= 1 || samples.length < 4) {
+      return samples;
+    }
+
+    final inputFrames = samples.length ~/ 2;
+    final outputFrames = (inputFrames + step - 1) ~/ step;
+    final output = Int16List(outputFrames * 2);
+    var out = 0;
+    for (var frame = 0; frame < inputFrames; frame += step) {
+      var left = 0;
+      var right = 0;
+      var count = 0;
+      for (var i = 0; i < step && frame + i < inputFrames; i++) {
+        final input = (frame + i) * 2;
+        left += samples[input];
+        right += samples[input + 1];
+        count++;
+      }
+      output[out++] = left ~/ count;
+      output[out++] = right ~/ count;
+    }
+    return output;
+  }
+
+  void _resetPreservedStream() {
+    final stream = _stream;
+    if (stream == null || _shuttingDown || _useNativeAudio) {
+      return;
+    }
+    try {
+      SoLoud.instance.resetBufferStream(stream);
+    } catch (_) {
+      _restartStreamAfterError();
+    }
+  }
+
+  void _restartStreamAfterError() {
+    if (_shuttingDown || _useNativeAudio) {
+      return;
+    }
+    try {
+      final stream = _stream;
+      final handle = _handle;
+      _stream = null;
+      _handle = null;
+      _playing = false;
+      _ready = false;
+      if (handle != null) {
+        unawaited(SoLoud.instance.stop(handle));
+      }
+      if (stream != null) {
+        unawaited(SoLoud.instance.disposeSource(stream));
+      }
+      _startStream();
+      _ready = _stream != null && _handle != null;
+      _mutedByError = !_ready;
+    } catch (error, stackTrace) {
+      _mutedByError = true;
+      debugPrint('AudioOutputService restart stream: $error\n$stackTrace');
     }
   }
 

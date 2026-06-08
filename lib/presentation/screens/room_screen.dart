@@ -1,20 +1,21 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 
+import '../../core/network/internet_direct_code.dart';
 import '../../core/network/lan_service.dart';
 import '../../core/network/netplay_protocol.dart';
-import '../../core/network/netplay_status.dart';
-import '../../core/network/player_info.dart';
-import '../../core/network/room_info.dart';
 import '../../core/settings/app_settings_service.dart';
 import '../../features/game_library/game_library_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/add_game_loading.dart';
 import '../widgets/game_card.dart';
 import 'netplay_emulator_screen.dart';
+
+enum NetplayRoomMode { lan, internet }
 
 /// Unified room page: host configures name + game, waits for players, starts game.
 /// Guests see the same layout without game selection.
@@ -59,6 +60,8 @@ class _RoomScreenState extends State<RoomScreen> {
   bool _isReady = false;
   bool _hasLocalRom = true;
   bool _awaitingRomDecision = false;
+  NetplayRoomMode _roomMode = NetplayRoomMode.lan;
+  InternetDirectCode? _internetDirectCode;
   double _romProgress = 0;
   String? _romStatusText;
 
@@ -68,6 +71,7 @@ class _RoomScreenState extends State<RoomScreen> {
   StreamSubscription<PlayerInfo>? _playerUpdatedSub;
   StreamSubscription<String>? _playerLeftSub;
   StreamSubscription<NetplayMessage>? _messageSub;
+  StreamSubscription<String>? _romRequestSub;
   StreamSubscription<RomTransferProgress>? _romProgressSub;
   StreamSubscription<NetplayStartGameEvent>? _startGameSub;
   StreamSubscription<bool>? _connectionSub;
@@ -79,6 +83,19 @@ class _RoomScreenState extends State<RoomScreen> {
       widget.netplayService.hostedRoom ??
       widget.netplayService.joinedRoom ??
       widget.roomInfo;
+
+  List<GameRom> _roomCompatibleGames(List<GameRom> games) {
+    return games
+        .where((game) => isHostAuthoritativeNetplayExtension(game.extension))
+        .toList();
+  }
+
+  void _setRoomGames(List<GameRom> games) {
+    _games = _roomCompatibleGames(games);
+    if (_selectedGameIndex >= _games.length) {
+      _selectedGameIndex = _games.isEmpty ? 0 : _games.length - 1;
+    }
+  }
 
   GameRom? get _selectedGame {
     if (!_isRoomHost) {
@@ -98,8 +115,7 @@ class _RoomScreenState extends State<RoomScreen> {
     return _selectedMaxPlayers.clamp(2, 4);
   }
 
-  bool get _hasTeammate =>
-      _playablePlayers.any((player) => !player.isHost);
+  bool get _hasTeammate => _playablePlayers.any((player) => !player.isHost);
 
   bool get _teammateReady =>
       _playablePlayers.any((player) => !player.isHost && player.isReady);
@@ -128,8 +144,7 @@ class _RoomScreenState extends State<RoomScreen> {
     if (_isRoomHost && player.isHost) {
       return player.copyWith(name: '我');
     }
-    if (!_isRoomHost &&
-        player.id == widget.netplayService.localPlayerId) {
+    if (!_isRoomHost && player.id == widget.netplayService.localPlayerId) {
       return player.copyWith(name: '我');
     }
     return player;
@@ -148,7 +163,7 @@ class _RoomScreenState extends State<RoomScreen> {
       if (!mounted) {
         return;
       }
-      setState(() => _games = games);
+      setState(() => _setRoomGames(games));
     });
 
     if (_gameLibrary.games.isEmpty) {
@@ -156,7 +171,7 @@ class _RoomScreenState extends State<RoomScreen> {
     } else {
       unawaited(_gameLibrary.init(refreshThumbnails: false));
     }
-    _games = _gameLibrary.games;
+    _setRoomGames(_gameLibrary.games);
 
     if (widget.isHost) {
       final defaultName = await NetplayService.defaultRoomName();
@@ -168,6 +183,7 @@ class _RoomScreenState extends State<RoomScreen> {
         _localGame = _gameLibrary.findGameByMd5(room.gameMd5);
         _hasLocalRom = await _gameLibrary.hasLocalRom(room.gameMd5);
       }
+      _internetDirectCode = widget.netplayService.internetDirectInviteCode;
       _initGuestPlayers();
       _attachNetplayListeners();
       widget.netplayService.enterLobby();
@@ -195,6 +211,7 @@ class _RoomScreenState extends State<RoomScreen> {
     _playerUpdatedSub?.cancel();
     _playerLeftSub?.cancel();
     _messageSub?.cancel();
+    _romRequestSub?.cancel();
     _romProgressSub?.cancel();
     _startGameSub?.cancel();
     _connectionSub?.cancel();
@@ -221,13 +238,7 @@ class _RoomScreenState extends State<RoomScreen> {
   void _initGuestPlayers() {
     _players
       ..clear()
-      ..add(
-        const PlayerInfo(
-          id: 'self',
-          name: '我',
-          isHost: false,
-        ),
-      );
+      ..add(const PlayerInfo(id: 'self', name: '我', isHost: false));
   }
 
   void _attachNetplayListeners() {
@@ -235,25 +246,45 @@ class _RoomScreenState extends State<RoomScreen> {
     _playerUpdatedSub?.cancel();
     _playerLeftSub?.cancel();
     _messageSub?.cancel();
+    _romRequestSub?.cancel();
     _romProgressSub?.cancel();
     _startGameSub?.cancel();
     _connectionSub?.cancel();
     _roomStateSub?.cancel();
     _hostPromotedSub?.cancel();
 
-    _playerJoinedSub =
-        widget.netplayService.onPlayerJoined.listen(_onPlayerJoined);
-    _playerUpdatedSub =
-        widget.netplayService.onPlayerUpdated.listen(_onPlayerUpdated);
+    _playerJoinedSub = widget.netplayService.onPlayerJoined.listen(
+      _onPlayerJoined,
+    );
+    _playerUpdatedSub = widget.netplayService.onPlayerUpdated.listen(
+      _onPlayerUpdated,
+    );
     _playerLeftSub = widget.netplayService.onPlayerLeft.listen(_onPlayerLeft);
-    _roomStateSub =
-        widget.netplayService.onRoomStateChanged.listen(_onRoomState);
+    _roomStateSub = widget.netplayService.onRoomStateChanged.listen(
+      _onRoomState,
+    );
     _messageSub = widget.netplayService.onMessage.listen(_onMessage);
-    _romProgressSub =
-        widget.netplayService.onRomProgress.listen(_onRomProgress);
+    _romRequestSub = widget.netplayService.onRomRequested.listen((peerId) {
+      if (_isRoomHost) {
+        unawaited(_sendRomToPeer(peerId: peerId));
+      }
+    });
+    _romProgressSub = widget.netplayService.onRomProgress.listen(
+      _onRomProgress,
+    );
     _startGameSub = widget.netplayService.onStartGame.listen(_launchEmulator);
-    _connectionSub =
-        widget.netplayService.onConnectionStateChanged.listen((connected) {
+    final cachedStart = widget.netplayService.lastStartGameEvent;
+    if (cachedStart != null &&
+        widget.netplayService.status == NetplayStatus.gaming) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _launchEmulator(cachedStart);
+        }
+      });
+    }
+    _connectionSub = widget.netplayService.onConnectionStateChanged.listen((
+      connected,
+    ) {
       if (!connected &&
           mounted &&
           !_leaving &&
@@ -261,8 +292,9 @@ class _RoomScreenState extends State<RoomScreen> {
         _leaveRoom(showDisconnectedSnack: true, notifyHost: false);
       }
     });
-    _hostPromotedSub =
-        widget.netplayService.onHostPromoted.listen(_onHostPromoted);
+    _hostPromotedSub = widget.netplayService.onHostPromoted.listen(
+      _onHostPromoted,
+    );
 
     _syncPlayersFromService();
   }
@@ -286,6 +318,7 @@ class _RoomScreenState extends State<RoomScreen> {
       _promotedToHost = true;
       _roomLive = true;
       _isReady = false;
+      _internetDirectCode = widget.netplayService.internetDirectInviteCode;
       _roomNameController.text = room.roomName;
       _selectedMaxPlayers = room.maxPlayers;
       final idx = _games.indexWhere((g) => g.md5 == room.gameMd5);
@@ -329,8 +362,9 @@ class _RoomScreenState extends State<RoomScreen> {
     setState(() => _creating = true);
 
     final hostIp = await widget.netplayService.getLocalIp() ?? '0.0.0.0';
-    final roomId =
-        DateTime.now().millisecondsSinceEpoch.toRadixString(36).toUpperCase();
+    final roomId = DateTime.now().millisecondsSinceEpoch
+        .toRadixString(36)
+        .toUpperCase();
     final roomTemplate = RoomInfo(
       roomId: roomId,
       roomName: _roomNameController.text.trim().isEmpty
@@ -338,17 +372,24 @@ class _RoomScreenState extends State<RoomScreen> {
           : _roomNameController.text.trim(),
       hostIp: hostIp,
       port: widget.netplayService.port,
-      gameCode: game.id,
+      gameCode: game.path.split('/').last,
       gameTitle: game.name,
       gameMd5: game.md5 ?? '',
       currentPlayers: 1,
       maxPlayers: _selectedMaxPlayers.clamp(2, 4),
     );
 
-    final success = await widget.netplayService.createRoom(
-      roomTemplate: roomTemplate,
-      playerName: 'Player 1',
-    );
+    InternetDirectCode? directCode;
+    final success = _roomMode == NetplayRoomMode.internet
+        ? (directCode = await widget.netplayService.createInternetDirectRoom(
+                roomTemplate: roomTemplate,
+                playerName: 'Player 1',
+              )) !=
+              null
+        : await widget.netplayService.createRoom(
+            roomTemplate: roomTemplate,
+            playerName: 'Player 1',
+          );
 
     if (!mounted) {
       return;
@@ -359,6 +400,7 @@ class _RoomScreenState extends State<RoomScreen> {
       if (success) {
         _roomLive = true;
         _localGame = game;
+        _internetDirectCode = directCode;
       }
     });
 
@@ -440,10 +482,6 @@ class _RoomScreenState extends State<RoomScreen> {
             _players[peerIndex] = _players[peerIndex].copyWith(isReady: ready);
           }
         });
-      case NetplayMessageType.requestRom:
-        if (_isRoomHost) {
-          unawaited(_sendRomToPeer());
-        }
       case NetplayMessageType.leave:
         if (!_isRoomHost && mounted) {
           _leaveRoom(showDisconnectedSnack: true, notifyHost: false);
@@ -486,8 +524,7 @@ class _RoomScreenState extends State<RoomScreen> {
       return true;
     }
     final text = _romStatusText;
-    return text != null &&
-        (text.contains('正在') || text.contains('等待'));
+    return text != null && (text.contains('正在') || text.contains('等待'));
   }
 
   double _gameCarouselHeight(BuildContext context) {
@@ -500,8 +537,10 @@ class _RoomScreenState extends State<RoomScreen> {
   void _ensurePageController(BuildContext context) {
     final screenWidth = MediaQuery.sizeOf(context).width;
     final pageWidth = screenWidth - _gameBannerSideInset * 2;
-    final fraction =
-        ((pageWidth + _gameBannerItemGap) / screenWidth).clamp(0.88, 0.96);
+    final fraction = ((pageWidth + _gameBannerItemGap) / screenWidth).clamp(
+      0.88,
+      0.96,
+    );
 
     _pageController ??= PageController(
       viewportFraction: fraction,
@@ -509,10 +548,7 @@ class _RoomScreenState extends State<RoomScreen> {
     );
   }
 
-  Widget _buildGamePreview(
-    GameRom game, {
-    VoidCallback? onTap,
-  }) {
+  Widget _buildGamePreview(GameRom game, {VoidCallback? onTap}) {
     return SizedBox(
       height: _gameCarouselHeight(context),
       width: double.infinity,
@@ -583,7 +619,7 @@ class _RoomScreenState extends State<RoomScreen> {
     }
   }
 
-  Future<void> _sendRomToPeer() async {
+  Future<void> _sendRomToPeer({String? peerId}) async {
     final game = _localGame ?? _selectedGame;
     final room = _room;
     if (game == null || room == null) {
@@ -598,13 +634,13 @@ class _RoomScreenState extends State<RoomScreen> {
       return;
     }
 
-    final peerId = widget.netplayService.firstPlayablePeerId;
-    if (peerId == null) {
+    final targetPeerId = peerId ?? widget.netplayService.firstPlayablePeerId;
+    if (targetPeerId == null) {
       return;
     }
 
     await widget.netplayService.sendRomFile(
-      peerId: peerId,
+      peerId: targetPeerId,
       filePath: romPath,
       fileName: NetplayWire.safeFileName(
         romPath.split(Platform.pathSeparator).last,
@@ -629,10 +665,7 @@ class _RoomScreenState extends State<RoomScreen> {
     if (game == null || room == null) {
       return;
     }
-    widget.netplayService.startGame(
-      gameMd5: room.gameMd5,
-      gameId: game.id,
-    );
+    widget.netplayService.startGame(gameMd5: room.gameMd5, gameId: game.id);
   }
 
   Future<void> _launchEmulator(NetplayStartGameEvent event) async {
@@ -643,7 +676,8 @@ class _RoomScreenState extends State<RoomScreen> {
       }
     }
 
-    final game = _gameLibrary.findGameByMd5(event.gameMd5) ??
+    final game =
+        _gameLibrary.findGameByMd5(event.gameMd5) ??
         _gameLibrary.getGame(event.gameId) ??
         _localGame;
     if (game == null) {
@@ -664,9 +698,7 @@ class _RoomScreenState extends State<RoomScreen> {
       return;
     }
 
-    final resumeSave = event.resume
-        ? await _waitForResumeSaveState()
-        : null;
+    final resumeSave = event.resume ? await _waitForResumeSaveState() : null;
 
     if (!mounted) {
       return;
@@ -715,8 +747,7 @@ class _RoomScreenState extends State<RoomScreen> {
     setState(() {
       _roomLive = true;
       _isReady = false;
-      _promotedToHost =
-          _promotedToHost || widget.netplayService.isHost;
+      _promotedToHost = _promotedToHost || widget.netplayService.isHost;
     });
     _syncPlayersFromService();
   }
@@ -767,6 +798,7 @@ class _RoomScreenState extends State<RoomScreen> {
     _playerUpdatedSub?.cancel();
     _playerLeftSub?.cancel();
     _messageSub?.cancel();
+    _romRequestSub?.cancel();
     _romProgressSub?.cancel();
     _startGameSub?.cancel();
     _roomStateSub?.cancel();
@@ -802,14 +834,16 @@ class _RoomScreenState extends State<RoomScreen> {
         return;
       }
       setState(() {
-        _games = _gameLibrary.games;
+        _setRoomGames(_gameLibrary.games);
         _selectedGameIndex = _games.indexWhere((g) => g.id == result.game.id);
         if (_selectedGameIndex < 0) {
-          _selectedGameIndex = _games.length - 1;
+          _selectedGameIndex = _games.isEmpty ? 0 : _games.length - 1;
         }
       });
       _showSnack(
-        result.isDuplicate
+        !isHostAuthoritativeNetplayExtension(result.game.extension)
+            ? '已添加 ${result.game.name}，GBA 会在游戏内使用独立 Link 入口'
+            : result.isDuplicate
             ? '该游戏已在库中: ${result.game.name}'
             : '已添加: ${result.game.name}',
       );
@@ -821,9 +855,9 @@ class _RoomScreenState extends State<RoomScreen> {
   }
 
   void _showSnack(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
@@ -842,44 +876,179 @@ class _RoomScreenState extends State<RoomScreen> {
         }
       },
       child: Scaffold(
-      backgroundColor: AppColors.background,
-      appBar: AppBar(
-        title: Text(
-          _isRoomHost && !_roomLive ? '创建房间' : '组队房间',
+        backgroundColor: AppColors.background,
+        appBar: AppBar(
+          title: Text(_isRoomHost && !_roomLive ? '创建房间' : '组队房间'),
         ),
-      ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : Column(
-              children: [
-                Expanded(
-                  child: SingleChildScrollView(
-                    padding: const EdgeInsets.only(bottom: 16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        _buildRoomHeader(context, room),
-                        if (_room?.awaitingReplacement ?? false) ...[
+        body: _loading
+            ? const Center(child: CircularProgressIndicator())
+            : Column(
+                children: [
+                  Expanded(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.only(bottom: 16),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          _buildRoomHeader(context, room),
+                          if (_room?.awaitingReplacement ?? false) ...[
+                            const SizedBox(height: 12),
+                            _buildAwaitingReplacementBanner(context),
+                          ],
+                          if (_isRoomHost && !_roomLive) ...[
+                            const SizedBox(height: 12),
+                            _buildRoomModeSelector(context),
+                            const SizedBox(height: 12),
+                            _buildMaxPlayersSelector(context),
+                          ],
+                          if (_internetDirectCode != null && _roomLive) ...[
+                            const SizedBox(height: 12),
+                            _buildInternetDirectCard(context),
+                          ],
                           const SizedBox(height: 12),
-                          _buildAwaitingReplacementBanner(context),
+                          _buildGameCarousel(context),
+                          const SizedBox(height: 16),
+                          _buildPlayersSection(context),
+                          if (_showRomTransferUi) _buildRomStatus(context),
                         ],
-                        if (_isRoomHost && !_roomLive) ...[
-                          const SizedBox(height: 12),
-                          _buildMaxPlayersSelector(context),
-                        ],
-                        const SizedBox(height: 12),
-                        _buildGameCarousel(context),
-                        const SizedBox(height: 16),
-                        _buildPlayersSection(context),
-                        if (_showRomTransferUi) _buildRomStatus(context),
-                      ],
+                      ),
                     ),
                   ),
-                ),
-                _buildBottomBar(context, canStart),
-              ],
-            ),
+                  _buildBottomBar(context, canStart),
+                ],
+              ),
       ),
+    );
+  }
+
+  Widget _buildRoomModeSelector(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            '连接方式',
+            style: Theme.of(
+              context,
+            ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 8),
+          SegmentedButton<NetplayRoomMode>(
+            segments: const [
+              ButtonSegment(
+                value: NetplayRoomMode.lan,
+                icon: Icon(Icons.wifi),
+                label: Text('局域网'),
+              ),
+              ButtonSegment(
+                value: NetplayRoomMode.internet,
+                icon: Icon(Icons.qr_code_2),
+                label: Text('互联网'),
+              ),
+            ],
+            selected: {_roomMode},
+            onSelectionChanged: (value) {
+              setState(() => _roomMode = value.first);
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInternetDirectCard(BuildContext context) {
+    final code = _internetDirectCode;
+    if (code == null) {
+      return const SizedBox.shrink();
+    }
+    final raw = code.encode();
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.public, color: AppColors.secondary, size: 20),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  '互联网二维码',
+                  style: Theme.of(
+                    context,
+                  ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+                ),
+              ),
+              IconButton(
+                tooltip: '复制连接码',
+                visualDensity: VisualDensity.compact,
+                iconSize: 18,
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: raw));
+                  _showSnack('已复制连接码');
+                },
+                icon: const Icon(Icons.copy),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              QrImageView(
+                backgroundColor: Colors.white,
+                data: raw,
+
+                version: QrVersions.auto,
+                size: 120,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildInternetInfoLine(
+                      context,
+                      label: '游戏',
+                      value: code.gameTitle,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInternetInfoLine(
+    BuildContext context, {
+    required String label,
+    required String value,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: Theme.of(
+            context,
+          ).textTheme.labelSmall?.copyWith(color: AppColors.onSurfaceVariant),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          value,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+            color: AppColors.onSurface,
+            fontFamily: 'JetBrains Mono',
+            height: 1.25,
+          ),
+        ),
+      ],
     );
   }
 
@@ -891,9 +1060,9 @@ class _RoomScreenState extends State<RoomScreen> {
         children: [
           Text(
             '联机人数',
-            style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                  fontWeight: FontWeight.w600,
-                ),
+            style: Theme.of(
+              context,
+            ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
           ),
           const SizedBox(height: 8),
           Wrap(
@@ -934,9 +1103,7 @@ class _RoomScreenState extends State<RoomScreen> {
           const SizedBox(width: 10),
           Expanded(
             child: Text(
-              _isRoomHost
-                  ? '队友已离开，进度已保存。等待新玩家加入后将自动同步并继续。'
-                  : '房主等待新玩家加入以继续游戏…',
+              _isRoomHost ? '队友已离开，进度已保存。等待新玩家加入后将自动同步并继续。' : '房主等待新玩家加入以继续游戏…',
               style: Theme.of(context).textTheme.bodySmall,
             ),
           ),
@@ -1012,19 +1179,19 @@ class _RoomScreenState extends State<RoomScreen> {
       children: [
         Text(
           label,
-          style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                color: AppColors.onSurfaceVariant,
-              ),
+          style: Theme.of(
+            context,
+          ).textTheme.labelMedium?.copyWith(color: AppColors.onSurfaceVariant),
         ),
         const SizedBox(height: 4),
         Text(
           value,
           style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                fontWeight: FontWeight.w600,
-                color: valueColor ?? AppColors.onSurface,
-                fontFamily: mono ? 'JetBrains Mono' : null,
-                letterSpacing: mono ? 0.5 : null,
-              ),
+            fontWeight: FontWeight.w600,
+            color: valueColor ?? AppColors.onSurface,
+            fontFamily: mono ? 'JetBrains Mono' : null,
+            letterSpacing: mono ? 0.5 : null,
+          ),
         ),
       ],
     );
@@ -1040,9 +1207,9 @@ class _RoomScreenState extends State<RoomScreen> {
             Text(
               '游戏',
               style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                    fontWeight: FontWeight.w600,
-                    color: AppColors.onSurfaceVariant,
-                  ),
+                fontWeight: FontWeight.w600,
+                color: AppColors.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 10),
             Text(
@@ -1060,17 +1227,17 @@ class _RoomScreenState extends State<RoomScreen> {
         child: Column(
           children: [
             Text(
-              '游戏库为空',
+              '暂无可用于房间联机的游戏',
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.titleMedium,
             ),
             const SizedBox(height: 8),
             Text(
-              '与游戏库相同：支持 GBA、FC/NES、街机 ROM（.zip/.7z 整包）',
+              '房间模式支持 FC/NES、街机 ROM（.zip/.7z 整包）；GBA 暂使用 gpSP Wi-Fi/RFU 局域网通道',
               textAlign: TextAlign.center,
               style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                    color: AppColors.onSurfaceVariant,
-                  ),
+                color: AppColors.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 16),
             FilledButton.icon(
@@ -1098,9 +1265,9 @@ class _RoomScreenState extends State<RoomScreen> {
             Text(
               '游戏',
               style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                    fontWeight: FontWeight.w600,
-                    color: AppColors.onSurfaceVariant,
-                  ),
+                fontWeight: FontWeight.w600,
+                color: AppColors.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 10),
             _buildGamePreview(games[displayIndex]),
@@ -1116,9 +1283,9 @@ class _RoomScreenState extends State<RoomScreen> {
           padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
           child: Text(
             '选择游戏',
-            style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                  fontWeight: FontWeight.w600,
-                ),
+            style: Theme.of(
+              context,
+            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600),
           ),
         ),
         SizedBox(
@@ -1159,8 +1326,9 @@ class _RoomScreenState extends State<RoomScreen> {
                             boxShadow: selected
                                 ? [
                                     BoxShadow(
-                                      color: AppColors.primary
-                                          .withValues(alpha: 0.2),
+                                      color: AppColors.primary.withValues(
+                                        alpha: 0.2,
+                                      ),
                                       blurRadius: 10,
                                       offset: const Offset(0, 3),
                                     ),
@@ -1201,9 +1369,7 @@ class _RoomScreenState extends State<RoomScreen> {
                 width: active ? 18 : 7,
                 height: 7,
                 decoration: BoxDecoration(
-                  color: active
-                      ? AppColors.primary
-                      : AppColors.outlineVariant,
+                  color: active ? AppColors.primary : AppColors.outlineVariant,
                   borderRadius: BorderRadius.circular(4),
                 ),
               );
@@ -1225,9 +1391,9 @@ class _RoomScreenState extends State<RoomScreen> {
           Text(
             '玩家',
             style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                  fontWeight: FontWeight.w600,
-                  color: AppColors.onSurfaceVariant,
-                ),
+              fontWeight: FontWeight.w600,
+              color: AppColors.onSurfaceVariant,
+            ),
           ),
           const SizedBox(height: 12),
           Wrap(
@@ -1285,8 +1451,8 @@ class _RoomScreenState extends State<RoomScreen> {
             backgroundColor: isEmpty
                 ? AppColors.surfaceContainerLow
                 : (isHost
-                    ? AppColors.secondary.withValues(alpha: 0.15)
-                    : AppColors.primary.withValues(alpha: 0.15)),
+                      ? AppColors.secondary.withValues(alpha: 0.15)
+                      : AppColors.primary.withValues(alpha: 0.15)),
             child: isEmpty
                 ? Icon(
                     Icons.person_add_alt_1,
@@ -1294,9 +1460,7 @@ class _RoomScreenState extends State<RoomScreen> {
                     size: 18,
                   )
                 : Text(
-                    player.name.isNotEmpty
-                        ? player.name[0].toUpperCase()
-                        : '?',
+                    player.name.isNotEmpty ? player.name[0].toUpperCase() : '?',
                     style: TextStyle(
                       fontSize: 18,
                       fontWeight: FontWeight.bold,
@@ -1314,21 +1478,30 @@ class _RoomScreenState extends State<RoomScreen> {
             overflow: TextOverflow.ellipsis,
             textAlign: TextAlign.center,
             style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                  color: isEmpty
-                      ? AppColors.onSurfaceVariant
-                      : AppColors.onSurface,
-                ),
+              color: isEmpty ? AppColors.onSurfaceVariant : AppColors.onSurface,
+            ),
           ),
         ),
         if (!isEmpty)
           Text(
             statusText,
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: isReady
-                      ? AppColors.secondary
-                      : AppColors.onSurfaceVariant,
-                  fontSize: 10,
-                ),
+              color: isReady ? AppColors.secondary : AppColors.onSurfaceVariant,
+              fontSize: 10,
+            ),
+          ),
+        if (!isEmpty && player.latency > 0)
+          Text(
+            '${player.latency}ms',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: player.latency < 80
+                  ? Colors.greenAccent
+                  : player.latency < 150
+                  ? Colors.orangeAccent
+                  : Colors.redAccent,
+              fontSize: 9,
+              fontFamily: 'monospace',
+            ),
           ),
       ],
     );
@@ -1363,7 +1536,8 @@ class _RoomScreenState extends State<RoomScreen> {
           child: SizedBox(
             width: double.infinity,
             child: OutlinedButton.icon(
-              onPressed: _hasLocalRom &&
+              onPressed:
+                  _hasLocalRom &&
                       widget.netplayService.status !=
                           NetplayStatus.transferringRom
                   ? _toggleReady
@@ -1385,7 +1559,9 @@ class _RoomScreenState extends State<RoomScreen> {
         child: SizedBox(
           width: double.infinity,
           child: FilledButton.icon(
-            onPressed: _primaryActionEnabled(canStart) ? _onPrimaryAction : null,
+            onPressed: _primaryActionEnabled(canStart)
+                ? _onPrimaryAction
+                : null,
             icon: _creating
                 ? const SizedBox(
                     width: 18,

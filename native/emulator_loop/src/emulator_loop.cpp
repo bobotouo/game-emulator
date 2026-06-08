@@ -7,7 +7,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <deque>
 #include <mutex>
+#include <vector>
 
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -25,22 +27,39 @@ static void AudioLog(const char* fmt, ...) {
 
 // libretro environment command IDs we need to handle
 #define _RETRO_ENV_SET_PIXEL_FORMAT    10
+#define _RETRO_ENV_GET_VARIABLE        15
+#define _RETRO_ENV_SET_VARIABLES       16
+#define _RETRO_ENV_GET_VARIABLE_UPDATE 17
 #define _RETRO_ENV_GET_RUMBLE_INTERFACE 23
 #define _RETRO_ENV_GET_SAVE_DIRECTORY  31
 #define _RETRO_ENV_GET_SYSTEM_DIRECTORY 9
 #define _RETRO_ENV_GET_CONTENT_DIRECTORY 2
 #define _RETRO_ENV_SET_SYSTEM_AV_INFO  14
-#define _RETRO_ENV_GET_TARGET_SAMPLE_RATE 67
 #define _RETRO_ENV_SET_CONTROLLER_INFO 35
 #define _RETRO_ENV_GET_INPUT_BITMASKS 51
+#define _RETRO_ENV_GET_CORE_OPTIONS_VERSION 52
+#define _RETRO_ENV_SET_CORE_OPTIONS 53
+#define _RETRO_ENV_SET_CORE_OPTIONS_INTL 54
+#define _RETRO_ENV_SET_CORE_OPTIONS_DISPLAY 55
+#define _RETRO_ENV_SET_CORE_OPTIONS_V2 67
+#define _RETRO_ENV_SET_CORE_OPTIONS_V2_INTL 68
+#define _RETRO_ENV_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK 69
 #define _RETRO_ENV_SET_MESSAGE 6
 #define _RETRO_ENV_GET_LOG_INTERFACE 27
+#define _RETRO_ENV_SET_NETPACKET_INTERFACE 78
+
+#define _RETRO_NETPACKET_BROADCAST 0xFFFF
 
 #define RETRO_DEVICE_ID_JOYPAD_MASK 256
 
 struct retro_message {
   const char* msg;
   unsigned frames;
+};
+
+struct retro_variable {
+  const char* key;
+  const char* value;
 };
 
 typedef void (*retro_log_printf_t)(unsigned level, const char* fmt, ...);
@@ -75,6 +94,29 @@ struct retro_game_geometry {
 struct retro_system_av_info {
   struct retro_game_geometry geometry;
   struct retro_system_timing timing;
+};
+
+typedef void (*retro_netpacket_send_t)(int flags, const void* buf, size_t len,
+                                       uint16_t client_id);
+typedef void (*retro_netpacket_poll_receive_t)(void);
+typedef void (*retro_netpacket_start_t)(uint16_t client_id,
+                                        retro_netpacket_send_t send_fn,
+                                        retro_netpacket_poll_receive_t poll_receive_fn);
+typedef void (*retro_netpacket_receive_t)(const void* buf, size_t len,
+                                          uint16_t client_id);
+typedef void (*retro_netpacket_stop_t)(void);
+typedef void (*retro_netpacket_poll_t)(void);
+typedef bool (*retro_netpacket_connected_t)(uint16_t client_id);
+typedef void (*retro_netpacket_disconnected_t)(uint16_t client_id);
+
+struct retro_netpacket_callback {
+  retro_netpacket_start_t start;
+  retro_netpacket_receive_t receive;
+  retro_netpacket_stop_t stop;
+  retro_netpacket_poll_t poll;
+  retro_netpacket_connected_t connected;
+  retro_netpacket_disconnected_t disconnected;
+  const char* protocol_version;
 };
 
 #define _RETRO_RUMBLE_STRONG 0
@@ -122,6 +164,99 @@ static std::atomic<uint64_t> gInputMaskByPort[4] = {};
 static std::atomic<uint64_t> gFrameCount{0};
 
 static std::mutex gCoreMutex;
+
+// ── gpSP RFU / wireless netpacket bridge ─────────────────────────────────
+struct NetpacketItem {
+  uint16_t client_id;
+  int32_t flags;
+  std::vector<uint8_t> data;
+};
+
+static std::mutex gNetpacketMutex;
+static retro_netpacket_callback gNetpacketIface = {};
+static std::atomic<bool> gNetpacketAvailable{false};
+static std::atomic<bool> gNetpacketRunning{false};
+static std::deque<NetpacketItem> gNetpacketOutgoing;
+static std::deque<NetpacketItem> gNetpacketIncoming;
+static constexpr size_t kNetpacketQueueLimit = 256;
+static constexpr size_t kNetpacketMaxBytes = 65536;
+static char gGpspSerialMode[16] = "auto";
+
+static void NetpacketPushBounded(std::deque<NetpacketItem>& queue,
+                                 NetpacketItem&& item) {
+  if (queue.size() >= kNetpacketQueueLimit) {
+    queue.pop_front();
+  }
+  queue.push_back(std::move(item));
+}
+
+static void C_NetpacketSend(int flags, const void* buf, size_t len,
+                            uint16_t client_id) {
+  if (!buf || len == 0 || len > kNetpacketMaxBytes) {
+    return;
+  }
+  NetpacketItem item;
+  item.client_id = client_id;
+  item.flags = flags;
+  item.data.assign(
+      static_cast<const uint8_t*>(buf),
+      static_cast<const uint8_t*>(buf) + len);
+  std::lock_guard<std::mutex> lock(gNetpacketMutex);
+  NetpacketPushBounded(gNetpacketOutgoing, std::move(item));
+}
+
+static void C_NetpacketPollReceive(void) {
+  retro_netpacket_receive_t receive = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(gNetpacketMutex);
+    receive = gNetpacketIface.receive;
+  }
+  if (!receive || !gNetpacketRunning.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  for (;;) {
+    NetpacketItem item;
+    {
+      std::lock_guard<std::mutex> lock(gNetpacketMutex);
+      if (gNetpacketIncoming.empty()) {
+        break;
+      }
+      item = std::move(gNetpacketIncoming.front());
+      gNetpacketIncoming.pop_front();
+    }
+    if (!item.data.empty()) {
+      receive(item.data.data(), item.data.size(), item.client_id);
+    }
+  }
+}
+
+static const char* CoreOptionValue(const char* key) {
+  if (!key) return nullptr;
+
+  if (std::strcmp(key, "gpsp_bios") == 0) return "builtin";
+  if (std::strcmp(key, "gpsp_boot_mode") == 0) return "game";
+  if (std::strcmp(key, "gpsp_drc") == 0) return "enabled";
+  if (std::strcmp(key, "gpsp_rtc") == 0) return "auto";
+  if (std::strcmp(key, "gpsp_serial") == 0) return gGpspSerialMode;
+  if (std::strcmp(key, "gpsp_rumble") == 0) return "auto";
+  if (std::strcmp(key, "gpsp_sprlim") == 0) return "disabled";
+  if (std::strcmp(key, "gpsp_frameskip") == 0) return "disabled";
+  if (std::strcmp(key, "gpsp_frameskip_threshold") == 0) return "33";
+  if (std::strcmp(key, "gpsp_frameskip_interval") == 0) return "0";
+  if (std::strcmp(key, "gpsp_color_correction") == 0) return "disabled";
+  if (std::strcmp(key, "gpsp_frame_mixing") == 0) return "disabled";
+  if (std::strcmp(key, "gpsp_turbo_period") == 0) return "4";
+
+  // FBNeo defaults used by the mobile frontend.
+  if (std::strcmp(key, "fbneo-allow-depth-32") == 0) return "enabled";
+  if (std::strcmp(key, "fbneo-cpu-speed-adjust") == 0) return "100";
+  if (std::strcmp(key, "fbneo-frameskip") == 0) return "0";
+  if (std::strcmp(key, "fbneo-neogeo-mode") == 0) return "MVS";
+  if (std::strcmp(key, "fbneo-diagnostic-input") == 0) return "Hold Start";
+
+  return nullptr;
+}
 
 // ── Rumble state ──────────────────────────────────────────────────────────
 static std::atomic<uint32_t> gRumbleStrong{0};
@@ -426,7 +561,9 @@ static void C_AudioSingle(int16_t left, int16_t right) {
   AudioWrite(samples, 2);
 }
 
-static void C_InputPoll(void) {}
+static void C_InputPoll(void) {
+  C_NetpacketPollReceive();
+}
 
 static int16_t C_InputState(unsigned port, unsigned /*device*/,
                               unsigned /*index*/, unsigned id) {
@@ -477,6 +614,37 @@ static unsigned C_Environment(unsigned cmd, void* data) {
     }
     return 0;
   }
+  if (cmd == _RETRO_ENV_GET_CORE_OPTIONS_VERSION) {
+    if (data) {
+      *static_cast<unsigned*>(data) = 2;
+      return 1;
+    }
+    return 0;
+  }
+  if (cmd == _RETRO_ENV_SET_VARIABLES ||
+      cmd == _RETRO_ENV_SET_CORE_OPTIONS ||
+      cmd == _RETRO_ENV_SET_CORE_OPTIONS_INTL ||
+      cmd == _RETRO_ENV_SET_CORE_OPTIONS_DISPLAY ||
+      cmd == _RETRO_ENV_SET_CORE_OPTIONS_V2 ||
+      cmd == _RETRO_ENV_SET_CORE_OPTIONS_V2_INTL ||
+      cmd == _RETRO_ENV_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK) {
+    return 1;
+  }
+  if (cmd == _RETRO_ENV_GET_VARIABLE_UPDATE) {
+    if (data) {
+      *static_cast<bool*>(data) = false;
+      return 1;
+    }
+    return 0;
+  }
+  if (cmd == _RETRO_ENV_GET_VARIABLE) {
+    if (data) {
+      auto* variable = static_cast<retro_variable*>(data);
+      variable->value = CoreOptionValue(variable->key);
+      return variable->value != nullptr ? 1 : 0;
+    }
+    return 0;
+  }
   if (cmd == _RETRO_ENV_GET_RUMBLE_INTERFACE) {
     if (data) {
       auto* rumble = static_cast<retro_rumble_interface*>(data);
@@ -502,15 +670,6 @@ static unsigned C_Environment(unsigned cmd, void* data) {
   if (cmd == _RETRO_ENV_GET_CONTENT_DIRECTORY) {
     if (data && gContentDirBuf[0] != '\0') {
       *(const char**)data = gContentDirBuf;
-      return 1;
-    }
-    return 0;
-  }
-  if (cmd == _RETRO_ENV_GET_TARGET_SAMPLE_RATE) {
-    if (data) {
-      const unsigned rate = gTargetSampleRate.load(std::memory_order_relaxed);
-      *static_cast<unsigned*>(data) = rate;
-      AudioLog("GET_TARGET_SAMPLE_RATE -> %u Hz", rate);
       return 1;
     }
     return 0;
@@ -549,6 +708,23 @@ static unsigned C_Environment(unsigned cmd, void* data) {
     if (data) {
       auto* callback = static_cast<retro_log_callback*>(data);
       callback->log = LibretroLog;
+      return 1;
+    }
+    return 0;
+  }
+  if (cmd == _RETRO_ENV_SET_NETPACKET_INTERFACE) {
+    if (data) {
+      const auto* callback = static_cast<const retro_netpacket_callback*>(data);
+      {
+        std::lock_guard<std::mutex> lock(gNetpacketMutex);
+        gNetpacketIface = *callback;
+        gNetpacketOutgoing.clear();
+        gNetpacketIncoming.clear();
+      }
+      gNetpacketAvailable.store(true, std::memory_order_release);
+      const char* protocol =
+          callback->protocol_version ? callback->protocol_version : "unknown";
+      LibretroLog(1, "netpacket interface available: %s\n", protocol);
       return 1;
     }
     return 0;
@@ -861,6 +1037,127 @@ uint64_t emulator_loop_netplay_sim_frame(void) {
 
 void emulator_loop_netplay_set_sim_frame(uint64_t frame) {
   gNetplaySimFrame.store(frame, std::memory_order_relaxed);
+}
+
+void emulator_loop_set_gpsp_serial_mode(const char* mode) {
+  const char* next = "auto";
+  if (mode != nullptr) {
+    if (std::strcmp(mode, "auto") == 0 ||
+        std::strcmp(mode, "disabled") == 0 ||
+        std::strcmp(mode, "rfu") == 0 ||
+        std::strcmp(mode, "mul_poke") == 0 ||
+        std::strcmp(mode, "mul_aw1") == 0 ||
+        std::strcmp(mode, "mul_aw2") == 0) {
+      next = mode;
+    }
+  }
+  std::snprintf(gGpspSerialMode, sizeof(gGpspSerialMode), "%s", next);
+}
+
+bool emulator_loop_netpacket_available(void) {
+  return gNetpacketAvailable.load(std::memory_order_acquire);
+}
+
+void emulator_loop_netpacket_start(uint16_t local_client_id) {
+  retro_netpacket_start_t start = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(gNetpacketMutex);
+    start = gNetpacketIface.start;
+    gNetpacketOutgoing.clear();
+    gNetpacketIncoming.clear();
+  }
+  if (!start) {
+    return;
+  }
+  std::lock_guard<std::mutex> core_lock(gCoreMutex);
+  start(local_client_id, C_NetpacketSend, C_NetpacketPollReceive);
+  gNetpacketRunning.store(true, std::memory_order_release);
+}
+
+void emulator_loop_netpacket_stop(void) {
+  retro_netpacket_stop_t stop = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(gNetpacketMutex);
+    stop = gNetpacketIface.stop;
+    gNetpacketIncoming.clear();
+    gNetpacketOutgoing.clear();
+  }
+  if (stop && gNetpacketRunning.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> core_lock(gCoreMutex);
+    stop();
+  }
+  gNetpacketRunning.store(false, std::memory_order_release);
+}
+
+bool emulator_loop_netpacket_connect(uint16_t client_id) {
+  retro_netpacket_connected_t connected = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(gNetpacketMutex);
+    connected = gNetpacketIface.connected;
+  }
+  if (!connected || !gNetpacketRunning.load(std::memory_order_acquire)) {
+    return true;
+  }
+  std::lock_guard<std::mutex> core_lock(gCoreMutex);
+  return connected(client_id);
+}
+
+void emulator_loop_netpacket_disconnect(uint16_t client_id) {
+  retro_netpacket_disconnected_t disconnected = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(gNetpacketMutex);
+    disconnected = gNetpacketIface.disconnected;
+  }
+  if (!disconnected || !gNetpacketRunning.load(std::memory_order_acquire)) {
+    return;
+  }
+  std::lock_guard<std::mutex> core_lock(gCoreMutex);
+  disconnected(client_id);
+}
+
+int32_t emulator_loop_netpacket_read(uint16_t* target_client_id_out,
+                                     int32_t* flags_out,
+                                     uint8_t* out,
+                                     int32_t max_bytes) {
+  if (!out || max_bytes <= 0) {
+    return 0;
+  }
+  NetpacketItem item;
+  {
+    std::lock_guard<std::mutex> lock(gNetpacketMutex);
+    if (gNetpacketOutgoing.empty()) {
+      return 0;
+    }
+    item = std::move(gNetpacketOutgoing.front());
+    gNetpacketOutgoing.pop_front();
+  }
+  const int32_t size = static_cast<int32_t>(item.data.size());
+  if (size <= 0 || size > max_bytes) {
+    return 0;
+  }
+  std::memcpy(out, item.data.data(), static_cast<size_t>(size));
+  if (target_client_id_out) {
+    *target_client_id_out = item.client_id;
+  }
+  if (flags_out) {
+    *flags_out = item.flags;
+  }
+  return size;
+}
+
+void emulator_loop_netpacket_push(const uint8_t* data, int32_t size,
+                                  uint16_t source_client_id) {
+  if (!data || size <= 0 || size > static_cast<int32_t>(kNetpacketMaxBytes)) {
+    return;
+  }
+  NetpacketItem item;
+  item.client_id = source_client_id;
+  item.flags = 0;
+  item.data.assign(data, data + size);
+  {
+    std::lock_guard<std::mutex> lock(gNetpacketMutex);
+    NetpacketPushBounded(gNetpacketIncoming, std::move(item));
+  }
 }
 
 } // extern "C"

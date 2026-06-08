@@ -9,6 +9,8 @@ import 'package:flutter/foundation.dart';
 import 'package:multicast_dns/multicast_dns.dart';
 
 import '../settings/app_settings_service.dart';
+import 'cloudflare_ice_service.dart';
+import 'internet_direct_code.dart';
 import 'lan_multicast_lock.dart';
 import 'lan_network_checker.dart';
 import '../emulator_loop/emulator_loop_ffi.dart' as emu_loop;
@@ -19,12 +21,20 @@ import 'netplay_room_state.dart';
 import 'netplay_status.dart';
 import 'player_info.dart';
 import 'room_info.dart';
+import 'internet_direct_webrtc.dart';
 
 /// Local LAN netplay: mDNS/UDP discovery, TCP signaling, chunked ROM transfer.
 class NetplayService {
   static const serviceType = '_retro-netplay._tcp';
   static const udpMagic = 'RETRO_NETPLAY:v1:';
   static const udpDiscover = 'RETRO_NETPLAY_DISCOVER';
+  static const _internetDirectPeerId = 'webrtc-peer';
+  static const _binaryMagic0 = 0x4E; // N
+  static const _binaryMagic1 = 0x50; // P
+  static const _binaryMagic2 = 0x42; // B
+  static const _binaryFrameInput = 1;
+  static const _binaryFrameBundle = 2;
+  static const _binaryRomChunk = 3;
 
   ServerSocket? _server;
   Socket? _clientSocket;
@@ -33,10 +43,23 @@ class NetplayService {
 
   RawDatagramSocket? _udpSocket;
   RawDatagramSocket? _udpResponderSocket;
+  InternetDirectWebRtcHost? _webrtcHost;
+  InternetDirectWebRtcGuest? _webrtcGuest;
+  StreamSubscription<Uint8List>? _webrtcDataSub;
+  StreamSubscription<Uint8List>? _webrtcRealtimeDataSub;
+  StreamSubscription<bool>? _webrtcConnectedSub;
+  NetplayStreamParser? _webrtcGuestParser;
+  Timer? _internetDirectAnswerPollTimer;
+  String? _internetDirectSignalRoomId;
+  InternetDirectCode? _internetDirectInviteCode;
+  bool _internetDirectMode = false;
+  bool _refreshingInternetDirectOffer = false;
+  int _debugInputLogCount = 0;
+  Timer? _pingTimer;
+  int _localLatency = 0;
   Timer? _udpAnnounceTimer;
   Timer? _udpDiscoverTimer;
   Timer? _mdnsScanTimer;
-
   MDnsClient? _mdnsClient;
 
   /// mDNS browse is off until we also publish room services via Bonjour.
@@ -58,10 +81,16 @@ class NetplayService {
   final Map<String, int> _recentRoomEmitMs = {};
 
   NetplayMessage? _pendingRomBegin;
+  BytesBuilder? _pendingRomChunks;
+  Uint8List? _pendingRomBuffer;
+  int _pendingRomReceivedBytes = 0;
   bool _sendingRom = false;
+  int _romReceiverAckedBytes = 0;
+  Completer<void>? _romReceiverAckCompleter;
 
   NetplayLockstepRunner? _lockstepRunner;
   NetplayRollbackRunner? _rollbackRunner;
+  LockstepStartConfig? _lastLockstepStartConfig;
   Set<int> _lockstepRequiredSlots = {1};
   final Set<String> _lockstepReadyPeers = {};
   double _lockstepFps = 60.0;
@@ -72,13 +101,18 @@ class NetplayService {
   bool _hostPromotionExit = false;
   Uint8List? _stashedResumeSaveState;
   Uint8List? _receivedResumeSaveState;
+  NetplayStartGameEvent? _lastStartGameEvent;
   final _lockstepStartController =
       StreamController<LockstepStartConfig>.broadcast();
   final _gameplayPeerLeftController = StreamController<void>.broadcast();
   final _saveStateReceivedController = StreamController<Uint8List>.broadcast();
+  final _saveStateEventController =
+      StreamController<NetplaySaveStateEvent>.broadcast();
   final _playerSlotAssignedController = StreamController<int>.broadcast();
   final _hostPromotedController = StreamController<RoomInfo>.broadcast();
   final _gameSpeedController = StreamController<int>.broadcast();
+  final _gbaNetpacketController =
+      StreamController<GbaNetpacketEvent>.broadcast();
 
   int _gameSpeed = 1;
 
@@ -88,6 +122,7 @@ class NetplayService {
   final _playerUpdatedController = StreamController<PlayerInfo>.broadcast();
   final _playerLeftController = StreamController<String>.broadcast();
   final _messageController = StreamController<NetplayMessage>.broadcast();
+  final _romRequestedController = StreamController<String>.broadcast();
   final _romProgressController =
       StreamController<RomTransferProgress>.broadcast();
   final _startGameController =
@@ -106,9 +141,11 @@ class NetplayService {
   Stream<PlayerInfo> get onPlayerUpdated => _playerUpdatedController.stream;
   Stream<String> get onPlayerLeft => _playerLeftController.stream;
   Stream<NetplayMessage> get onMessage => _messageController.stream;
+  Stream<String> get onRomRequested => _romRequestedController.stream;
   Stream<RomTransferProgress> get onRomProgress =>
       _romProgressController.stream;
   Stream<NetplayStartGameEvent> get onStartGame => _startGameController.stream;
+  NetplayStartGameEvent? get lastStartGameEvent => _lastStartGameEvent;
   Stream<bool> get onConnectionStateChanged =>
       _connectionStateController.stream;
   Stream<NetplayRoomState> get onRoomStateChanged =>
@@ -118,21 +155,53 @@ class NetplayService {
   Stream<void> get onGameplayPeerLeft => _gameplayPeerLeftController.stream;
   Stream<Uint8List> get onSaveStateReceived =>
       _saveStateReceivedController.stream;
+  Stream<NetplaySaveStateEvent> get onSaveStateEvent =>
+      _saveStateEventController.stream;
   Stream<int> get onPlayerSlotAssigned => _playerSlotAssignedController.stream;
   Stream<RoomInfo> get onHostPromoted => _hostPromotedController.stream;
   Stream<int> get onGameSpeedChanged => _gameSpeedController.stream;
+  Stream<GbaNetpacketEvent> get onGbaNetpacket =>
+      _gbaNetpacketController.stream;
   int get gameSpeed => _gameSpeed;
 
   bool get isPlayableParticipant => _isHost || _localPlayerSlot > 0;
 
   NetplayLockstepRunner? get lockstepRunner => _lockstepRunner;
   NetplayRollbackRunner? get rollbackRunner => _rollbackRunner;
+  LockstepStartConfig? get lastLockstepStartConfig => _lastLockstepStartConfig;
+  bool get isLockstepStartAckReceived => _lockstepStartAckReceived;
   bool get awaitingReplacement => _awaitingReplacement;
   bool get isHostPromotionPending => _hostPromotionPending;
+  bool get isInternetDirectMode => _internetDirectMode;
+  int get localLatencyMs => _localLatency;
+  int get measuredLatencyMs {
+    if (_isHost) {
+      var maxLatency = _localLatency;
+      for (final peer in _peers.values) {
+        if (peer.latency > maxLatency) {
+          maxLatency = peer.latency;
+        }
+      }
+      return maxLatency;
+    }
+    final state = _roomState;
+    if (state == null) {
+      return 0;
+    }
+    var maxLatency = 0;
+    for (final player in state.players) {
+      if (player.latency > maxLatency) {
+        maxLatency = player.latency;
+      }
+    }
+    return maxLatency;
+  }
+
   Uint8List? takeResumeSaveState() {
     final state = _stashedResumeSaveState ?? _receivedResumeSaveState;
     _stashedResumeSaveState = null;
     _receivedResumeSaveState = null;
+    _lastStartGameEvent = null;
     return state;
   }
 
@@ -148,12 +217,14 @@ class NetplayService {
   RoomInfo? get hostedRoom => _hostedRoom;
   RoomInfo? get joinedRoom => _joinedRoom;
   RoomInfo? get activeRoom => _hostedRoom ?? _joinedRoom;
+  InternetDirectCode? get internetDirectInviteCode => _internetDirectInviteCode;
   String? get roomCode => activeRoom?.roomId;
   String? get hostIp => _isHost ? _hostedRoom?.hostIp : _joinedRoom?.hostIp;
   int get port => _port;
   bool get isDiscoverySocketReady => _udpSocket != null;
   bool get isHostingUdpReady => _udpResponderSocket != null;
-  List<Socket> get clients => _peers.values.map((peer) => peer.socket).toList();
+  List<Socket> get clients =>
+      _peers.values.map((peer) => peer.socket).whereType<Socket>().toList();
 
   /// First guest peer that has been assigned a player slot (for ROM transfer, etc.).
   String? get firstPlayablePeerId {
@@ -179,7 +250,7 @@ class NetplayService {
   void sendData(Uint8List data) {
     if (_isHost) {
       for (final peer in _peers.values) {
-        peer.socket.add(data);
+        peer.socket?.add(data);
       }
     } else {
       _clientSocket?.add(data);
@@ -283,8 +354,190 @@ class NetplayService {
       _sendToHost(NetplayMessage.ping(DateTime.now().millisecondsSinceEpoch));
       _setStatus(NetplayStatus.inLobby);
       _connectionStateController.add(true);
+      _startPingTimer();
       return true;
     } catch (e) {
+      await _resetConnections();
+      return false;
+    }
+  }
+
+  Future<InternetDirectCode?> createInternetDirectRoom({
+    required RoomInfo roomTemplate,
+    String? playerName,
+    InternetDirectCode? reuseInviteCode,
+  }) async {
+    await _resetConnections(keepDiscovery: false);
+    _isHost = true;
+    _internetDirectMode = true;
+    _localPlayerName = playerName ?? 'Player 1';
+    _localPlayerSlot = 1;
+    _localPlayerId = null;
+
+    try {
+      _logInternetDirect('host requesting cloudflare ice');
+      final ice = await CloudflareIceService.generate().timeout(
+        CloudflareIceService.requestTimeout,
+      );
+      _logInternetDirect(
+        'host cloudflare ice servers=${ice.iceServers.length}',
+      );
+      _webrtcHost = InternetDirectWebRtcHost(
+        iceServers: ice.iceServers,
+        onLog: _logInternetDirect,
+      );
+      _logInternetDirect('host creating webrtc offer');
+      final offerSdp = await _webrtcHost!.createOffer().timeout(
+        const Duration(seconds: 20),
+      );
+      _logInternetDirect(
+        'host webrtc offer ready phase=${InternetDirectIcePhase.turn.name} '
+        'sdpBytes=${offerSdp.length}',
+      );
+      _attachWebRtcHostDataListener();
+      final signalRoomInfo = roomTemplate.copyWith(
+        hostIp: Uri.parse(CloudflareIceService.signalBaseUrl).host,
+        port: 443,
+      );
+      _logInternetDirect('host publishing offer to worker');
+      final signalRoomId = reuseInviteCode?.signalRoomId;
+      if (signalRoomId != null && signalRoomId.isNotEmpty) {
+        await CloudflareIceService.updateRoom(
+          roomId: signalRoomId,
+          offerSdp: offerSdp,
+          roomInfo: signalRoomInfo,
+        ).timeout(CloudflareIceService.requestTimeout);
+      }
+      final createdSignalRoomId =
+          signalRoomId ??
+          await CloudflareIceService.createRoom(
+            offerSdp: offerSdp,
+            roomInfo: signalRoomInfo,
+          ).timeout(CloudflareIceService.requestTimeout);
+      _logInternetDirect('host worker room=$createdSignalRoomId');
+      _internetDirectSignalRoomId = createdSignalRoomId;
+      _startInternetDirectAnswerPolling(createdSignalRoomId);
+
+      _hostedRoom = signalRoomInfo.copyWith(currentPlayers: 1);
+      _joinedRoom = null;
+      _localPlayerId = _hostedRoom!.hostIp;
+      _applyRoomState(_buildRoomState());
+      _setStatus(NetplayStatus.hosting);
+      _connectionStateController.add(true);
+
+      final inviteCode = InternetDirectCode(
+        signalUrl: CloudflareIceService.signalBaseUrl,
+        signalRoomId: createdSignalRoomId,
+        roomId: roomTemplate.roomId,
+        roomName: roomTemplate.roomName,
+        gameCode: roomTemplate.gameCode,
+        gameTitle: roomTemplate.gameTitle,
+        gameMd5: roomTemplate.gameMd5,
+        maxPlayers: roomTemplate.maxPlayers,
+      );
+      _internetDirectInviteCode = inviteCode;
+      return inviteCode;
+    } catch (e, st) {
+      _logInternetDirect('host create failed: $e\n$st');
+      await _resetConnections();
+      return null;
+    }
+  }
+
+  Future<bool> joinInternetDirectRoom(
+    InternetDirectCode code, {
+    String? playerName,
+  }) async {
+    await _resetConnections(keepDiscovery: false);
+    _isHost = false;
+    _internetDirectMode = true;
+    _localPlayerName = playerName ?? 'Player 2';
+    _localPlayerSlot = 0;
+    _localPlayerId = null;
+    _joinedRoom = code.toRoomInfo();
+    _hostedRoom = null;
+    _internetDirectInviteCode = code;
+
+    try {
+      _logInternetDirect('join loading worker room=${code.signalRoomId}');
+      final signalRoom = await CloudflareIceService.getRoom(
+        code.signalRoomId,
+      ).timeout(CloudflareIceService.requestTimeout);
+      _joinedRoom = signalRoom.roomInfo;
+      _internetDirectInviteCode = code;
+      _logInternetDirect('join requesting cloudflare ice');
+      final ice = await CloudflareIceService.generate().timeout(
+        CloudflareIceService.requestTimeout,
+      );
+      _logInternetDirect(
+        'join cloudflare ice servers=${ice.iceServers.length}',
+      );
+
+      _webrtcGuest = InternetDirectWebRtcGuest(
+        iceServers: ice.iceServers,
+        onLog: _logInternetDirect,
+      );
+      _webrtcGuestParser = NetplayStreamParser();
+      _attachWebRtcGuestDataListener();
+
+      _logInternetDirect(
+        'join webrtc worker=${CloudflareIceService.signalBaseUrl} room=${code.signalRoomId}',
+      );
+
+      final connected = await _webrtcGuest!.connect(
+        offerSdp: signalRoom.offerSdp,
+        submitAnswer: (answerSdp) => CloudflareIceService.submitAnswer(
+          roomId: code.signalRoomId,
+          answerSdp: answerSdp,
+        ),
+      );
+      if (!connected) {
+        _logInternetDirect('join webrtc failed');
+        await _resetConnections();
+        return false;
+      }
+
+      final completer = Completer<bool>();
+      late StreamSubscription<int> slotSub;
+      Timer? retryTimer;
+      slotSub = onPlayerSlotAssigned.listen((slot) {
+        if (slot > 0 && !completer.isCompleted) {
+          _logInternetDirect('join received slot=$slot');
+          completer.complete(true);
+        }
+      });
+      void sendJoin() {
+        _sendInternetDirect(NetplayMessage.join(playerName: _localPlayerName!));
+        _sendInternetDirect(
+          NetplayMessage.ping(DateTime.now().millisecondsSinceEpoch),
+        );
+      }
+
+      sendJoin();
+      retryTimer = Timer.periodic(const Duration(milliseconds: 400), (_) {
+        if (completer.isCompleted) {
+          return;
+        }
+        sendJoin();
+      });
+
+      final ok = await completer.future.timeout(
+        const Duration(seconds: 12),
+        onTimeout: () => false,
+      );
+      await slotSub.cancel();
+      retryTimer.cancel();
+      if (!ok) {
+        _logInternetDirect('join timeout waiting JOIN_ACK over webrtc');
+        await _resetConnections();
+        return false;
+      }
+      _setStatus(NetplayStatus.inLobby);
+      _connectionStateController.add(true);
+      _startPingTimer();
+      return true;
+    } catch (e, st) {
+      _logInternetDirect('join failed: $e\n$st');
       await _resetConnections();
       return false;
     }
@@ -496,6 +749,13 @@ class NetplayService {
   }
 
   void requestRom() {
+    debugPrint('[Netplay] request ROM from host');
+    // Reset parser to ensure clean state before receiving ROM data.
+    _webrtcGuestParser?.reset();
+    _pendingRomBegin = null;
+    _pendingRomChunks = null;
+    _pendingRomBuffer = null;
+    _pendingRomReceivedBytes = 0;
     _broadcast(NetplayMessage.requestRom());
   }
 
@@ -527,28 +787,133 @@ class NetplayService {
     _setStatus(NetplayStatus.transferringRom);
 
     final safeName = NetplayWire.safeFileName(fileName);
-    // LAN ROMs are small — send as base64 inside JSON to avoid binary/text mix-ups.
+    debugPrint(
+      '[Netplay] sending ROM peer=$targetPeerId bytes=${bytes.length} '
+      'chunk=${NetplayRomTransfer.chunkSize} internet=$_internetDirectMode',
+    );
     _sendToPeer(
       targetPeerId,
       NetplayMessage.romBegin(
         size: bytes.length,
         fileName: safeName,
         md5: fileMd5,
-        dataB64: base64Encode(bytes),
+        chunked: _internetDirectMode,
       ),
     );
-    _romProgressController.add(
-      RomTransferProgress(
-        sent: bytes.length,
-        total: bytes.length,
-        isSending: true,
-      ),
-    );
+    final sent = await _sendRomBytesToPeer(targetPeerId, bytes);
+    if (!sent) {
+      debugPrint('[Netplay] ROM send failed peer=$targetPeerId');
+      _sendingRom = false;
+      if (_status == NetplayStatus.transferringRom) {
+        _setStatus(NetplayStatus.inLobby);
+      }
+      return;
+    }
     _sendToPeer(targetPeerId, NetplayMessage.romEnd());
+    debugPrint('[Netplay] ROM send complete peer=$targetPeerId');
     _sendingRom = false;
     if (_status == NetplayStatus.transferringRom) {
       _setStatus(NetplayStatus.inLobby);
     }
+  }
+
+  Future<bool> _sendRomBytesToPeer(String peerId, Uint8List bytes) async {
+    final chunkSize = _internetDirectMode
+        ? (NetplayRomTransfer.chunkSize ~/ 2)
+        : NetplayRomTransfer.chunkSize;
+    Socket? socket;
+    if (!_internetDirectMode) {
+      socket = _peers[peerId]?.socket;
+      if (socket == null) {
+        return false;
+      }
+    }
+
+    debugPrint(
+      '[Netplay] _sendRomBytesToPeer total=${bytes.length} '
+      'chunkSize=$chunkSize internet=$_internetDirectMode',
+    );
+
+    // WebRTC flow control: send a batch, then wait for the receiver to
+    // acknowledge receipt before sending the next batch. This prevents the
+    // TURN relay buffer from overflowing.
+    const webrtcChunkDelay = Duration(milliseconds: 10);
+    const webrtcBatchBytes = 128 * 1024; // 128KB per batch
+    const ackTimeout = Duration(seconds: 30);
+
+    _romReceiverAckedBytes = 0;
+    _romReceiverAckCompleter = null;
+
+    for (var offset = 0; offset < bytes.length; offset += chunkSize) {
+      if (!_sendingRom) {
+        debugPrint('[Netplay] ROM send cancelled at offset=$offset');
+        return false;
+      }
+      final end = min(offset + chunkSize, bytes.length);
+      final chunk = Uint8List.sublistView(bytes, offset, end);
+      if (_internetDirectMode) {
+        final packet = _encodeInternetDirectRomChunk(
+          offset: offset,
+          total: bytes.length,
+          chunk: chunk,
+        );
+        final sent = _webrtcHost?.send(packet) ?? false;
+        if (!sent) {
+          debugPrint('[Netplay] ROM send failed at offset=$offset');
+          return false;
+        }
+        await Future<void>.delayed(webrtcChunkDelay);
+
+        // After sending a batch worth of data, wait for the receiver to
+        // acknowledge receipt before continuing.
+        if (end % webrtcBatchBytes < chunkSize || end >= bytes.length) {
+          final completer = Completer<void>();
+          _romReceiverAckCompleter = completer;
+          debugPrint(
+            '[Netplay] ROM send waiting for ack sent=${end ~/ 1024}KB '
+            'acked=${_romReceiverAckedBytes ~/ 1024}KB',
+          );
+          try {
+            await completer.future.timeout(ackTimeout);
+          } on TimeoutException {
+            debugPrint('[Netplay] ROM send ack timeout');
+            _romReceiverAckCompleter = null;
+            return false;
+          }
+          _romReceiverAckCompleter = null;
+          // Give the relay extra time to drain after ack.
+          await Future<void>.delayed(const Duration(milliseconds: 200));
+        }
+      } else {
+        try {
+          socket!.add(chunk);
+          if ((offset ~/ chunkSize) % 8 == 7) {
+            await socket.flush();
+          }
+        } on Object {
+          return false;
+        }
+      }
+      if ((offset ~/ chunkSize) % 20 == 19) {
+        debugPrint(
+          '[Netplay] ROM send progress=${end ~/ 1024}KB/'
+          '${bytes.length ~/ 1024}KB',
+        );
+      }
+      _romProgressController.add(
+        RomTransferProgress(sent: end, total: bytes.length, isSending: true),
+      );
+    }
+
+    if (!_internetDirectMode) {
+      try {
+        await socket?.flush();
+      } on Object {
+        return false;
+      }
+    }
+    debugPrint('[Netplay] _sendRomBytesToPeer complete');
+    return true;
   }
 
   void startGame({required String gameMd5, required String gameId}) {
@@ -575,9 +940,9 @@ class NetplayService {
       _broadcastRoomState();
     }
     _broadcast(NetplayMessage.startGame(gameMd5: gameMd5, gameId: gameId));
-    _startGameController.add(
-      NetplayStartGameEvent(gameMd5: gameMd5, gameId: gameId),
-    );
+    final event = NetplayStartGameEvent(gameMd5: gameMd5, gameId: gameId);
+    _lastStartGameEvent = event;
+    _startGameController.add(event);
     _setStatus(NetplayStatus.gaming);
     _broadcast(NetplayMessage.gameSpeed(speed: _gameSpeed));
   }
@@ -658,6 +1023,28 @@ class NetplayService {
       return;
     }
     _publishGameSpeed(speed, broadcast: true);
+  }
+
+  void sendGbaNetpacket({
+    required int sourceClientId,
+    required int targetClientId,
+    required int flags,
+    required Uint8List bytes,
+  }) {
+    if (bytes.isEmpty) {
+      return;
+    }
+    final message = NetplayMessage.gbaNetpacket(
+      sourceClientId: sourceClientId,
+      targetClientId: targetClientId,
+      flags: flags,
+      bytes: bytes,
+    );
+    if (_isHost) {
+      _sendGbaNetpacketFromHost(message, targetClientId: targetClientId);
+    } else {
+      _safeSendToHost(message);
+    }
   }
 
   void _publishGameSpeed(int speed, {required bool broadcast}) {
@@ -781,26 +1168,57 @@ class NetplayService {
   Future<void> sendSaveStateToPeer({
     required String peerId,
     required Uint8List bytes,
+    String purpose = 'initial',
+    int? frame,
   }) async {
     if (!_isHost || bytes.isEmpty) {
       return;
     }
-    _sendToPeer(peerId, NetplayMessage.saveStateBegin(size: bytes.length));
+    debugPrint(
+      '[Netplay] sending save state peer=$peerId bytes=${bytes.length} '
+      'internet=$_internetDirectMode',
+    );
+    _sendToPeer(
+      peerId,
+      NetplayMessage.saveStateBegin(
+        size: bytes.length,
+        purpose: purpose,
+        frame: frame,
+      ),
+    );
     const chunkSize = NetplayRomTransfer.chunkSize;
     for (var offset = 0; offset < bytes.length; offset += chunkSize) {
       final end = min(offset + chunkSize, bytes.length);
-      _peers[peerId]?.socket.add(bytes.sublist(offset, end));
+      if (_internetDirectMode) {
+        _webrtcHost?.send(Uint8List.sublistView(bytes, offset, end));
+        await Future<void>.delayed(const Duration(milliseconds: 40));
+        continue;
+      }
+      final socket = _peers[peerId]?.socket;
+      if (socket == null) {
+        return;
+      }
+      socket.add(bytes.sublist(offset, end));
     }
     _sendToPeer(peerId, NetplayMessage.saveStateEnd());
   }
 
-  Future<void> sendSaveStateToPlayablePeers(Uint8List bytes) async {
+  Future<void> sendSaveStateToPlayablePeers(
+    Uint8List bytes, {
+    String purpose = 'initial',
+    int? frame,
+  }) async {
     if (!_isHost || bytes.isEmpty) {
       return;
     }
     for (final peer in _peers.values) {
       if (peer.playerSlot > 0) {
-        await sendSaveStateToPeer(peerId: peer.id, bytes: bytes);
+        await sendSaveStateToPeer(
+          peerId: peer.id,
+          bytes: bytes,
+          purpose: purpose,
+          frame: frame,
+        );
       }
     }
   }
@@ -813,6 +1231,13 @@ class NetplayService {
   void configureRollbackRunner(NetplayRollbackRunner runner) {
     _rollbackRunner = runner;
     _lockstepRunner = null;
+  }
+
+  void replayLastLockstepStart() {
+    final config = _lastLockstepStartConfig;
+    if (config != null) {
+      _handleLockstepStart(config, notify: false);
+    }
   }
 
   /// Both sides call after [retro_load_game] — lockstep begins when all ready.
@@ -853,14 +1278,25 @@ class NetplayService {
       return;
     }
     final message = NetplayMessage.frameBundle(frame: frame, inputs: inputs);
-    _broadcast(message);
+    if (_internetDirectMode) {
+      _sendInternetDirectRealtime(message);
+      _sendInternetDirect(message);
+    } else {
+      _broadcast(message);
+    }
     _lockstepRunner?.applyFrameBundle(frame, inputs);
+  }
+
+  void sendLockstepStartAck() {
+    _safeSendToHost(NetplayMessage.lockstepStartAck());
   }
 
   void _stopLockstep() {
     _lockstepRunner?.stop();
     _rollbackRunner?.stop();
     _lockstepReadyPeers.clear();
+    _lastLockstepStartConfig = null;
+    _lockstepStartAckReceived = false;
   }
 
   void _tryStartLockstep() {
@@ -889,21 +1325,14 @@ class NetplayService {
       startFrame: 0,
       fps: _lockstepFps,
       requiredSlots: slots.toList()..sort(),
+      inputDelayFrames: _recommendedLockstepInputDelayFrames(),
     );
-    _broadcast(
-      NetplayMessage.lockstepStart(
-        frame: config.startFrame,
-        fps: config.fps,
-        slots: config.requiredSlots,
-        inputDelayFrames: config.inputDelayFrames,
-      ),
-    );
+    _lastLockstepStartConfig = config;
+    _broadcast(_lockstepStartMessage(config));
     _lockstepRunner?.setRequiredSlots(_lockstepRequiredSlots);
     _lockstepRunner?.setInputDelayFrames(config.inputDelayFrames);
     _rollbackRunner?.setRequiredSlots(_lockstepRequiredSlots);
     _lockstepStartController.add(config);
-    _lockstepRunner?.start(fps: config.fps, startFrame: config.startFrame);
-    _rollbackRunner?.start(fps: config.fps, startFrame: config.startFrame);
   }
 
   void _handleLockstepReady(String peerId, double fps) {
@@ -912,19 +1341,111 @@ class NetplayService {
     }
     _lockstepReadyPeers.add(peerId);
     if (_isHost) {
+      if ((_lockstepRunner?.isRunning ?? false) ||
+          (_rollbackRunner?.isRunning ?? false)) {
+        final config = _lastLockstepStartConfig;
+        if (config != null) {
+          debugPrint('[Netplay] resend LOCKSTEP_START to $peerId');
+          _sendToPeer(peerId, _lockstepStartMessage(config));
+        }
+        return;
+      }
       _tryStartLockstep();
     }
   }
 
-  void _handleLockstepStart(LockstepStartConfig config) {
+  NetplayMessage _lockstepStartMessage(LockstepStartConfig config) {
+    return NetplayMessage.lockstepStart(
+      frame: config.startFrame,
+      fps: config.fps,
+      slots: config.requiredSlots,
+      inputDelayFrames: config.inputDelayFrames,
+    );
+  }
+
+  int _recommendedLockstepInputDelayFrames() {
+    return recommendedLockstepInputDelayFrames();
+  }
+
+  int recommendedLockstepInputDelayFrames() {
+    final latency = measuredLatencyMs;
+    if (_internetDirectMode) {
+      if (latency >= 450) {
+        return 8;
+      }
+      if (latency >= 300) {
+        return 6;
+      }
+      if (latency >= 160) {
+        return 5;
+      }
+      if (latency >= 100) {
+        return 4;
+      }
+      return 3;
+    }
+    return kDefaultNetplayInputDelayFrames;
+  }
+
+  int recommendedRollbackFrames() {
+    if (_internetDirectMode) {
+      return 8;
+    }
+    return kGgpoRollbackFrames;
+  }
+
+  int recommendedRollbackInputDelayFrames() {
+    if (_internetDirectMode) {
+      final latency = measuredLatencyMs;
+      if (latency >= 450) {
+        return 6;
+      }
+      if (latency >= 300) {
+        return 5;
+      }
+      if (latency >= 180) {
+        return 4;
+      }
+      return 3;
+    }
+    return kGgpoInputDelayFrames;
+  }
+
+  void _handleLockstepStart(LockstepStartConfig config, {bool notify = true}) {
+    debugPrint(
+      '[Netplay] handle LOCKSTEP_START host=$_isHost '
+      'slots=${config.requiredSlots} fps=${config.fps} notify=$notify',
+    );
+    _lastLockstepStartConfig = config;
     _lockstepRequiredSlots = config.requiredSlots.toSet();
     _lockstepRunner?.setRequiredSlots(_lockstepRequiredSlots);
     _lockstepRunner?.setInputDelayFrames(config.inputDelayFrames);
     _rollbackRunner?.setRequiredSlots(_lockstepRequiredSlots);
-    _lockstepStartController.add(config);
+    if (notify) {
+      _lockstepStartController.add(config);
+    }
+    if (_isHost) {
+      // Host waits for guest ACK before starting runners.
+      return;
+    }
     _lockstepRunner?.start(fps: config.fps, startFrame: config.startFrame);
     _rollbackRunner?.start(fps: config.fps, startFrame: config.startFrame);
   }
+
+  void _handleLockstepStartAck() {
+    debugPrint('[Netplay] handle LOCKSTEP_START_ACK host=$_isHost');
+    if (!_isHost) {
+      return;
+    }
+    _lockstepStartAckReceived = true;
+    final config = _lastLockstepStartConfig;
+    if (config != null) {
+      _lockstepRunner?.start(fps: config.fps, startFrame: config.startFrame);
+      _rollbackRunner?.start(fps: config.fps, startFrame: config.startFrame);
+    }
+  }
+
+  bool _lockstepStartAckReceived = false;
 
   void _handleFrameInput(String peerId, NetplayMessage message) {
     final slot = (message.payload['slot'] as num?)?.toInt() ?? 0;
@@ -938,6 +1459,13 @@ class NetplayService {
     if (!_isHost) {
       _rollbackRunner?.receiveRemoteInput(frame, slot, buttons);
       return;
+    }
+    if (_internetDirectMode && _debugInputLogCount < 8) {
+      _debugInputLogCount++;
+      debugPrint(
+        '[Netplay] host received input peer=$peerId frame=$frame '
+        'slot=$slot buttons=$buttons',
+      );
     }
     runner?.receiveRemoteInput(frame, slot, buttons);
     _rollbackRunner?.receiveRemoteInput(frame, slot, buttons);
@@ -985,6 +1513,8 @@ class NetplayService {
     final roomSnapshot = _hostedRoom;
     _udpAnnounceTimer?.cancel();
     _udpAnnounceTimer = null;
+    unawaited(_disposeInternetDirectWebRtc());
+    _internetDirectMode = false;
     _closeUdpResponder();
     _broadcast(NetplayMessage.leave());
     unawaited(_repeatRoomClosedAnnouncement(roomSnapshot));
@@ -1046,10 +1576,14 @@ class NetplayService {
             .toJson(),
         playerName: peer.playerName,
         gameSpeed: _gameSpeed,
+        internetDirectInvite: _internetDirectInviteCode?.toJson(),
       ),
     );
 
     await Future<void>.delayed(const Duration(milliseconds: 150));
+    if (_internetDirectMode) {
+      _internetDirectSignalRoomId = null;
+    }
     await _resetConnections(notifyDisconnected: false);
   }
 
@@ -1068,6 +1602,10 @@ class NetplayService {
     );
     final resumeSave = _receivedResumeSaveState;
     final roomTemplate = parsed.copyWith(currentPlayers: 1);
+    final inviteRaw = message.payload['internetDirectInvite'];
+    final internetInvite = inviteRaw is Map
+        ? InternetDirectCode.fromJson(Map<String, dynamic>.from(inviteRaw))
+        : null;
 
     await _clientSocket?.close();
     _clientSocket = null;
@@ -1076,10 +1614,14 @@ class NetplayService {
     _localPlayerName = playerName;
     await _resetConnections(keepDiscovery: false, notifyDisconnected: false);
 
-    final ok = await createRoom(
-      roomTemplate: roomTemplate,
-      playerName: playerName,
-    );
+    final ok = internetInvite != null
+        ? await createInternetDirectRoom(
+                roomTemplate: roomTemplate,
+                playerName: playerName,
+                reuseInviteCode: internetInvite,
+              ) !=
+              null
+        : await createRoom(roomTemplate: roomTemplate, playerName: playerName);
     if (!ok) {
       return;
     }
@@ -1130,6 +1672,7 @@ class NetplayService {
     await _playerUpdatedController.close();
     await _playerLeftController.close();
     await _messageController.close();
+    await _romRequestedController.close();
     await _romProgressController.close();
     await _startGameController.close();
     await _connectionStateController.close();
@@ -1137,9 +1680,11 @@ class NetplayService {
     await _lockstepStartController.close();
     await _gameplayPeerLeftController.close();
     await _saveStateReceivedController.close();
+    await _saveStateEventController.close();
     await _playerSlotAssignedController.close();
     await _hostPromotedController.close();
     await _gameSpeedController.close();
+    await _gbaNetpacketController.close();
   }
 
   void _setStatus(NetplayStatus status) {
@@ -1150,10 +1695,458 @@ class NetplayService {
     _statusController.add(status);
   }
 
+  void _attachWebRtcHostDataListener() {
+    final host = _webrtcHost;
+    if (host == null) {
+      return;
+    }
+    _webrtcDataSub?.cancel();
+    _webrtcDataSub = host.onData.listen((data) {
+      final existingParser = _peers[_internetDirectPeerId]?.parser;
+      if (existingParser == null || !existingParser.isReceivingBinary) {
+        if (_handleInternetDirectBinary(_internetDirectPeerId, data)) {
+          return;
+        }
+      }
+      _peers.putIfAbsent(
+        _internetDirectPeerId,
+        () => _PeerConnection(
+          id: _internetDirectPeerId,
+          parser: NetplayStreamParser(),
+        ),
+      );
+      _handlePeerData(_peers[_internetDirectPeerId]!, data);
+    });
+    _webrtcRealtimeDataSub?.cancel();
+    _webrtcRealtimeDataSub = host.onRealtimeData.listen((data) {
+      _handleInternetDirectBinary(_internetDirectPeerId, data);
+    });
+    _webrtcConnectedSub?.cancel();
+    _webrtcConnectedSub = host.onConnected.listen((connected) {
+      if (!connected && _isHost && _internetDirectMode) {
+        _handlePeerClosed(_internetDirectPeerId);
+      }
+    });
+  }
+
+  Future<void> _refreshInternetDirectOffer() async {
+    if (_refreshingInternetDirectOffer || !_isHost || !_internetDirectMode) {
+      return;
+    }
+    final signalRoomId = _internetDirectSignalRoomId;
+    final room = _hostedRoom;
+    if (signalRoomId == null || signalRoomId.isEmpty || room == null) {
+      return;
+    }
+    _refreshingInternetDirectOffer = true;
+    try {
+      _logInternetDirect('host refreshing worker offer room=$signalRoomId');
+      final host =
+          _webrtcHost ??
+          InternetDirectWebRtcHost(
+            iceServers: (await CloudflareIceService.generate()).iceServers,
+            onLog: _logInternetDirect,
+          );
+      _webrtcHost = host;
+      final offerSdp = await host.createOffer().timeout(
+        const Duration(seconds: 20),
+      );
+      _attachWebRtcHostDataListener();
+      await CloudflareIceService.updateRoom(
+        roomId: signalRoomId,
+        offerSdp: offerSdp,
+        roomInfo: room,
+      ).timeout(CloudflareIceService.requestTimeout);
+      _startInternetDirectAnswerPolling(signalRoomId);
+      _logInternetDirect('host refreshed worker offer');
+    } catch (e) {
+      _logInternetDirect('host refresh offer failed: $e');
+    } finally {
+      _refreshingInternetDirectOffer = false;
+    }
+  }
+
+  void _startInternetDirectAnswerPolling(String signalRoomId) {
+    _internetDirectAnswerPollTimer?.cancel();
+    var applying = false;
+    Future<void> pollOnce() async {
+      if (applying || !_internetDirectMode || !_isHost) {
+        return;
+      }
+      applying = true;
+      try {
+        final answer = await CloudflareIceService.getAnswer(signalRoomId);
+        if (answer == null || answer.isEmpty) {
+          return;
+        }
+        _logInternetDirect('host received answer via worker');
+        _internetDirectAnswerPollTimer?.cancel();
+        _internetDirectAnswerPollTimer = null;
+        final ok = await _webrtcHost?.applyAnswer(answer) ?? false;
+        if (!ok) {
+          _logInternetDirect('host apply answer failed');
+        } else {
+          _startPingTimer();
+        }
+      } catch (e) {
+        _logInternetDirect('host answer poll failed: $e');
+      } finally {
+        applying = false;
+      }
+    }
+
+    unawaited(pollOnce());
+    _internetDirectAnswerPollTimer = Timer.periodic(
+      const Duration(milliseconds: 700),
+      (_) => unawaited(pollOnce()),
+    );
+  }
+
+  void _attachWebRtcGuestDataListener() {
+    final guest = _webrtcGuest;
+    final parser = _webrtcGuestParser;
+    if (guest == null || parser == null) {
+      return;
+    }
+    _webrtcDataSub?.cancel();
+    _webrtcDataSub = guest.onData.listen((data) {
+      if (!parser.isReceivingBinary) {
+        if (_handleInternetDirectBinary('host', data)) {
+          return;
+        }
+      }
+      parser.feed(
+        data,
+        onMessage: (message) => _handleMessage('host', message),
+        onRomComplete: (bytes, beginMeta) {
+          debugPrint(
+            '[Netplay] guest ROM complete via parser bytes=${bytes.length}',
+          );
+          _handleRomComplete('host', bytes, beginMeta);
+        },
+        onRomProgress: (received, total, _) {
+          _emitRomReceiveProgress(received, total);
+          // Acknowledge receipt to the host for flow control.
+          // Send every ~128KB (matching host's batch size).
+          if (received % (128 * 1024) < 16 * 1024 || received >= total) {
+            _sendInternetDirect(NetplayMessage.romProgress(received: received));
+          }
+        },
+        onSaveStateComplete: (bytes, beginMeta) =>
+            _handleSaveStateComplete(bytes, beginMeta),
+      );
+    });
+    _webrtcRealtimeDataSub?.cancel();
+    _webrtcRealtimeDataSub = guest.onRealtimeData.listen((data) {
+      _handleInternetDirectBinary('host', data);
+    });
+  }
+
+  void _sendInternetDirect(NetplayMessage message) {
+    final bytes =
+        _encodeInternetDirectBinary(message) ??
+        NetplayLineCodec.encode(message);
+    if (_isHost) {
+      _webrtcHost?.send(bytes);
+    } else {
+      _webrtcGuest?.send(bytes);
+    }
+  }
+
+  void _sendInternetDirectRealtime(NetplayMessage message) {
+    final bytes = _encodeInternetDirectBinary(message);
+    if (bytes == null) {
+      _sendInternetDirect(message);
+      return;
+    }
+    if (_isHost) {
+      _webrtcHost?.sendRealtime(bytes);
+    } else {
+      _webrtcGuest?.sendRealtime(bytes);
+    }
+  }
+
+  bool _handleInternetDirectBinary(String peerId, Uint8List data) {
+    if (_handleInternetDirectRomChunk(peerId, data)) {
+      return true;
+    }
+    final message = _decodeInternetDirectBinary(data);
+    if (message == null) {
+      return false;
+    }
+    _handleMessage(peerId, message);
+    return true;
+  }
+
+  Uint8List _encodeInternetDirectRomChunk({
+    required int offset,
+    required int total,
+    required Uint8List chunk,
+  }) {
+    final bytes = Uint8List(16 + chunk.length);
+    final data = ByteData.sublistView(bytes);
+    data.setUint8(0, _binaryMagic0);
+    data.setUint8(1, _binaryMagic1);
+    data.setUint8(2, _binaryMagic2);
+    data.setUint8(3, _binaryRomChunk);
+    data.setUint32(4, offset, Endian.little);
+    data.setUint32(8, total, Endian.little);
+    data.setUint32(12, chunk.length, Endian.little);
+    bytes.setRange(16, bytes.length, chunk);
+    return bytes;
+  }
+
+  bool _handleInternetDirectRomChunk(String peerId, Uint8List bytes) {
+    if (bytes.length < 16 ||
+        bytes[0] != _binaryMagic0 ||
+        bytes[1] != _binaryMagic1 ||
+        bytes[2] != _binaryMagic2 ||
+        bytes[3] != _binaryRomChunk) {
+      return false;
+    }
+    if (_isHost || _pendingRomBegin == null) {
+      return true;
+    }
+
+    final data = ByteData.sublistView(bytes);
+    final offset = data.getUint32(4, Endian.little);
+    final total = data.getUint32(8, Endian.little);
+    final length = data.getUint32(12, Endian.little);
+    if (length == 0 || bytes.length != 16 + length || offset + length > total) {
+      debugPrint(
+        '[Netplay] invalid ROM chunk offset=$offset length=$length total=$total bytes=${bytes.length}',
+      );
+      return true;
+    }
+
+    var buffer = _pendingRomBuffer;
+    if (buffer == null || buffer.length != total) {
+      buffer = Uint8List(total);
+      _pendingRomBuffer = buffer;
+      _pendingRomReceivedBytes = 0;
+    }
+
+    buffer.setRange(offset, offset + length, bytes, 16);
+    _pendingRomReceivedBytes = max(_pendingRomReceivedBytes, offset + length);
+    _emitRomReceiveProgress(_pendingRomReceivedBytes, total);
+    if (_internetDirectMode) {
+      _sendInternetDirect(
+        NetplayMessage.romProgress(received: _pendingRomReceivedBytes),
+      );
+    }
+
+    if (_pendingRomReceivedBytes >= total) {
+      final begin = _pendingRomBegin;
+      if (begin != null) {
+        debugPrint(
+          '[Netplay] guest ROM complete via binary chunks bytes=$total',
+        );
+        _handleRomComplete(peerId, buffer, begin);
+      }
+    }
+    return true;
+  }
+
+  Uint8List? _encodeInternetDirectBinary(NetplayMessage message) {
+    switch (message.type) {
+      case NetplayMessageType.frameInput:
+        final frame = (message.payload['frame'] as num?)?.toInt() ?? 0;
+        final slot = (message.payload['slot'] as num?)?.toInt() ?? 0;
+        final buttons = (message.payload['buttons'] as num?)?.toInt() ?? 0;
+        final bytes = Uint8List(11);
+        final data = ByteData.sublistView(bytes);
+        data.setUint8(0, _binaryMagic0);
+        data.setUint8(1, _binaryMagic1);
+        data.setUint8(2, _binaryMagic2);
+        data.setUint8(3, _binaryFrameInput);
+        data.setUint32(4, frame, Endian.little);
+        data.setUint8(8, slot.clamp(0, 0xFF));
+        data.setUint16(9, buttons & 0xFFFF, Endian.little);
+        return bytes;
+      case NetplayMessageType.frameBundle:
+        final frame = (message.payload['frame'] as num?)?.toInt() ?? 0;
+        final rawInputs = message.payload['inputs'];
+        if (rawInputs is! Map) {
+          return null;
+        }
+        final entries = <MapEntry<int, int>>[];
+        for (final entry in rawInputs.entries) {
+          final slot = int.tryParse(entry.key.toString());
+          if (slot == null) {
+            continue;
+          }
+          entries.add(
+            MapEntry(
+              slot.clamp(0, 0xFF),
+              ((entry.value as num?)?.toInt() ?? 0) & 0xFFFF,
+            ),
+          );
+        }
+        if (entries.length > 4) {
+          return null;
+        }
+        final bytes = Uint8List(9 + entries.length * 3);
+        final data = ByteData.sublistView(bytes);
+        data.setUint8(0, _binaryMagic0);
+        data.setUint8(1, _binaryMagic1);
+        data.setUint8(2, _binaryMagic2);
+        data.setUint8(3, _binaryFrameBundle);
+        data.setUint32(4, frame, Endian.little);
+        data.setUint8(8, entries.length);
+        var offset = 9;
+        for (final entry in entries) {
+          data.setUint8(offset, entry.key);
+          data.setUint16(offset + 1, entry.value, Endian.little);
+          offset += 3;
+        }
+        return bytes;
+    }
+    return null;
+  }
+
+  NetplayMessage? _decodeInternetDirectBinary(Uint8List bytes) {
+    if (bytes.length < 4 ||
+        bytes[0] != _binaryMagic0 ||
+        bytes[1] != _binaryMagic1 ||
+        bytes[2] != _binaryMagic2) {
+      return null;
+    }
+    final data = ByteData.sublistView(bytes);
+    switch (bytes[3]) {
+      case _binaryFrameInput:
+        if (bytes.length != 11) {
+          return null;
+        }
+        return NetplayMessage.frameInput(
+          frame: data.getUint32(4, Endian.little),
+          slot: data.getUint8(8),
+          buttons: data.getUint16(9, Endian.little),
+        );
+      case _binaryFrameBundle:
+        if (bytes.length < 9) {
+          return null;
+        }
+        final count = data.getUint8(8);
+        if (bytes.length != 9 + count * 3) {
+          return null;
+        }
+        final inputs = <int, int>{};
+        var offset = 9;
+        for (var i = 0; i < count; i++) {
+          inputs[data.getUint8(offset)] = data.getUint16(
+            offset + 1,
+            Endian.little,
+          );
+          offset += 3;
+        }
+        return NetplayMessage.frameBundle(
+          frame: data.getUint32(4, Endian.little),
+          inputs: inputs,
+        );
+    }
+    return null;
+  }
+
+  void _startPingTimer() {
+    _pingTimer?.cancel();
+    _pingTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+      if (_internetDirectMode) {
+        unawaited(_updateInternetDirectStats());
+      }
+      final msg = NetplayMessage.ping(DateTime.now().millisecondsSinceEpoch);
+      if (_internetDirectMode) {
+        _sendInternetDirect(msg);
+      } else if (_isHost) {
+        _broadcast(msg);
+      } else {
+        _sendToHost(msg);
+      }
+    });
+  }
+
+  Future<void> _updateInternetDirectStats() async {
+    if (!_internetDirectMode) {
+      return;
+    }
+    final stats = _isHost
+        ? await _webrtcHost?.getStats()
+        : await _webrtcGuest?.getStats();
+    if (stats == null || stats.rttMs == null) {
+      return;
+    }
+    final latency = stats.rttMs!;
+    debugPrint('[InternetDirect/WebRTC] stats $stats');
+    _localLatency = latency;
+    if (_isHost) {
+      _broadcastRoomState();
+    } else {
+      _updateLocalRoomStateLatency(latency);
+      _sendInternetDirect(NetplayMessage.latencyReport(latency: latency));
+      _playerUpdatedController.add(
+        PlayerInfo(
+          id: _localPlayerId ?? 'local',
+          name: _localPlayerName ?? '我',
+          isHost: false,
+          slot: _localPlayerSlot,
+          latency: latency,
+        ),
+      );
+    }
+  }
+
+  void _updateLocalRoomStateLatency(int latency) {
+    final state = _roomState;
+    if (state == null || _localPlayerSlot <= 0) {
+      return;
+    }
+    final players = state.players
+        .map(
+          (player) => player.slot == _localPlayerSlot
+              ? player.copyWith(latency: latency)
+              : player,
+        )
+        .toList();
+    _roomState = NetplayRoomState(
+      players: players,
+      maxPlayers: state.maxPlayers,
+      inGame: state.inGame,
+      awaitingReplacement: state.awaitingReplacement,
+    );
+    _roomStateController.add(_roomState!);
+  }
+
+  Future<void> _disposeInternetDirectWebRtc() async {
+    _internetDirectAnswerPollTimer?.cancel();
+    _internetDirectAnswerPollTimer = null;
+    final signalRoomId = _internetDirectSignalRoomId;
+    _internetDirectSignalRoomId = null;
+    await _webrtcDataSub?.cancel();
+    _webrtcDataSub = null;
+    await _webrtcRealtimeDataSub?.cancel();
+    _webrtcRealtimeDataSub = null;
+    await _webrtcConnectedSub?.cancel();
+    _webrtcConnectedSub = null;
+    _webrtcGuestParser = null;
+    await _webrtcHost?.dispose();
+    _webrtcHost = null;
+    await _webrtcGuest?.dispose();
+    _webrtcGuest = null;
+    if (signalRoomId != null && signalRoomId.isNotEmpty) {
+      unawaited(CloudflareIceService.closeRoom(signalRoomId));
+    }
+  }
+
+  void _logInternetDirect(String message) {
+    debugPrint('[InternetDirect] $message');
+  }
+
   Future<void> _resetConnections({
     bool keepDiscovery = false,
     bool notifyDisconnected = true,
   }) async {
+    _pingTimer?.cancel();
+    _pingTimer = null;
+    _localLatency = 0;
     _udpAnnounceTimer?.cancel();
     _udpAnnounceTimer = null;
 
@@ -1164,7 +2157,7 @@ class NetplayService {
     unawaited(LanMulticastLock.release());
 
     for (final peer in _peers.values) {
-      await peer.socket.close();
+      await peer.socket?.close();
     }
     _peers.clear();
 
@@ -1174,15 +2167,23 @@ class NetplayService {
     await _server?.close();
     _server = null;
 
+    await _disposeInternetDirectWebRtc();
+    _internetDirectMode = false;
+
     _hostedRoom = null;
     _joinedRoom = null;
+    _internetDirectInviteCode = null;
     _roomState = null;
     _localPlayerSlot = 0;
     _localPlayerId = null;
     _isHost = false;
     _sendingRom = false;
     _pendingRomBegin = null;
+    _pendingRomChunks = null;
+    _pendingRomBuffer = null;
+    _pendingRomReceivedBytes = 0;
     _awaitingReplacement = false;
+    _lastLockstepStartConfig = null;
     _exitingForReplacement = false;
     _hostPromotionExit = false;
     _stashedResumeSaveState = null;
@@ -1247,6 +2248,7 @@ class NetplayService {
         isHost: true,
         isReady: true,
         slot: 1,
+        latency: _isHost ? _localLatency : 0,
       ),
     ];
 
@@ -1352,21 +2354,40 @@ class NetplayService {
   }
 
   void _handlePeerData(_PeerConnection peer, Uint8List data) {
-    peer.parser.feed(
+    final parser = peer.parser;
+    if (parser == null) {
+      return;
+    }
+    parser.feed(
       data,
       onMessage: (message) => _handleMessage(peer.id, message),
       onRomComplete: (bytes, beginMeta) =>
           _handleRomComplete(peer.id, bytes, beginMeta),
-      onSaveStateComplete: (bytes) => _handleSaveStateComplete(bytes),
+      onRomProgress: (received, total, _) =>
+          _emitRomReceiveProgress(received, total),
+      onSaveStateComplete: (bytes, beginMeta) =>
+          _handleSaveStateComplete(bytes, beginMeta),
     );
   }
 
-  void _handleSaveStateComplete(Uint8List bytes) {
+  void _handleSaveStateComplete(Uint8List bytes, NetplayMessage beginMeta) {
     if (bytes.isEmpty) {
       return;
     }
-    _receivedResumeSaveState = Uint8List.fromList(bytes);
-    _saveStateReceivedController.add(_receivedResumeSaveState!);
+    final purpose = beginMeta.payload['purpose'] as String? ?? 'initial';
+    final frame = (beginMeta.payload['frame'] as num?)?.toInt();
+    debugPrint(
+      '[Netplay] received save state bytes=${bytes.length} '
+      'purpose=$purpose frame=$frame',
+    );
+    final copied = Uint8List.fromList(bytes);
+    if (purpose != 'correction') {
+      _receivedResumeSaveState = copied;
+      _saveStateReceivedController.add(_receivedResumeSaveState!);
+    }
+    _saveStateEventController.add(
+      NetplaySaveStateEvent(bytes: copied, purpose: purpose, frame: frame),
+    );
   }
 
   void _handleMessage(String peerId, NetplayMessage message) {
@@ -1443,19 +2464,20 @@ class NetplayService {
       case NetplayMessageType.requestRom:
         if (_isHost) {
           _ensurePeerPlayable(peerId);
-          _messageController.add(message);
+          debugPrint('[Netplay] ROM requested by peer=$peerId');
+          _romRequestedController.add(peerId);
         }
       case NetplayMessageType.startGame:
         final gameMd5 = message.payload['gameMd5'] as String? ?? '';
         final gameId = message.payload['gameId'] as String? ?? '';
         final resume = _isResumeStartPayload(message.payload);
-        _startGameController.add(
-          NetplayStartGameEvent(
-            gameMd5: gameMd5,
-            gameId: gameId,
-            resume: resume,
-          ),
+        final event = NetplayStartGameEvent(
+          gameMd5: gameMd5,
+          gameId: gameId,
+          resume: resume,
         );
+        _lastStartGameEvent = event;
+        _startGameController.add(event);
         _setStatus(NetplayStatus.gaming);
       case NetplayMessageType.lockstepReady:
         if (_isHost) {
@@ -1483,6 +2505,8 @@ class NetplayService {
             ),
           );
         }
+      case NetplayMessageType.lockstepStartAck:
+        _handleLockstepStartAck();
       case NetplayMessageType.frameInput:
         _handleFrameInput(peerId, message);
       case NetplayMessageType.frameBundle:
@@ -1494,6 +2518,8 @@ class NetplayService {
       case NetplayMessageType.gameSpeed:
         final speed = (message.payload['speed'] as num?)?.toInt() ?? 1;
         _applyRemoteGameSpeed(speed);
+      case NetplayMessageType.gbaNetpacket:
+        _handleGbaNetpacket(peerId, message);
       case NetplayMessageType.hostPromote:
         if (!_isHost) {
           _hostPromotionPending = true;
@@ -1507,12 +2533,19 @@ class NetplayService {
         _handlePeerClosed(peerId);
       case NetplayMessageType.ping:
         final sentAt = message.payload['sentAt'] as int? ?? 0;
-        _sendToPeer(peerId, NetplayMessage.pong(sentAt));
+        if (_internetDirectMode) {
+          _sendInternetDirect(NetplayMessage.pong(sentAt));
+        } else {
+          _sendToPeer(peerId, NetplayMessage.pong(sentAt));
+        }
       case NetplayMessageType.pong:
         final sentAt = message.payload['sentAt'] as int? ?? 0;
         final latency = max(0, DateTime.now().millisecondsSinceEpoch - sentAt);
+        if (_isHost || !_internetDirectMode) {
+          _localLatency = latency;
+        }
         final peer = _peers[peerId];
-        if (peer != null) {
+        if (peer != null && !_internetDirectMode) {
           peer.latency = latency;
         }
         _playerUpdatedController.add(
@@ -1526,6 +2559,24 @@ class NetplayService {
         if (_isHost) {
           _broadcastRoomState();
         }
+      case NetplayMessageType.latencyReport:
+        final latency =
+            (message.payload['latency'] as num?)?.toInt().clamp(0, 60000) ?? 0;
+        if (_isHost && latency > 0) {
+          final peer = _peers[peerId];
+          if (peer != null) {
+            peer.latency = latency;
+            _playerUpdatedController.add(
+              PlayerInfo(
+                id: peerId,
+                name: peer.playerName,
+                latency: latency,
+                slot: peer.playerSlot,
+              ),
+            );
+            _broadcastRoomState();
+          }
+        }
       case NetplayMessageType.romBegin:
         if (!_isHost) {
           if (NetplayWire.hasInlineRomData(message.payload)) {
@@ -1537,12 +2588,69 @@ class NetplayService {
             }
           } else {
             _pendingRomBegin = message;
+            _pendingRomChunks = BytesBuilder(copy: false);
+            final expected = (message.payload['size'] as num?)?.toInt() ?? 0;
+            _pendingRomBuffer = _internetDirectMode && expected > 0
+                ? Uint8List(expected)
+                : null;
+            _pendingRomReceivedBytes = 0;
             _setStatus(NetplayStatus.transferringRom);
           }
         }
+      case NetplayMessageType.romChunk:
+        if (!_isHost && _pendingRomBegin != null) {
+          final raw = message.payload['data'] as String? ?? '';
+          if (raw.isEmpty) {
+            return;
+          }
+          try {
+            final chunk = base64Decode(raw);
+            _pendingRomChunks ??= BytesBuilder(copy: false);
+            _pendingRomChunks!.add(chunk);
+            final expected =
+                (_pendingRomBegin!.payload['size'] as num?)?.toInt() ?? 0;
+            final received = _pendingRomChunks!.length;
+            if (expected > 0) {
+              _romProgressController.add(
+                RomTransferProgress(
+                  sent: received.clamp(0, expected),
+                  total: expected,
+                  isSending: false,
+                ),
+              );
+              if (received >= expected) {
+                final begin = _pendingRomBegin;
+                final chunks = _pendingRomChunks;
+                if (begin != null && chunks != null) {
+                  _handleRomComplete(peerId, chunks.takeBytes(), begin);
+                  _pendingRomChunks = null;
+                }
+              }
+            }
+          } catch (_) {}
+        }
       case NetplayMessageType.romEnd:
-        if (!_isHost && _pendingRomBegin == null) {
-          _setStatus(NetplayStatus.inLobby);
+        if (!_isHost) {
+          final begin = _pendingRomBegin;
+          final chunks = _pendingRomChunks;
+          if (begin != null &&
+              chunks != null &&
+              chunks.length > 0 &&
+              _pendingRomBuffer == null) {
+            _handleRomComplete(peerId, chunks.takeBytes(), begin);
+            _pendingRomChunks = null;
+          } else if (_pendingRomBegin == null) {
+            _setStatus(NetplayStatus.inLobby);
+          }
+        }
+      case NetplayMessageType.romProgress:
+        if (_isHost) {
+          final received = (message.payload['received'] as num?)?.toInt() ?? 0;
+          _romReceiverAckedBytes = received;
+          if (_romReceiverAckCompleter != null &&
+              !_romReceiverAckCompleter!.isCompleted) {
+            _romReceiverAckCompleter!.complete();
+          }
         }
     }
   }
@@ -1555,6 +2663,9 @@ class NetplayService {
     final expectedSize = (beginMeta.payload['size'] as num?)?.toInt() ?? 0;
     if (expectedSize > 0 && bytes.length != expectedSize) {
       _pendingRomBegin = null;
+      _pendingRomChunks = null;
+      _pendingRomBuffer = null;
+      _pendingRomReceivedBytes = 0;
       if (!_isHost) {
         _setStatus(NetplayStatus.inLobby);
       }
@@ -1562,6 +2673,23 @@ class NetplayService {
     }
 
     final md5Hash = (beginMeta.payload['md5'] as String? ?? '').toLowerCase();
+    if (md5Hash.isNotEmpty) {
+      final actualMd5 = md5.convert(bytes).toString().toLowerCase();
+      if (actualMd5 != md5Hash) {
+        _pendingRomBegin = null;
+        _pendingRomChunks = null;
+        _pendingRomBuffer = null;
+        _pendingRomReceivedBytes = 0;
+        if (!_isHost) {
+          _setStatus(NetplayStatus.inLobby);
+        }
+        debugPrint(
+          '[Netplay] ROM md5 mismatch expected=$md5Hash actual=$actualMd5 '
+          'bytes=${bytes.length}',
+        );
+        return;
+      }
+    }
     final fileName = NetplayWire.decodeRomFileName(beginMeta.payload);
     _romProgressController.add(
       RomTransferProgress(
@@ -1574,8 +2702,99 @@ class NetplayService {
       ),
     );
     _pendingRomBegin = null;
+    _pendingRomChunks = null;
+    _pendingRomBuffer = null;
+    _pendingRomReceivedBytes = 0;
     if (!_isHost) {
       _setStatus(NetplayStatus.inLobby);
+    }
+  }
+
+  void _emitRomReceiveProgress(int received, int total) {
+    if (_isHost || total <= 0) {
+      return;
+    }
+    _romProgressController.add(
+      RomTransferProgress(
+        sent: received.clamp(0, total),
+        total: total,
+        isSending: false,
+      ),
+    );
+  }
+
+  void _handleGbaNetpacket(String peerId, NetplayMessage message) {
+    final rawData = message.payload['data'] as String? ?? '';
+    if (rawData.isEmpty) {
+      return;
+    }
+    Uint8List bytes;
+    try {
+      bytes = base64Decode(rawData);
+    } catch (_) {
+      return;
+    }
+    if (bytes.isEmpty) {
+      return;
+    }
+
+    final targetClientId =
+        (message.payload['targetClientId'] as num?)?.toInt() ?? 0xFFFF;
+    final flags = (message.payload['flags'] as num?)?.toInt() ?? 0;
+    final sourceClientId = _isHost
+        ? ((_peers[peerId]?.playerSlot ?? 0) - 1).clamp(0, 0xFFFF).toInt()
+        : 0;
+
+    _gbaNetpacketController.add(
+      GbaNetpacketEvent(
+        sourceClientId: sourceClientId,
+        targetClientId: targetClientId,
+        flags: flags,
+        bytes: bytes,
+      ),
+    );
+
+    if (_isHost) {
+      final forwarded = NetplayMessage.gbaNetpacket(
+        sourceClientId: sourceClientId,
+        targetClientId: targetClientId,
+        flags: flags,
+        bytes: bytes,
+      );
+      _sendGbaNetpacketFromHost(
+        forwarded,
+        targetClientId: targetClientId,
+        excludedPeerId: peerId,
+      );
+    }
+  }
+
+  void _sendGbaNetpacketFromHost(
+    NetplayMessage message, {
+    required int targetClientId,
+    String? excludedPeerId,
+  }) {
+    if (targetClientId == 0) {
+      return;
+    }
+    if (targetClientId == 0xFFFF) {
+      for (final peer in _peers.values) {
+        if (peer.id == excludedPeerId || peer.playerSlot <= 0) {
+          continue;
+        }
+        _sendToPeer(peer.id, message);
+      }
+      return;
+    }
+    final targetSlot = targetClientId + 1;
+    for (final peer in _peers.values) {
+      if (peer.id == excludedPeerId) {
+        continue;
+      }
+      if (peer.playerSlot == targetSlot) {
+        _sendToPeer(peer.id, message);
+        return;
+      }
     }
   }
 
@@ -1589,6 +2808,9 @@ class NetplayService {
     if (_isHost) {
       _syncHostedRoomCounts();
       _broadcastRoomState();
+      if (_internetDirectMode) {
+        unawaited(_refreshInternetDirectOffer());
+      }
     }
     if (!_isHost && peerId == _joinedRoom?.hostIp && !_hostPromotionPending) {
       unawaited(_resetConnections());
@@ -1615,13 +2837,21 @@ class NetplayService {
   }
 
   void _broadcast(NetplayMessage message) {
+    if (_internetDirectMode && _isHost) {
+      if (_isRealtimeNetplayMessage(message)) {
+        _sendInternetDirectRealtime(message);
+      } else {
+        _sendInternetDirect(message);
+      }
+      return;
+    }
     final bytes = NetplayLineCodec.encode(message);
     if (_isHost) {
       for (final peer in _peers.values) {
-        _safeSocketAdd(peer.socket, bytes);
+        _safePeerAdd(peer, bytes);
       }
     } else {
-      _safeSocketAdd(_clientSocket, bytes);
+      _safeSendToHost(message);
     }
   }
 
@@ -1629,18 +2859,36 @@ class NetplayService {
     if (!_isHost) {
       return;
     }
+    if (_internetDirectMode) {
+      if (excludedPeerId != _internetDirectPeerId) {
+        if (_isRealtimeNetplayMessage(message)) {
+          _sendInternetDirectRealtime(message);
+        } else {
+          _sendInternetDirect(message);
+        }
+      }
+      return;
+    }
     final bytes = NetplayLineCodec.encode(message);
     for (final peer in _peers.values) {
       if (peer.id == excludedPeerId) {
         continue;
       }
-      _safeSocketAdd(peer.socket, bytes);
+      _safePeerAdd(peer, bytes);
     }
   }
 
   void _sendToPeer(String peerId, NetplayMessage message) {
+    if (_internetDirectMode && _isHost && peerId == _internetDirectPeerId) {
+      if (_isRealtimeNetplayMessage(message)) {
+        _sendInternetDirectRealtime(message);
+      } else {
+        _sendInternetDirect(message);
+      }
+      return;
+    }
     final bytes = NetplayLineCodec.encode(message);
-    _safeSocketAdd(_peers[peerId]?.socket, bytes);
+    _safePeerAdd(_peers[peerId], bytes);
   }
 
   void _sendToHost(NetplayMessage message) {
@@ -1648,7 +2896,20 @@ class NetplayService {
   }
 
   void _safeSendToHost(NetplayMessage message) {
+    if (_internetDirectMode && !_isHost) {
+      if (_isRealtimeNetplayMessage(message)) {
+        _sendInternetDirectRealtime(message);
+      } else {
+        _sendInternetDirect(message);
+      }
+      return;
+    }
     _safeSocketAdd(_clientSocket, NetplayLineCodec.encode(message));
+  }
+
+  bool _isRealtimeNetplayMessage(NetplayMessage message) {
+    return message.type == NetplayMessageType.frameInput ||
+        message.type == NetplayMessageType.frameBundle;
   }
 
   void _safeSocketAdd(Socket? socket, List<int> bytes) {
@@ -1662,6 +2923,17 @@ class NetplayService {
     } on SocketException {
       // Peer disconnected.
     }
+  }
+
+  void _safePeerAdd(_PeerConnection? peer, List<int> bytes) {
+    if (peer == null) {
+      return;
+    }
+    if (_internetDirectMode && _isHost) {
+      _webrtcHost?.send(bytes);
+      return;
+    }
+    _safeSocketAdd(peer.socket, bytes);
   }
 
   Future<void> _startUdpResponder() async {
@@ -1690,8 +2962,12 @@ class NetplayService {
           try {
             socket.send(payload, datagram.address, datagram.port);
           } on SocketException {
+            // Discovery response failed; the next broadcast will retry.
           } on OSError {
-          } catch (_) {}
+            // Some platforms report unreachable broadcast routes as OSError.
+          } catch (_) {
+            // Keep discovery best-effort.
+          }
         }
       });
     } catch (_) {}
@@ -1733,14 +3009,6 @@ class NetplayService {
       _sendUdpDiscoveryPacket(socket, Uint8List.fromList(payload));
       socket.close();
     } catch (_) {}
-  }
-
-  Future<void> _broadcastRoomClosedAnnouncement() async {
-    final room = _hostedRoom;
-    if (room == null) {
-      return;
-    }
-    await _sendRoomClosedAnnouncement(room);
   }
 
   Future<void> _broadcastUdpAnnouncement() async {
@@ -1903,23 +3171,41 @@ class NetplayService {
 }
 
 class _PeerConnection {
-  _PeerConnection({
-    required this.id,
-    required this.socket,
-    required this.parser,
-    this.playerName = 'Player',
-    this.playerSlot = 0,
-    this.isReady = false,
-    this.latency = 0,
-  });
+  _PeerConnection({required this.id, this.socket, this.parser});
 
   final String id;
-  final Socket socket;
-  final NetplayStreamParser parser;
-  String playerName;
-  int playerSlot;
-  bool isReady;
-  int latency;
+  final Socket? socket;
+  final NetplayStreamParser? parser;
+  String playerName = 'Player';
+  int playerSlot = 0;
+  bool isReady = false;
+  int latency = 0;
+}
+
+class GbaNetpacketEvent {
+  const GbaNetpacketEvent({
+    required this.sourceClientId,
+    required this.targetClientId,
+    required this.flags,
+    required this.bytes,
+  });
+
+  final int sourceClientId;
+  final int targetClientId;
+  final int flags;
+  final Uint8List bytes;
+}
+
+class NetplaySaveStateEvent {
+  const NetplaySaveStateEvent({
+    required this.bytes,
+    required this.purpose,
+    this.frame,
+  });
+
+  final Uint8List bytes;
+  final String purpose;
+  final int? frame;
 }
 
 class RomTransferProgress {

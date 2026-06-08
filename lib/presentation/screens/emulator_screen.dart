@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
+import 'dart:math';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../theme/app_theme.dart';
@@ -22,7 +23,9 @@ import '../../core/network/netplay_emulator_session.dart';
 import '../../core/network/netplay_input_sync.dart';
 import '../../core/network/netplay_lockstep.dart';
 import '../../core/network/netplay_rollback.dart';
+import '../../core/network/netplay_room_state.dart';
 import '../../core/network/netplay_service.dart';
+import '../../core/network/room_info.dart';
 import '../widgets/netplay_player_bar.dart';
 
 class EmulatorScreen extends StatefulWidget {
@@ -56,6 +59,8 @@ class EmulatorScreen extends StatefulWidget {
 }
 
 class _EmulatorScreenState extends State<EmulatorScreen> {
+  static const _gbaAutoRoomPrefix = 'GBAWIFI';
+
   // Emulator service
   final EmulatorService _emulatorService = EmulatorService();
   final AudioOutputService _audioOutputService = AudioOutputService.instance;
@@ -77,6 +82,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   bool _showFullscreenNavigation = false;
   String? _errorMessage;
   final ValueNotifier<double> _fps = ValueNotifier(0);
+  final ValueNotifier<int> _remoteLatency = ValueNotifier(0);
   String _gameName = '';
   String _displayAspectRatio = AppSettingsService.aspectOriginal;
   double _displayBrightness = 1;
@@ -87,6 +93,8 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   // Audio drain: reads C ring buffer → SoLoud
   Timer? _audioDrainTimer;
   Timer? _rumblePollTimer;
+  Timer? _gbaNetpacketPumpTimer;
+  Timer? _gbaAutoHostTimer;
   int _lastRumbleSequence = 0;
   int _lastFrameCount = 0;
   DateTime _lastFpsUpdate = DateTime.now();
@@ -99,18 +107,46 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   StreamSubscription<LockstepStartConfig>? _lockstepStartSub;
   StreamSubscription<void>? _gameplayPeerLeftSub;
   StreamSubscription<int>? _gameSpeedSub;
+  StreamSubscription<GbaNetpacketEvent>? _gbaNetpacketSub;
+  StreamSubscription<RoomInfo>? _gbaAutoRoomFoundSub;
+  StreamSubscription<NetplayRoomState>? _gbaAutoRoomStateSub;
+
+  NetplayService? _gbaAutoNetplayService;
+  NetplayService? _gbaAutoDiscoveryService;
+  NetplayEmulatorSession? _gbaAutoNetplaySession;
+  String? _gbaAutoRomMd5;
+  String? _gbaAutoMatchKey;
+  String _gbaGpspSerialMode = 'auto';
+  int? _gbaNetpacketLocalClientId;
+  final Set<int> _gbaNetpacketConnectedClients = {};
+  bool _gbaAutoStarted = false;
+  bool _gbaAutoConnecting = false;
+  bool _gbaNetpacketStarted = false;
 
   bool get _usesLockstepNetplay =>
       widget.useLockstepNetplay &&
       _isNetplay &&
       (widget.netplaySession?.localPlayerSlot ?? 0) > 0;
 
-  bool get _usesRollbackNetplay =>
-      _usesLockstepNetplay && _coreConfig.system == EmulatorSystem.nes;
+  bool get _usesRollbackNetplay => false;
+
+  bool get _usesGbaWirelessNetplay =>
+      _coreConfig.system == EmulatorSystem.gba &&
+      _effectiveNetplayService != null &&
+      _effectiveNetplaySession != null;
 
   bool get _isNetplayHost => widget.isNetplayHost;
 
   bool get _isNetplay => widget.netplaySession != null;
+
+  NetplayService? get _effectiveNetplayService =>
+      widget.netplayService ?? _gbaAutoNetplayService;
+
+  NetplayEmulatorSession? get _effectiveNetplaySession =>
+      widget.netplaySession ?? _gbaAutoNetplaySession;
+
+  bool get _effectiveIsNetplayHost =>
+      _effectiveNetplayService?.isHost ?? _isNetplayHost;
 
   bool get _canAdjustSpeed =>
       !_isNetplay || (widget.netplayService?.isHost ?? _isNetplayHost);
@@ -136,6 +172,55 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
           '· 所需 BIOS 已放在 system 目录（如 neogeo.zip）';
     }
     return '加载游戏失败';
+  }
+
+  String _detectGpspSerialMode() {
+    final text = '${widget.romPath} $_gameName'.toLowerCase();
+    final compact = text.replaceAll(RegExp(r'[^a-z0-9\u4e00-\u9fff]+'), '');
+
+    final looksLikePokemonGen3 =
+        text.contains('pokemon') ||
+        text.contains('pokémon') ||
+        text.contains('pocket monster') ||
+        text.contains('pocket monsters') ||
+        text.contains('宝可梦') ||
+        text.contains('口袋妖怪') ||
+        text.contains('口袋怪兽') ||
+        compact.contains('firered') ||
+        compact.contains('leafgreen') ||
+        text.contains('fire red') ||
+        text.contains('leaf green') ||
+        text.contains('ruby') ||
+        text.contains('sapphire') ||
+        text.contains('emerald') ||
+        text.contains('红宝石') ||
+        text.contains('蓝宝石') ||
+        text.contains('绿宝石') ||
+        text.contains('火红') ||
+        text.contains('叶绿');
+    if (looksLikePokemonGen3) {
+      return 'mul_poke';
+    }
+
+    if (text.contains('advance wars 2') ||
+        text.contains('black hole rising') ||
+        text.contains('高级战争2')) {
+      return 'mul_aw2';
+    }
+    if (text.contains('advance wars') || text.contains('高级战争')) {
+      return 'mul_aw1';
+    }
+
+    return 'auto';
+  }
+
+  String _gbaAutoSessionKey(String romMd5) {
+    return switch (_gbaGpspSerialMode) {
+      'mul_poke' => 'gba-link:mul_poke:pokemon-gen3',
+      'mul_aw1' => 'gba-link:mul_aw1:advance-wars-1',
+      'mul_aw2' => 'gba-link:mul_aw2:advance-wars-2',
+      _ => 'gba-wireless:$romMd5',
+    };
   }
 
   @override
@@ -202,6 +287,10 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     _audioDrainTimer = null;
     _rumblePollTimer?.cancel();
     _rumblePollTimer = null;
+    _gbaNetpacketPumpTimer?.cancel();
+    _gbaNetpacketPumpTimer = null;
+    _gbaAutoHostTimer?.cancel();
+    _gbaAutoHostTimer = null;
   }
 
   /// Stop timers → emulation → audio (order matters for SoLoud / AAudio).
@@ -218,6 +307,15 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     _gameplayPeerLeftSub = null;
     _gameSpeedSub?.cancel();
     _gameSpeedSub = null;
+    _gbaNetpacketSub?.cancel();
+    _gbaNetpacketSub = null;
+    if (_gbaNetpacketStarted) {
+      emu_loop.stopGbaNetpacketSession();
+      _gbaNetpacketStarted = false;
+      _gbaNetpacketLocalClientId = null;
+      _gbaNetpacketConnectedClients.clear();
+    }
+    unawaited(_disposeGbaAutoNetplay());
     _emulatorService.pause();
 
     if (autoSave && !_isNetplay) {
@@ -234,8 +332,18 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   void dispose() {
     _gameplayPeerLeftSub?.cancel();
     _gameSpeedSub?.cancel();
+    _gbaNetpacketSub?.cancel();
+    _gbaAutoRoomFoundSub?.cancel();
+    _gbaAutoRoomStateSub?.cancel();
     _cancelSessionTimers();
+    if (_gbaNetpacketStarted) {
+      emu_loop.stopGbaNetpacketSession();
+      _gbaNetpacketStarted = false;
+      _gbaNetpacketLocalClientId = null;
+      _gbaNetpacketConnectedClients.clear();
+    }
     _fps.dispose();
+    _remoteLatency.dispose();
     _settings.removeListener(_syncSettings);
     if (!_sessionEnded) {
       _emulatorService.pause();
@@ -249,6 +357,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     if (!_sessionEnded) {
       unawaited(_gameTexture.dispose());
     }
+    unawaited(_disposeGbaAutoNetplay());
     _emulatorService.dispose();
     super.dispose();
   }
@@ -294,6 +403,14 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
         return;
       }
 
+      if (_coreConfig.system == EmulatorSystem.gba) {
+        _gbaGpspSerialMode = _detectGpspSerialMode();
+        emu_loop.setGpspSerialMode(_gbaGpspSerialMode);
+      }
+
+      _inputState.clear();
+      emu_loop.clearInputs();
+
       // Load ROM (core init + load in one locked session).
       final loaded = await _emulatorService.loadAndStart(
         widget.romPath,
@@ -302,6 +419,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
         coreConfig: _coreConfig,
         startLoop: false,
         restoreSaveState: !_isNetplay,
+        runWarmupFrames: !_usesLockstepNetplay,
       );
       if (!loaded) {
         setState(() {
@@ -315,6 +433,9 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       if (resumeSave != null && resumeSave.isNotEmpty) {
         await _emulatorService.loadState(resumeSave);
       }
+
+      _inputState.clear();
+      emu_loop.clearInputs();
 
       if (_isNetplay && (widget.netplaySession?.maxPlayers ?? 0) >= 2) {
         _emulatorService.core?.configureMultiplayerJoypads();
@@ -353,9 +474,11 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       if (_usesLockstepNetplay) {
         emu_loop.setPresentToTexture(true);
         _emulatorService.core?.switchToNativeCallbacks();
-        _presentLockstepWarmupFrame();
         await _startLockstepNetplay(fps: _emulatorService.core?.fps ?? 60.0);
       } else {
+        if (_usesGbaWirelessNetplay) {
+          _startGbaWirelessNetplay();
+        }
         _emulatorService.startGameLoop();
 
         // iOS: AVAudioEngine pulls PCM on a real-time thread (no Dart drain).
@@ -364,7 +487,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
           _audioDrainTimer = Timer.periodic(const Duration(milliseconds: 16), (
             _,
           ) {
-            final samples = emu_loop.drainAudio(maxSamples: 8192);
+            final samples = emu_loop.drainAudio(maxSamples: 16384);
             if (samples != null && samples.isNotEmpty) {
               _audioOutputService.addSamples(samples);
             }
@@ -392,6 +515,9 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
         _isPaused = false;
         _isLoading = false;
       });
+      if (!_isNetplay && _coreConfig.system == EmulatorSystem.gba) {
+        unawaited(_startGbaAutoWirelessNetplay(romFile));
+      }
       if (_isNetplay) {
         _applySpeed(_speed);
       }
@@ -402,6 +528,9 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       _lastFpsUpdate = DateTime.now();
       _fpsTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
         if (mounted) {
+          if (_isNetplay) {
+            _remoteLatency.value = widget.netplayService?.localLatencyMs ?? 0;
+          }
           if (_usesLockstepNetplay) {
             final now = DateTime.now();
             final elapsed = now.difference(_lastFpsUpdate).inMilliseconds;
@@ -423,22 +552,6 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
         _errorMessage = '初始化失败: $e';
         _isLoading = false;
       });
-    }
-  }
-
-  /// [loadAndStart] warmup runs before [GameTexture] exists; push one frame after texture is ready.
-  void _presentLockstepWarmupFrame() {
-    final runPtr = _emulatorService.core?.retroRunPtr;
-    if (runPtr == null) {
-      return;
-    }
-    emu_loop.advanceEmulatorFrame(runPtr);
-    if (_useNativeTexture) {
-      return;
-    }
-    final capture = emu_loop.captureLastFrame();
-    if (capture != null) {
-      _frameBufferManager?.updateFrom(capture.rgba);
     }
   }
 
@@ -467,6 +580,9 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
         serializePtr: core.bindings.retroSerializePtr,
         restorePtr: core.bindings.retroUnserializePtr,
         stateSize: core.serializeStateSize,
+        maxRollbackFrames: netplay.recommendedRollbackFrames(),
+        inputDelayFrames: netplay.recommendedRollbackInputDelayFrames(),
+        sharedMenuFrames: (fps * 30).round(),
         onSendInput: (frame, slot, buttons) {
           netplay.sendFrameInput(frame: frame, slot: slot, buttons: buttons);
         },
@@ -475,6 +591,14 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       netplay.configureRollbackRunner(_rollbackRunner!);
       _rollbackRunner!.setSpeed(_speed);
     } else {
+      final menuGuardFrames = switch (_coreConfig.system) {
+        EmulatorSystem.nes || EmulatorSystem.arcade => (fps * 30).round(),
+        _ => 0,
+      };
+      final shareMenuControls = _coreConfig.system == EmulatorSystem.nes;
+      final edgeFilteredMenuMask = _coreConfig.system == EmulatorSystem.arcade
+          ? kNetplayMenuCoinMask | kNetplayMenuStartMask
+          : kNetplayMenuStartMask;
       _lockstepRunner = NetplayLockstepRunner(
         localSlot: session.localPlayerSlot,
         isHost: widget.isNetplayHost,
@@ -489,6 +613,10 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
               }
             : null,
         onFrameAdvanced: _onLockstepFrame,
+        inputDelayFrames: netplay.recommendedLockstepInputDelayFrames(),
+        sharedMenuFrames: menuGuardFrames,
+        shareMenuControls: shareMenuControls,
+        edgeFilteredMenuMask: edgeFilteredMenuMask,
       );
       netplay.configureLockstepRunner(_lockstepRunner!);
       _lockstepRunner!.setSpeed(_speed);
@@ -506,37 +634,410 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       }
     });
 
-    await _syncInitialNetplayState();
+    final synced = await _syncInitialNetplayState();
+    if (!synced) {
+      return;
+    }
     netplay.signalLockstepReady(fps: fps, requiredSlots: initialSlots);
+    if (!widget.isNetplayHost) {
+      // Wait for LOCKSTEP_START from host (may arrive after signalLockstepReady).
+      for (var attempt = 0; attempt < 20; attempt++) {
+        final config = netplay.lastLockstepStartConfig;
+        if (config != null) {
+          _lockstepRunner?.setRequiredSlots(config.requiredSlots.toSet());
+          _rollbackRunner?.setRequiredSlots(config.requiredSlots.toSet());
+          _lockstepRunner?.start(
+            fps: config.fps,
+            startFrame: config.startFrame,
+          );
+          _rollbackRunner?.start(
+            fps: config.fps,
+            startFrame: config.startFrame,
+          );
+          netplay.sendLockstepStartAck();
+          return;
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+      debugPrint('[Netplay] guest never received LOCKSTEP_START');
+    }
   }
 
-  Future<void> _syncInitialNetplayState() async {
+  Future<void> _startGbaAutoWirelessNetplay(File romFile) async {
+    if (_gbaAutoStarted ||
+        _sessionEnded ||
+        _isNetplay ||
+        !_settings.networkEnabled) {
+      return;
+    }
+    _gbaAutoStarted = true;
+
+    try {
+      final digest = await md5.bind(romFile.openRead()).first;
+      if (!mounted || _sessionEnded) {
+        return;
+      }
+      _gbaAutoRomMd5 = digest.toString();
+      _gbaAutoMatchKey = _gbaAutoSessionKey(_gbaAutoRomMd5!);
+
+      final discovery = NetplayService();
+      _gbaAutoDiscoveryService = discovery;
+      _gbaAutoRoomFoundSub = discovery.onRoomFound.listen((room) {
+        unawaited(_handleGbaAutoRoomFound(room));
+      });
+      discovery.startDiscovery();
+
+      final jitterMs = 900 + Random().nextInt(900);
+      _gbaAutoHostTimer?.cancel();
+      _gbaAutoHostTimer = Timer(Duration(milliseconds: jitterMs), () {
+        unawaited(_ensureGbaAutoHost());
+      });
+    } catch (_) {
+      _gbaAutoStarted = false;
+    }
+  }
+
+  bool _isMatchingGbaAutoRoom(RoomInfo room) {
+    final matchKey = _gbaAutoMatchKey;
+    if (matchKey == null || room.closed || room.gameMd5 != matchKey) {
+      return false;
+    }
+    if (!room.roomId.startsWith(_gbaAutoRoomPrefix)) {
+      return false;
+    }
+    return netplayExtensionFromPath(room.gameCode) == '.gba';
+  }
+
+  bool _isOwnGbaAutoRoom(RoomInfo room) {
+    final hosted = _gbaAutoNetplayService?.hostedRoom;
+    return hosted != null &&
+        hosted.roomId == room.roomId &&
+        hosted.hostIp == room.hostIp &&
+        hosted.port == room.port;
+  }
+
+  bool _shouldPreferRemoteGbaRoom(RoomInfo remote) {
+    final hosted = _gbaAutoNetplayService?.hostedRoom;
+    if (hosted == null) {
+      return true;
+    }
+    if ((hosted.currentPlayers) > 1) {
+      return false;
+    }
+    final localKey = '${hosted.roomId}|${hosted.hostIp}';
+    final remoteKey = '${remote.roomId}|${remote.hostIp}';
+    return remoteKey.compareTo(localKey) < 0;
+  }
+
+  void _watchGbaAutoRoomState(NetplayService service) {
+    _gbaAutoRoomStateSub?.cancel();
+    _gbaAutoRoomStateSub = service.onRoomStateChanged.listen((_) {
+      if (!mounted || service.activeRoom == null) {
+        return;
+      }
+      setState(() {
+        _gbaAutoNetplaySession = NetplayEmulatorSession.fromNetplay(
+          netplay: service,
+          isHost: service.isHost,
+        );
+      });
+      _syncGbaNetpacketConnections();
+    });
+  }
+
+  void _syncGbaNetpacketConnections() {
+    final session = _effectiveNetplaySession;
+    final localClientId = _gbaNetpacketLocalClientId;
+    if (!_gbaNetpacketStarted || session == null || localClientId == null) {
+      return;
+    }
+
+    final wanted = <int>{};
+    for (var clientId = 0; clientId < session.maxPlayers; clientId++) {
+      if (clientId != localClientId) {
+        wanted.add(clientId);
+      }
+    }
+
+    for (final clientId in wanted) {
+      if (_gbaNetpacketConnectedClients.add(clientId)) {
+        emu_loop.connectGbaNetpacketClient(clientId);
+      }
+    }
+
+    final stale = _gbaNetpacketConnectedClients.difference(wanted);
+    for (final clientId in stale) {
+      emu_loop.disconnectGbaNetpacketClient(clientId);
+      _gbaNetpacketConnectedClients.remove(clientId);
+    }
+  }
+
+  Future<void> _handleGbaAutoRoomFound(RoomInfo room) async {
+    if (!_isMatchingGbaAutoRoom(room) ||
+        _isOwnGbaAutoRoom(room) ||
+        _gbaAutoConnecting ||
+        _sessionEnded) {
+      return;
+    }
+
+    final activeService = _gbaAutoNetplayService;
+    if (activeService?.isHost == true && !_shouldPreferRemoteGbaRoom(room)) {
+      return;
+    }
+    if (activeService != null && !activeService.isHost) {
+      return;
+    }
+
+    _gbaAutoConnecting = true;
+    _gbaAutoHostTimer?.cancel();
+    _gbaAutoHostTimer = null;
+
+    if (activeService?.isHost == true) {
+      activeService?.closeRoom();
+      await activeService?.dispose();
+      if (_gbaAutoNetplayService == activeService) {
+        _gbaAutoNetplayService = null;
+        _gbaAutoNetplaySession = null;
+      }
+      if (_gbaNetpacketStarted) {
+        emu_loop.stopGbaNetpacketSession();
+        _gbaNetpacketStarted = false;
+        _gbaNetpacketLocalClientId = null;
+        _gbaNetpacketConnectedClients.clear();
+      }
+    }
+
+    final service = NetplayService();
+    _gbaAutoNetplayService = service;
+    _watchGbaAutoRoomState(service);
+
+    try {
+      final joined = await service.joinRoom(room, playerName: 'Player 2');
+      if (!joined) {
+        await service.dispose();
+        if (_gbaAutoNetplayService == service) {
+          _gbaAutoNetplayService = null;
+        }
+        _gbaAutoConnecting = false;
+        unawaited(_ensureGbaAutoHost());
+        return;
+      }
+
+      if (service.localPlayerSlot <= 0) {
+        await service.onPlayerSlotAssigned
+            .firstWhere((slot) => slot > 0)
+            .timeout(const Duration(seconds: 5));
+      }
+      if (!mounted || _sessionEnded || service.localPlayerSlot <= 0) {
+        return;
+      }
+      setState(() {
+        _gbaAutoNetplaySession = NetplayEmulatorSession.fromNetplay(
+          netplay: service,
+          isHost: false,
+        );
+      });
+      _startGbaWirelessNetplay();
+    } catch (_) {
+      await service.dispose();
+      if (_gbaAutoNetplayService == service) {
+        _gbaAutoNetplayService = null;
+        _gbaAutoNetplaySession = null;
+      }
+      unawaited(_ensureGbaAutoHost());
+    } finally {
+      _gbaAutoConnecting = false;
+    }
+  }
+
+  Future<void> _ensureGbaAutoHost() async {
+    if (!mounted ||
+        _sessionEnded ||
+        _gbaAutoConnecting ||
+        _gbaAutoNetplayService != null ||
+        _gbaAutoMatchKey == null) {
+      return;
+    }
+
+    final service = NetplayService();
+    _gbaAutoNetplayService = service;
+    _watchGbaAutoRoomState(service);
+
+    try {
+      final hostIp = await service.getLocalIp() ?? '0.0.0.0';
+      final roomId =
+          '$_gbaAutoRoomPrefix-${DateTime.now().microsecondsSinceEpoch.toRadixString(36).toUpperCase()}';
+      final roomTemplate = RoomInfo(
+        roomId: roomId,
+        roomName: _gameName,
+        hostIp: hostIp,
+        port: service.port,
+        gameCode: widget.romPath.split(Platform.pathSeparator).last,
+        gameTitle: _gameName,
+        gameMd5: _gbaAutoMatchKey!,
+        currentPlayers: 1,
+        maxPlayers: 2,
+      );
+      final hosted = await service.createRoom(
+        roomTemplate: roomTemplate,
+        playerName: 'Player 1',
+      );
+      if (!hosted || !mounted || _sessionEnded) {
+        await service.dispose();
+        if (_gbaAutoNetplayService == service) {
+          _gbaAutoNetplayService = null;
+        }
+        return;
+      }
+      setState(() {
+        _gbaAutoNetplaySession = NetplayEmulatorSession.fromNetplay(
+          netplay: service,
+          isHost: true,
+        );
+      });
+      _startGbaWirelessNetplay();
+    } catch (_) {
+      await service.dispose();
+      if (_gbaAutoNetplayService == service) {
+        _gbaAutoNetplayService = null;
+        _gbaAutoNetplaySession = null;
+      }
+    }
+  }
+
+  Future<void> _disposeGbaAutoNetplay() async {
+    _gbaAutoHostTimer?.cancel();
+    _gbaAutoHostTimer = null;
+    await _gbaAutoRoomFoundSub?.cancel();
+    _gbaAutoRoomFoundSub = null;
+    await _gbaAutoRoomStateSub?.cancel();
+    _gbaAutoRoomStateSub = null;
+
+    final discovery = _gbaAutoDiscoveryService;
+    _gbaAutoDiscoveryService = null;
+    if (discovery != null) {
+      await discovery.dispose();
+    }
+
+    final service = _gbaAutoNetplayService;
+    _gbaAutoNetplayService = null;
+    _gbaAutoNetplaySession = null;
+    if (service != null) {
+      await service.dispose();
+    }
+  }
+
+  void _startGbaWirelessNetplay() {
+    final netplay = _effectiveNetplayService;
+    final session = _effectiveNetplaySession;
+    if (netplay == null || session == null) {
+      return;
+    }
+    if (_gbaNetpacketStarted) {
+      return;
+    }
+    if (!emu_loop.isGbaNetpacketAvailable()) {
+      if (_isNetplay) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('当前 GBA 核心未提供 wireless 联机接口'),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+      return;
+    }
+
+    final localClientId = _effectiveIsNetplayHost
+        ? 0
+        : (session.localPlayerSlot - 1).clamp(1, 0xFFFF).toInt();
+    emu_loop.startGbaNetpacketSession(localClientId);
+    _gbaNetpacketStarted = true;
+    _gbaNetpacketLocalClientId = localClientId;
+    _gbaNetpacketConnectedClients.clear();
+    _syncGbaNetpacketConnections();
+
+    _gbaNetpacketSub?.cancel();
+    _gbaNetpacketSub = netplay.onGbaNetpacket.listen((packet) {
+      final target = packet.targetClientId;
+      final shouldReceive =
+          target == emu_loop.gbaNetpacketBroadcast || target == localClientId;
+      if (!shouldReceive) {
+        return;
+      }
+      emu_loop.pushGbaNetpacket(
+        packet.bytes,
+        sourceClientId: packet.sourceClientId,
+      );
+    });
+
+    _gbaNetpacketPumpTimer?.cancel();
+    _gbaNetpacketPumpTimer = Timer.periodic(const Duration(milliseconds: 4), (
+      _,
+    ) {
+      for (var i = 0; i < 64; i++) {
+        final packet = emu_loop.readGbaNetpacket();
+        if (packet == null) {
+          return;
+        }
+        netplay.sendGbaNetpacket(
+          sourceClientId: localClientId,
+          targetClientId: packet.targetClientId,
+          flags: packet.flags,
+          bytes: packet.bytes,
+        );
+      }
+    });
+  }
+
+  Future<bool> _syncInitialNetplayState() async {
     final netplay = widget.netplayService;
     if (netplay == null || !_usesLockstepNetplay) {
-      return;
+      return true;
     }
 
     if (widget.isNetplayHost) {
       final state = await _emulatorService.saveState(persistToDisk: false);
       if (state != null && state.isNotEmpty) {
         await netplay.sendSaveStateToPlayablePeers(state);
+        if (netplay.isInternetDirectMode) {
+          await Future<void>.delayed(const Duration(milliseconds: 120));
+        }
       }
-      return;
+      return true;
     }
 
     var state = netplay.takeResumeSaveState();
     if (state == null || state.isEmpty) {
       try {
-        state = await netplay.onSaveStateReceived.first.timeout(
-          const Duration(seconds: 3),
+        final timeout = netplay.isInternetDirectMode
+            ? const Duration(seconds: 15)
+            : const Duration(seconds: 3);
+        debugPrint(
+          '[Netplay] guest waiting initial save state timeout=$timeout',
         );
+        state = await netplay.onSaveStateReceived.first.timeout(timeout);
       } on Object {
         state = null;
       }
     }
+    if ((state == null || state.isEmpty) && netplay.isInternetDirectMode) {
+      debugPrint('[Netplay] guest initial save state missing');
+      if (mounted) {
+        setState(() {
+          _errorMessage = '互联网联机同步状态超时，请返回房间后重试';
+          _isLoading = false;
+        });
+      }
+      return false;
+    }
     if (state != null && state.isNotEmpty) {
+      debugPrint(
+        '[Netplay] guest loading initial save state bytes=${state.length}',
+      );
       await _emulatorService.loadState(state);
     }
+    return true;
   }
 
   void _onLockstepFrame() {
@@ -570,6 +1071,9 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     }
     if (_usesLockstepNetplay && _lockstepRunner != null) {
       _lockstepRunner!.updateLocalButtons(inputStateToMask(state));
+      return;
+    }
+    if (_usesLockstepNetplay) {
       return;
     }
     _inputState
@@ -1000,6 +1504,10 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       child: ValueListenableBuilder<double>(
         valueListenable: _fps,
         builder: (context, fps, _) {
+          final parts = <String>['${fps.toStringAsFixed(0)} FPS'];
+          if (_speed > 1) parts.add('${_speed}x');
+          final latency = _remoteLatency.value;
+          if (_isNetplay && latency > 0) parts.add('${latency}ms');
           return Container(
             padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
             decoration: BoxDecoration(
@@ -1007,7 +1515,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
               borderRadius: BorderRadius.circular(4),
             ),
             child: Text(
-              '${fps.toStringAsFixed(0)} FPS${_speed > 1 ? ' · ${_speed}x' : ''}',
+              parts.join(' · '),
               style: TextStyle(
                 fontSize: 10,
                 fontFamily: 'monospace',

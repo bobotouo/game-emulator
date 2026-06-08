@@ -2,12 +2,13 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
-
+import '../../core/network/internet_direct_code.dart';
 import '../../core/network/lan_service.dart';
 import '../../core/settings/app_settings_service.dart';
 import '../../features/game_library/game_library_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/immersive_scroll_page.dart';
+import 'internet_direct_scan_screen.dart';
 import 'room_screen.dart';
 
 class MultiplayerLobbyScreen extends StatefulWidget {
@@ -197,6 +198,12 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
       return;
     }
 
+    if (!isHostAuthoritativeNetplayExtension(
+      netplayExtensionFromPath(room.gameCode),
+    )) {
+      return;
+    }
+
     final key = _roomKey(room);
 
     if (room.closed) {
@@ -205,9 +212,7 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
     }
 
     setState(() {
-      _rooms.removeWhere(
-        (r) => r.roomId == room.roomId && _roomKey(r) != key,
-      );
+      _rooms.removeWhere((r) => r.roomId == room.roomId && _roomKey(r) != key);
       _roomLastSeen[key] = DateTime.now();
       final index = _rooms.indexWhere((r) => _roomKey(r) == key);
       if (index >= 0) {
@@ -290,10 +295,6 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
       _showNetworkDisabledMessage();
       return;
     }
-    if (!(_network?.canUseLanLobby ?? false)) {
-      _showWideAreaMessage();
-      return;
-    }
 
     if (_gameLibrary.games.isEmpty) {
       await _gameLibrary.init(refreshThumbnails: false);
@@ -320,7 +321,69 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
     }
   }
 
-  Future<void> _joinRoom(RoomInfo room) async {
+  Future<void> _scanInternetDirectRoom() async {
+    if (!AppSettingsService.instance.networkEnabled) {
+      _showNetworkDisabledMessage();
+      return;
+    }
+
+    final raw = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(builder: (context) => const InternetDirectScanScreen()),
+    );
+    if (!mounted || raw == null) {
+      return;
+    }
+
+    final code = InternetDirectCode.tryDecode(raw);
+    if (code == null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('无效的直连二维码（请使用最新版房主二维码）')));
+      return;
+    }
+
+    final extension = netplayExtensionFromPath(code.gameCode);
+    if (!isHostAuthoritativeNetplayExtension(extension)) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('互联网直连暂仅支持 FC/NES 和街机游戏')));
+      return;
+    }
+
+    final success = await _netplay.joinInternetDirectRoom(
+      code,
+      playerName: 'Player 2',
+    );
+    if (!mounted) {
+      return;
+    }
+    if (!success) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('互联网直连失败')));
+      return;
+    }
+
+    final room = _netplay.joinedRoom ?? code.toRoomInfo();
+    final hasRom = await _gameLibrary.hasLocalRom(room.gameMd5);
+    if (!mounted) return;
+
+    await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(
+        builder: (context) => RoomScreen(
+          netplayService: _netplay,
+          gameLibrary: _gameLibrary,
+          isHost: false,
+          roomInfo: room,
+          hasLocalRom: hasRom,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _joinRoom(RoomInfo room, {bool internetDirect = false}) async {
     if (_joiningRoom) {
       return;
     }
@@ -331,7 +394,7 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
         _showNetworkDisabledMessage();
         return;
       }
-      if (!(_network?.canUseLanLobby ?? false)) {
+      if (!internetDirect && !(_network?.canUseLanLobby ?? false)) {
         _showWideAreaMessage();
         return;
       }
@@ -351,16 +414,15 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
         return;
       }
 
-      final success = await _netplay.joinRoom(
-        room,
-        playerName: 'Player 2',
-      );
+      final success = await _netplay.joinRoom(room, playerName: 'Player 2');
 
       if (!success) {
         if (!mounted) {
           return;
         }
-        setState(() => _removeRoomsById(room.roomId));
+        if (!internetDirect) {
+          setState(() => _removeRoomsById(room.roomId));
+        }
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(const SnackBar(content: Text('加入房间失败')));
@@ -447,13 +509,20 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
       title: '联机大厅',
       actions: [
         IconButton(
+          icon: const Icon(Icons.qr_code_scanner),
+          tooltip: '扫码加入',
+          onPressed: _scanInternetDirectRoom,
+        ),
+        IconButton(
           icon: const Icon(Icons.refresh),
           tooltip: '重新搜索',
           onPressed: _manualRefresh,
         ),
       ],
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: _canUseLanLobby ? _openCreateRoom : _showWideAreaMessage,
+        onPressed: AppSettingsService.instance.networkEnabled
+            ? _openCreateRoom
+            : _showNetworkDisabledMessage,
         backgroundColor: AppColors.secondary,
         foregroundColor: AppColors.onSecondary,
         icon: const Icon(Icons.add),
@@ -647,7 +716,9 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
                               Text(
                                 room.gameTitle,
                                 style: Theme.of(context).textTheme.bodySmall
-                                    ?.copyWith(color: AppColors.onSurfaceVariant),
+                                    ?.copyWith(
+                                      color: AppColors.onSurfaceVariant,
+                                    ),
                                 maxLines: 2,
                                 overflow: TextOverflow.ellipsis,
                               ),
@@ -793,11 +864,7 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
     }
   }
 
-  Widget _buildInfoChip(
-    IconData icon,
-    String label, {
-    Color? labelColor,
-  }) {
+  Widget _buildInfoChip(IconData icon, String label, {Color? labelColor}) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(

@@ -125,6 +125,20 @@ bool emulator_loop_netplay_load_frame(uint64_t frame);
 uint64_t emulator_loop_netplay_sim_frame(void);
 void emulator_loop_netplay_set_sim_frame(uint64_t frame);
 
+// ── gpSP RFU / wireless netpacket bridge ─────────────────────────────────
+void emulator_loop_set_gpsp_serial_mode(const char* mode);
+bool emulator_loop_netpacket_available(void);
+void emulator_loop_netpacket_start(uint16_t local_client_id);
+void emulator_loop_netpacket_stop(void);
+bool emulator_loop_netpacket_connect(uint16_t client_id);
+void emulator_loop_netpacket_disconnect(uint16_t client_id);
+int32_t emulator_loop_netpacket_read(uint16_t* target_client_id_out,
+                                     int32_t* flags_out,
+                                     uint8_t* out,
+                                     int32_t max_bytes);
+void emulator_loop_netpacket_push(const uint8_t* data, int32_t size,
+                                  uint16_t source_client_id);
+
 #ifdef __cplusplus
 }
 #endif

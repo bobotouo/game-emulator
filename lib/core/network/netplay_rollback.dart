@@ -8,7 +8,7 @@ import '../libretro/libretro_bindings.dart';
 import 'netplay_input_sync.dart';
 
 /// Default GGPO rollback window.
-const int kGgpoRollbackFrames = 30;
+const int kGgpoRollbackFrames = 8;
 
 /// Small local input delay gives remote inputs time to arrive before prediction.
 const int kGgpoInputDelayFrames = 2;
@@ -44,6 +44,7 @@ class NetplayRollbackRunner {
     this.onFrameAdvanced,
     this.maxRollbackFrames = kGgpoRollbackFrames,
     this.inputDelayFrames = kGgpoInputDelayFrames,
+    this.sharedMenuFrames = 0,
   }) : _requiredSlots = Set<int>.from(requiredSlots);
 
   final int localSlot;
@@ -55,9 +56,11 @@ class NetplayRollbackRunner {
   final void Function()? onFrameAdvanced;
   final int maxRollbackFrames;
   final int inputDelayFrames;
+  final int sharedMenuFrames;
 
   bool _running = false;
   bool _emulating = false;
+  bool _ready = false;
   int? _pendingRollbackFrom;
   Timer? _tickTimer;
   double _fps = 60.0;
@@ -66,7 +69,9 @@ class NetplayRollbackRunner {
 
   int _localButtonMask = 0;
   int _lastLocalMask = 0;
+  int? _sharedMenuStopFrame;
   DateTime? _lastRollbackAt;
+  DateTime? _lastStallResendAt;
 
   final Map<int, Map<int, int>> _usedInputsByFrame = {};
   final Map<int, Map<int, int>> _confirmedInputsByFrame = {};
@@ -96,11 +101,14 @@ class NetplayRollbackRunner {
     _fps = fps > 0 ? fps : 60.0;
     _running = true;
     _emulating = false;
+    _ready = false;
     _pendingRollbackFrom = null;
     _lastRollbackAt = null;
-    _lastLocalMask = _localButtonMask;
+    _lastStallResendAt = null;
+    _sharedMenuStopFrame = null;
+    _localButtonMask = 0;
+    _lastLocalMask = 0;
     _usedInputsByFrame.clear();
-    _confirmedInputsByFrame.clear();
     _localInputsByFrame.clear();
     _lastRemoteMask.clear();
     for (final slot in _requiredSlots) {
@@ -117,6 +125,7 @@ class NetplayRollbackRunner {
 
     emu_loop.stopNativeLoop();
     emu_loop.waitUntilEmulatorStopped();
+    emu_loop.clearInputs();
 
     emu_loop.endNetplaySnapshots();
     emu_loop.beginNetplaySnapshots(
@@ -125,9 +134,7 @@ class NetplayRollbackRunner {
       stateSize: stateSize,
       maxFrames: maxRollbackFrames,
     );
-    if (startFrame > 0) {
-      emu_loop.netplaySetSimFrame(startFrame);
-    }
+    emu_loop.netplaySetSimFrame(startFrame);
 
     _scheduleTick();
   }
@@ -135,11 +142,15 @@ class NetplayRollbackRunner {
   void stop() {
     _running = false;
     _emulating = false;
+    _ready = false;
     _pendingRollbackFrom = null;
+    _localButtonMask = 0;
+    _lastLocalMask = 0;
     _tickTimer?.cancel();
     _tickTimer = null;
     emu_loop.stopNativeLoop();
     emu_loop.waitUntilEmulatorStopped();
+    emu_loop.clearInputs();
     emu_loop.endNetplaySnapshots();
     _usedInputsByFrame.clear();
     _confirmedInputsByFrame.clear();
@@ -149,18 +160,24 @@ class NetplayRollbackRunner {
 
   void updateLocalButtons(int mask) {
     _localButtonMask = mask & 0xFFFF;
-    if (_running && !_emulating) {
-      _scheduleLocalInput(emu_loop.netplaySimFrame() + inputDelayFrames);
+    if (_running && !_emulating && _ready) {
+      final frame = emu_loop.netplaySimFrame();
+      _localInputsByFrame[frame] = _localButtonMask;
+      _scheduleLocalInput(frame + inputDelayFrames);
     }
   }
 
   void receiveRemoteInput(int frame, int slot, int buttons) {
-    if (!_running || slot == localSlot || !_requiredSlots.contains(slot)) {
+    if (slot == localSlot || !_requiredSlots.contains(slot)) {
       return;
     }
     buttons &= 0xFFFF;
     _lastRemoteMask[slot] = buttons;
     _setConfirmed(frame, slot, buttons);
+
+    if (!_running) {
+      return;
+    }
 
     final sim = emu_loop.netplaySimFrame();
     if (frame >= sim) {
@@ -173,6 +190,10 @@ class NetplayRollbackRunner {
     }
 
     if (sim - frame > maxRollbackFrames) {
+      debugPrint(
+        'NetplayRollbackRunner: late input dropped frame=$frame sim=$sim '
+        'slot=$slot window=$maxRollbackFrames',
+      );
       return;
     }
 
@@ -225,12 +246,17 @@ class NetplayRollbackRunner {
 
   void _advanceOneFrame() {
     _emulating = true;
+    _ready = true;
     try {
       final f = emu_loop.netplaySimFrame();
       _scheduleLocalInput(f + inputDelayFrames);
+      if (_shouldWaitForRemoteInput(f)) {
+        _resendStalledInputs(f);
+        return;
+      }
       final inputs = _buildInputsForFrame(f, predictRemote: true);
       _recordUsedInputs(f, inputs);
-      _applyInputs(inputs);
+      _applyInputs(inputs, frame: f, updateSharedMenuState: true);
       emu_loop.advanceEmulatorFrame(retroRunPtr);
       _pruneHistory();
       onFrameAdvanced?.call();
@@ -264,7 +290,7 @@ class NetplayRollbackRunner {
       for (var f = fromFrame; f < target; f++) {
         final inputs = _buildInputsForFrame(f, predictRemote: false);
         _recordUsedInputs(f, inputs);
-        _applyInputs(inputs);
+        _applyInputs(inputs, frame: f, updateSharedMenuState: false);
         emu_loop.advanceEmulatorFrame(retroRunPtr);
       }
       _pruneHistory();
@@ -286,22 +312,115 @@ class NetplayRollbackRunner {
         continue;
       }
 
-      final confirmed = _confirmedMask(frame, slot);
-      if (confirmed != null) {
-        inputs[slot] = confirmed;
-      } else if (predictRemote) {
-        inputs[slot] = _lastRemoteMask[slot] ?? 0;
-      } else {
-        inputs[slot] = _usedMask(frame, slot) ?? _lastRemoteMask[slot] ?? 0;
-      }
+      inputs[slot] = _remoteMaskForFrame(
+        frame,
+        slot,
+        predictRemote: predictRemote,
+      );
     }
     return inputs;
   }
 
-  void _applyInputs(Map<int, int> inputs) {
+  int _remoteMaskForFrame(int frame, int slot, {required bool predictRemote}) {
+    final confirmed = _confirmedMask(frame, slot);
+    if (confirmed != null) {
+      return confirmed;
+    }
+    if (predictRemote) {
+      return _lastRemoteMask[slot] ?? 0;
+    }
+    return _usedMask(frame, slot) ?? _lastRemoteMask[slot] ?? 0;
+  }
+
+  bool _shouldWaitForRemoteInput(int frame) {
+    final waitThreshold = maxRollbackFrames + inputDelayFrames;
+    for (final slot in _requiredSlots) {
+      if (slot == localSlot) {
+        continue;
+      }
+      if (_confirmedMask(frame, slot) == null) {
+        final newest = _latestConfirmedFrameForSlot(slot);
+        if (newest == null || frame - newest > waitThreshold) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  int? _latestConfirmedFrameForSlot(int slot) {
+    int? latest;
+    for (final entry in _confirmedInputsByFrame.entries) {
+      if (entry.value.containsKey(slot) &&
+          (latest == null || entry.key > latest)) {
+        latest = entry.key;
+      }
+    }
+    return latest;
+  }
+
+  void _resendStalledInputs(int frame) {
+    final now = DateTime.now();
+    final last = _lastStallResendAt;
+    if (last != null &&
+        now.difference(last) < const Duration(milliseconds: 100)) {
+      return;
+    }
+    _lastStallResendAt = now;
+    for (var f = frame; f < frame + inputDelayFrames + 2; f++) {
+      _scheduleLocalInput(f);
+    }
+  }
+
+  void _applyInputs(
+    Map<int, int> inputs, {
+    required int frame,
+    required bool updateSharedMenuState,
+  }) {
+    final applied = Map<int, int>.from(inputs);
+    if (_shouldShareMenuControls(frame)) {
+      var menuMask = 0;
+      for (final mask in inputs.values) {
+        menuMask |= mask & kNetplayMenuControlMask;
+      }
+      if (menuMask != 0) {
+        applied[1] = (applied[1] ?? 0) | menuMask;
+      }
+      if (updateSharedMenuState &&
+          _sharedMenuStopFrame == null &&
+          ((inputs[1] ?? 0) & kNetplayMenuStartMask) != 0) {
+        _sharedMenuStopFrame = frame + (_fps / 2).round().clamp(1, 60);
+      }
+    }
+    _applyMenuStartEdges(applied, frame);
+
     emu_loop.clearInputs();
-    for (final entry in inputs.entries) {
+    for (final entry in applied.entries) {
       applyNetplayInputMask(netplaySlotToLibretroPort(entry.key), entry.value);
+    }
+  }
+
+  bool _shouldShareMenuControls(int frame) {
+    if (sharedMenuFrames <= 0 || frame > sharedMenuFrames) {
+      return false;
+    }
+    final stopFrame = _sharedMenuStopFrame;
+    return stopFrame == null || frame <= stopFrame;
+  }
+
+  void _applyMenuStartEdges(Map<int, int> inputs, int frame) {
+    if (sharedMenuFrames <= 0 || frame > sharedMenuFrames) {
+      return;
+    }
+    for (final entry in List<MapEntry<int, int>>.from(inputs.entries)) {
+      final mask = entry.value;
+      if ((mask & kNetplayMenuStartMask) == 0) {
+        continue;
+      }
+      final previous = _usedInputsByFrame[frame - 1]?[entry.key] ?? 0;
+      if ((previous & kNetplayMenuStartMask) != 0) {
+        inputs[entry.key] = mask & ~kNetplayMenuStartMask;
+      }
     }
   }
 

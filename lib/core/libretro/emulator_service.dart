@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import '../storage/storage_paths_service.dart';
 import '../audio/audio_debug.dart';
@@ -79,6 +78,7 @@ class EmulatorService {
     EmulatorCoreConfig? coreConfig,
     bool startLoop = true,
     bool restoreSaveState = true,
+    bool runWarmupFrames = true,
   }) async {
     return LibretroSessionLock.runExclusive(() async {
       if (corePath == null) {
@@ -105,7 +105,7 @@ class EmulatorService {
         final targetHz = deviceHz.round().clamp(8000, 192000);
         emu_loop.setTargetSampleRate(targetHz);
         logAudio(
-          'before loadGame: device=$deviceHz Hz mGBA_target=$targetHz (core resamples)',
+          'before loadGame: device=$deviceHz Hz core_target=$targetHz (core resamples)',
         );
       }
       final success = _core!.loadGame(romPath, config: config);
@@ -132,9 +132,11 @@ class EmulatorService {
             : 'No save state restored for $romPath (gameId=$gameId)',
       );
 
-      final runPtr = _core!.retroRunPtr;
-      final warmupBurst = _warmupBurstFramesFor(config.system, restored);
-      emu_loop.runSyncFrames(runPtr, warmupBurst);
+      if (runWarmupFrames) {
+        final runPtr = _core!.retroRunPtr;
+        final warmupBurst = _warmupBurstFramesFor(config.system, restored);
+        emu_loop.runSyncFrames(runPtr, warmupBurst);
+      }
 
       if (startLoop) {
         startGameLoop();
@@ -170,7 +172,7 @@ class EmulatorService {
       final targetHz = deviceHz.round().clamp(8000, 192000);
       emu_loop.setTargetSampleRate(targetHz);
       logAudio(
-        'before loadGameFromBytes: device=$deviceHz Hz mGBA_target=$targetHz',
+        'before loadGameFromBytes: device=$deviceHz Hz core_target=$targetHz',
       );
     }
     final success = _core!.loadGameFromBytes(romBytes, path);

@@ -1,6 +1,6 @@
 # Game Emulator
 
-基于 Flutter 与 libretro 核心的多系统模拟器，当前支持 **GBA / GB / GBC**（[mGBA](https://mgba.io/)）、**FC / NES**（[FCEUmm](https://github.com/libretro/libretro-fceumm)）与 **街机**（[FBNeo](https://github.com/finalburnneo/FBNeo) Libretro），具备本地游戏库、自动存档、变速游玩与局域网联机。
+基于 Flutter 与 libretro 核心的多系统模拟器，当前支持 **GBA**（[gpSP](https://github.com/libretro/gpsp)）、**FC / NES**（[FCEUmm](https://github.com/libretro/libretro-fceumm)）与 **街机**（[FBNeo](https://github.com/finalburnneo/FBNeo) Libretro），具备本地游戏库、自动存档、变速游玩与局域网联机。
 
 ---
 
@@ -25,17 +25,17 @@
 
 | 模块 | 说明 |
 |------|------|
-| **模拟器核心** | `.gba`/`.gb`/`.gbc` → mGBA；`.nes`/`.fds` 等 → FCEUmm；`.zip`/`.7z` → FBNeo |
+| **模拟器核心** | `.gba` → gpSP；`.nes`/`.fds` 等 → FCEUmm；`.zip`/`.7z` → FBNeo |
 | **虚拟手柄** | 触控按键映射，支持触觉反馈与 libretro 震动回调 |
 | **自动存档** | 退出自动保存、进入自动读取；Android 公共目录 / iOS Documents |
 | **游戏库** | ROM 导入、缩略图生成、搜索分类|
-| **变速齿轮** | 1x ~ 5x 快进，音画同步加速 |
+| **变速齿轮** | 1x ~ 3x 快进，音画同步加速 |
 
 ### 进行中 / 部分完成
 
 | 模块 | 说明 |
 |------|------|
-| **局域网联机** | FC/NES 与街机采用房主仲裁锁步 + 1 帧固定输入延迟 |
+| **局域网联机** | FC/NES 与街机采用房主仲裁锁步；GBA 使用 gpSP Wi-Fi/RFU packet 通道 |
 | **性能优化** | 持续调优渲染与音频缓冲，降低发热 |
 
 ### 尚未实现
@@ -44,12 +44,11 @@
 - 金手指（Cheats）
 - 手动多档位存档槽
 - 画面滤镜（扫描线、CRT、像素平滑等 Shader 扩展）
-- GBA 掌机的联机对战
 ---
 
 ## 未来计划
 
-1. **联机对战** — 完善 GBA 联机
+1. **联机对战** — 继续调优 GBA Wi-Fi/RFU 兼容性
 2. **外设支持** — 蓝牙手柄、键盘映射
 3. **增强体验** — 金手指、作弊码、ROM 信息展示
 4. **画面增强** — Shader 滤镜链（HQ2X / Scanlines / Color correction）
@@ -77,7 +76,7 @@ lib/
 │   ├── widgets/         # 虚拟手柄、游戏卡片
 │   └── theme/           # 主题
 scripts/
-├── build_mgba_libretro.sh    # 编译 mGBA 核心
+├── build_gpsp_libretro.sh    # 编译 gpSP 核心
 ├── build_fceumm_libretro.sh  # 编译 FCEUmm 核心
 ├── build_fbneo_libretro.sh   # 编译 FBNeo 街机核心
 └── build_all_cores.sh        # 一键编译全部核心
@@ -92,7 +91,7 @@ chmod +x scripts/*.sh
 ./scripts/build_all_cores.sh android
 
 # 或单独编译
-./scripts/build_mgba_libretro.sh android
+./scripts/build_gpsp_libretro.sh android
 ./scripts/build_fceumm_libretro.sh android
 ```
 
@@ -106,7 +105,7 @@ chmod +x scripts/*.sh
 
 | 核心 | Android 库名 | iOS 库名 |
 |------|----------------|----------|
-| mGBA | `libmgba_libretro.so` | `mgba_libretro_ios.dylib` |
+| gpSP | `libgpsp_libretro.so` | `gpsp_libretro_ios.dylib` |
 | FCEUmm | `libfceumm_libretro.so` | `fceumm_libretro_ios.dylib` |
 | FBNeo | `libfbneo_libretro.so` | `fbneo_libretro_ios.dylib` |
 
@@ -123,14 +122,14 @@ FC/NES 与街机双人联机采用 **房主仲裁严格帧同步**：
 - 固定 **1 帧输入延迟**（约 16 ms @ 60 fps），给网络留出缓冲
 - 会话开始走 `LOCKSTEP_READY` / `LOCKSTEP_START` 握手
 
-GBA 联机尚未实现。
+GBA 使用 gpSP 的 libretro `SET_NETPACKET_INTERFACE`，走独立 Wi-Fi/RFU packet 转发，不参与 FC/NES / 街机的锁步同步。
 
 ---
 
 ## 技术栈
 
 - **模拟核心：** 
-[mGBA](https://github.com/mgba-emu/mgba)（GBA/GB/GBC）
+[gpSP](https://github.com/libretro/gpsp)（GBA）
 [FCEUmm](https://github.com/libretro/libretro-fceumm)（NES/FC）  
 [FBNeo](https://github.com/finalburnneo/FBNeo)（Arcade）
 ---
@@ -152,7 +151,7 @@ flutter run
 
 本项目站在巨人的肩膀上，特别感谢：
 
-- **[mGBA](https://mgba.io/)** — GBA / GB / GBC 模拟核心（MPL 2.0）
+- **[gpSP](https://github.com/libretro/gpsp)** — GBA 模拟核心
 - **[FCEUmm](https://github.com/libretro/libretro-fceumm)** — FC / NES 模拟核心（GPL-2.0）
 - **[FBNeo](https://github.com/finalburnneo/FBNeo)** — 街机模拟核心（GPL-2.0+）
 - **[libretro](https://www.libretro.com/)** — 统一的模拟器 API 规范
@@ -164,4 +163,4 @@ flutter run
 
 本项目应用层代码采用 **MIT** 许可证。
 
-mGBA 核心遵循 **[MPL 2.0](https://github.com/mgba-emu/mgba/blob/master/LICENSE)**；FCEUmm 核心遵循 **[GPL-2.0](https://github.com/libretro/libretro-fceumm/blob/master/COPYING)**。分发包含上述核心的构建产物时，请遵守相应开源协议。
+gpSP、FCEUmm、FBNeo 等 libretro 核心的分发需遵守各自开源许可证。

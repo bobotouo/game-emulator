@@ -5,7 +5,7 @@ import '../emulator_loop/emulator_loop_ffi.dart' as emu_loop;
 import 'netplay_input_sync.dart';
 
 /// Fixed input delay for lockstep (frames to buffer before sim).
-const int kDefaultNetplayInputDelayFrames = 3;
+const int kDefaultNetplayInputDelayFrames = 2;
 
 /// Config broadcast when all players are loaded and lockstep begins.
 class LockstepStartConfig {
@@ -38,8 +38,11 @@ class NetplayLockstepRunner {
     this.onFrameComplete,
     this.onFrameAdvanced,
     int inputDelayFrames = kDefaultNetplayInputDelayFrames,
+    this.sharedMenuFrames = 0,
+    this.shareMenuControls = false,
+    this.edgeFilteredMenuMask = kNetplayMenuStartMask,
   }) : _requiredSlots = Set<int>.from(requiredSlots),
-       _inputDelayFrames = inputDelayFrames.clamp(0, 8);
+       _inputDelayFrames = inputDelayFrames.clamp(0, 12);
 
   final int localSlot;
   final bool isHost;
@@ -47,6 +50,9 @@ class NetplayLockstepRunner {
   final void Function(int frame, int slot, int buttons) onSendInput;
   final void Function(int frame, Map<int, int> inputs)? onFrameComplete;
   final void Function()? onFrameAdvanced;
+  final int sharedMenuFrames;
+  final bool shareMenuControls;
+  final int edgeFilteredMenuMask;
   int _inputDelayFrames;
 
   int _frame = 0;
@@ -59,6 +65,8 @@ class NetplayLockstepRunner {
   Set<int> _requiredSlots;
   int? _publishingFrame;
   int _lastPublishedLocalMask = 0;
+  int? _sharedMenuStopFrame;
+  Map<int, int> _lastCoreInputs = {};
 
   /// frame index -> slot -> button mask (host scheduling).
   final Map<int, Map<int, int>> _scheduledInputs = {};
@@ -73,7 +81,7 @@ class NetplayLockstepRunner {
     if (_running) {
       return;
     }
-    _inputDelayFrames = frames.clamp(0, 8);
+    _inputDelayFrames = frames.clamp(0, 12);
   }
 
   int get frame => _frame;
@@ -102,6 +110,8 @@ class NetplayLockstepRunner {
     _running = true;
     _publishingFrame = null;
     _lastPublishedLocalMask = _localButtonMask;
+    _sharedMenuStopFrame = null;
+    _lastCoreInputs = {};
     _scheduledInputs.clear();
     _pendingFrameBundles.clear();
     _latestRemoteMask.clear();
@@ -136,6 +146,7 @@ class NetplayLockstepRunner {
     _guestSendTimer = null;
     _publishingFrame = null;
     _lastPublishedLocalMask = 0;
+    _lastCoreInputs = {};
     _scheduledInputs.clear();
     _pendingFrameBundles.clear();
     _latestRemoteMask.clear();
@@ -153,7 +164,8 @@ class NetplayLockstepRunner {
       return;
     }
     if (isHost) {
-      _scheduleInput(_frame + _inputDelayFrames, localSlot, _localButtonMask);
+      _scheduleInput(_frame, localSlot, _localButtonMask);
+      _scheduleInput(_frame + 1, localSlot, _localButtonMask);
     } else {
       _sendLocalInput();
     }
@@ -167,10 +179,11 @@ class NetplayLockstepRunner {
     if (slot <= 0 || slot == localSlot || !_requiredSlots.contains(slot)) {
       return;
     }
-    if (frame < _frame) {
-      return;
-    }
     buttons &= 0xFFFF;
+    _latestRemoteMask[slot] = buttons;
+    if (frame < _frame) {
+      frame = _frame;
+    }
     _scheduleInput(frame, slot, buttons);
   }
 
@@ -207,15 +220,13 @@ class NetplayLockstepRunner {
       }
     }
 
+    final applied = _prepareInputsForCore(frame, inputs);
     emu_loop.clearInputs();
-    for (final entry in inputs.entries) {
+    for (final entry in applied.entries) {
       applyNetplayInputMask(netplaySlotToLibretroPort(entry.key), entry.value);
-      if (entry.key == localSlot) {
-        _lastPublishedLocalMask = entry.value & 0xFFFF;
-      } else {
-        _latestRemoteMask[entry.key] = entry.value & 0xFFFF;
-      }
+      _rememberInput(entry.key, entry.value);
     }
+    _lastCoreInputs = Map<int, int>.from(applied);
     emu_loop.advanceEmulatorFrame(retroRunPtr);
     _scheduledInputs.remove(frame);
     _publishingFrame = null;
@@ -225,6 +236,14 @@ class NetplayLockstepRunner {
       _sendLocalInput();
     }
     return true;
+  }
+
+  void _rememberInput(int slot, int buttons) {
+    if (slot == localSlot) {
+      _lastPublishedLocalMask = buttons & 0xFFFF;
+    } else {
+      _latestRemoteMask[slot] = buttons & 0xFFFF;
+    }
   }
 
   void _drainPendingFrameBundles() {
@@ -241,11 +260,11 @@ class NetplayLockstepRunner {
 
   void _prunePendingFrameBundles() {
     _pendingFrameBundles.removeWhere((frame, _) => frame < _frame);
-    if (_pendingFrameBundles.length <= 12) {
+    if (_pendingFrameBundles.length <= 4) {
       return;
     }
     final frames = _pendingFrameBundles.keys.toList()..sort();
-    for (final frame in frames.take(_pendingFrameBundles.length - 12)) {
+    for (final frame in frames.take(_pendingFrameBundles.length - 4)) {
       _pendingFrameBundles.remove(frame);
     }
   }
@@ -265,6 +284,55 @@ class NetplayLockstepRunner {
       }
     }
     return out;
+  }
+
+  Map<int, int> _prepareInputsForCore(int frame, Map<int, int> inputs) {
+    final applied = Map<int, int>.from(inputs);
+    if (_shouldShareMenuControls(frame)) {
+      var menuMask = 0;
+      for (final mask in inputs.values) {
+        menuMask |= mask & kNetplayMenuControlMask;
+      }
+      if (menuMask != 0) {
+        applied[1] = (applied[1] ?? 0) | menuMask;
+      }
+      if (_sharedMenuStopFrame == null &&
+          ((inputs[1] ?? 0) & kNetplayMenuStartMask) != 0) {
+        _sharedMenuStopFrame = frame + (_fps / 2).round().clamp(1, 60);
+      }
+    }
+    _applyMenuStartEdges(applied, frame);
+    return applied;
+  }
+
+  bool _shouldShareMenuControls(int frame) {
+    if (!shareMenuControls || !_isMenuControlFrame(frame)) {
+      return false;
+    }
+    final stopFrame = _sharedMenuStopFrame;
+    return stopFrame == null || frame <= stopFrame;
+  }
+
+  bool _isMenuControlFrame(int frame) {
+    return sharedMenuFrames > 0 && frame <= sharedMenuFrames;
+  }
+
+  void _applyMenuStartEdges(Map<int, int> inputs, int frame) {
+    if (!_isMenuControlFrame(frame) || edgeFilteredMenuMask == 0) {
+      return;
+    }
+    for (final entry in List<MapEntry<int, int>>.from(inputs.entries)) {
+      final mask = entry.value;
+      final filteredMask = mask & edgeFilteredMenuMask;
+      if (filteredMask == 0) {
+        continue;
+      }
+      final previousMask = _lastCoreInputs[entry.key] ?? 0;
+      final repeatedMask = filteredMask & previousMask;
+      if (repeatedMask != 0) {
+        inputs[entry.key] = mask & ~repeatedMask;
+      }
+    }
   }
 
   void _seedBootstrapFrame(int frame) {
@@ -318,7 +386,8 @@ class NetplayLockstepRunner {
     if (!_running || !isHost) {
       return;
     }
-    _scheduleInput(_frame + _inputDelayFrames, localSlot, _localButtonMask);
+    _scheduleInput(_frame, localSlot, _localButtonMask);
+    _scheduleInput(_frame + 1, localSlot, _localButtonMask);
     _tryPublishFrame();
   }
 

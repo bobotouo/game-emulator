@@ -203,6 +203,149 @@ int netplaySimFrame() => _netplaySimFrame();
 
 void netplaySetSimFrame(int frame) => _netplaySetSimFrame(frame);
 
+// ── gpSP serial netpacket bridge ──────────────────────────────────────────
+typedef _SetGpspSerialModeNative = Void Function(Pointer<Utf8>);
+typedef _SetGpspSerialModeDart = void Function(Pointer<Utf8>);
+final _setGpspSerialMode = emuLoopLib
+    .lookupFunction<_SetGpspSerialModeNative, _SetGpspSerialModeDart>(
+      'emulator_loop_set_gpsp_serial_mode',
+    );
+
+void setGpspSerialMode(String mode) {
+  final normalized = switch (mode) {
+    'disabled' => 'disabled',
+    'rfu' => 'rfu',
+    'mul_poke' => 'mul_poke',
+    'mul_aw1' => 'mul_aw1',
+    'mul_aw2' => 'mul_aw2',
+    _ => 'auto',
+  };
+  final ptr = normalized.toNativeUtf8(allocator: malloc);
+  try {
+    _setGpspSerialMode(ptr);
+  } finally {
+    malloc.free(ptr);
+  }
+}
+
+typedef _NetpacketAvailableNative = Bool Function();
+typedef _NetpacketAvailableDart = bool Function();
+final _netpacketAvailable = emuLoopLib
+    .lookupFunction<_NetpacketAvailableNative, _NetpacketAvailableDart>(
+      'emulator_loop_netpacket_available',
+    );
+
+typedef _NetpacketStartNative = Void Function(Uint16);
+typedef _NetpacketStartDart = void Function(int);
+final _netpacketStart = emuLoopLib
+    .lookupFunction<_NetpacketStartNative, _NetpacketStartDart>(
+      'emulator_loop_netpacket_start',
+    );
+
+typedef _NetpacketStopNative = Void Function();
+typedef _NetpacketStopDart = void Function();
+final _netpacketStop = emuLoopLib
+    .lookupFunction<_NetpacketStopNative, _NetpacketStopDart>(
+      'emulator_loop_netpacket_stop',
+    );
+
+typedef _NetpacketConnectNative = Bool Function(Uint16);
+typedef _NetpacketConnectDart = bool Function(int);
+final _netpacketConnect = emuLoopLib
+    .lookupFunction<_NetpacketConnectNative, _NetpacketConnectDart>(
+      'emulator_loop_netpacket_connect',
+    );
+
+typedef _NetpacketDisconnectNative = Void Function(Uint16);
+typedef _NetpacketDisconnectDart = void Function(int);
+final _netpacketDisconnect = emuLoopLib
+    .lookupFunction<_NetpacketDisconnectNative, _NetpacketDisconnectDart>(
+      'emulator_loop_netpacket_disconnect',
+    );
+
+typedef _NetpacketReadNative =
+    Int32 Function(Pointer<Uint16>, Pointer<Int32>, Pointer<Uint8>, Int32);
+typedef _NetpacketReadDart =
+    int Function(Pointer<Uint16>, Pointer<Int32>, Pointer<Uint8>, int);
+final _netpacketRead = emuLoopLib
+    .lookupFunction<_NetpacketReadNative, _NetpacketReadDart>(
+      'emulator_loop_netpacket_read',
+    );
+
+typedef _NetpacketPushNative = Void Function(Pointer<Uint8>, Int32, Uint16);
+typedef _NetpacketPushDart = void Function(Pointer<Uint8>, int, int);
+final _netpacketPush = emuLoopLib
+    .lookupFunction<_NetpacketPushNative, _NetpacketPushDart>(
+      'emulator_loop_netpacket_push',
+    );
+
+class GbaNetpacket {
+  const GbaNetpacket({
+    required this.targetClientId,
+    required this.flags,
+    required this.bytes,
+  });
+
+  final int targetClientId;
+  final int flags;
+  final Uint8List bytes;
+}
+
+const int gbaNetpacketBroadcast = 0xFFFF;
+const int _gbaNetpacketMaxBytes = 65536;
+final Pointer<Uint8> _gbaNetpacketBuf = calloc<Uint8>(_gbaNetpacketMaxBytes);
+final Pointer<Uint16> _gbaNetpacketTarget = calloc<Uint16>();
+final Pointer<Int32> _gbaNetpacketFlags = calloc<Int32>();
+
+bool isGbaNetpacketAvailable() => _netpacketAvailable();
+
+void startGbaNetpacketSession(int localClientId) {
+  _netpacketStart(localClientId.clamp(0, gbaNetpacketBroadcast).toInt());
+}
+
+void stopGbaNetpacketSession() => _netpacketStop();
+
+bool connectGbaNetpacketClient(int clientId) =>
+    _netpacketConnect(clientId.clamp(0, gbaNetpacketBroadcast).toInt());
+
+void disconnectGbaNetpacketClient(int clientId) =>
+    _netpacketDisconnect(clientId.clamp(0, gbaNetpacketBroadcast).toInt());
+
+GbaNetpacket? readGbaNetpacket() {
+  final size = _netpacketRead(
+    _gbaNetpacketTarget,
+    _gbaNetpacketFlags,
+    _gbaNetpacketBuf,
+    _gbaNetpacketMaxBytes,
+  );
+  if (size <= 0) {
+    return null;
+  }
+  return GbaNetpacket(
+    targetClientId: _gbaNetpacketTarget.value,
+    flags: _gbaNetpacketFlags.value,
+    bytes: Uint8List.fromList(_gbaNetpacketBuf.asTypedList(size)),
+  );
+}
+
+void pushGbaNetpacket(Uint8List bytes, {required int sourceClientId}) {
+  if (bytes.isEmpty) {
+    return;
+  }
+  final size = bytes.length.clamp(0, _gbaNetpacketMaxBytes);
+  final ptr = malloc<Uint8>(size);
+  try {
+    ptr.asTypedList(size).setAll(0, bytes.take(size));
+    _netpacketPush(
+      ptr,
+      size,
+      sourceClientId.clamp(0, gbaNetpacketBroadcast).toInt(),
+    );
+  } finally {
+    malloc.free(ptr);
+  }
+}
+
 typedef _RunFramesNative =
     Void Function(Pointer<NativeFunction<Void Function()>>, Uint32);
 typedef _RunFramesDart =
@@ -391,7 +534,7 @@ final _getReportedSampleRate = emuLoopLib
       'emulator_loop_get_reported_sample_rate',
     );
 
-/// mGBA etc. resample to this rate in [retro_load_game]. Call before loading ROM.
+/// Cores can resample to this rate in [retro_load_game]. Call before loading ROM.
 void setTargetSampleRate(int sampleRate) =>
     _setTargetSampleRate(sampleRate.clamp(8000, 192000));
 

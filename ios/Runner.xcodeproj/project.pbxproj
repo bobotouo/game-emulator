@@ -22,8 +22,8 @@
 		D1E2F3A51CF9000F007C1002 /* game_texture_upload.cc in Sources */ = {isa = PBXBuildFile; fileRef = D1E2F3A71CF9000F007C1004 /* game_texture_upload.cc */; };
 		D1E2F3A81CF9000F007C1005 /* GameTextureBridge.mm in Sources */ = {isa = PBXBuildFile; fileRef = D1E2F3A91CF9000F007C1006 /* GameTextureBridge.mm */; };
 		D1E2F3B01CF9000F007C2001 /* EmulatorLoop.mm in Sources */ = {isa = PBXBuildFile; fileRef = D1E2F3B11CF9000F007C2002 /* EmulatorLoop.mm */; };
-		D1E2F3B41CF9000F007C2005 /* GameAudioEngine.mm in Sources */ = {isa = PBXBuildFile; fileRef = D1E2F3B51CF9000F007C2006 /* GameAudioEngine.mm */; };
 		D1E2F3B21CF9000F007C2003 /* emulator_loop.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D1E2F3B31CF9000F007C2004 /* emulator_loop.cpp */; };
+		D1E2F3B41CF9000F007C2005 /* GameAudioEngine.mm in Sources */ = {isa = PBXBuildFile; fileRef = D1E2F3B51CF9000F007C2006 /* GameAudioEngine.mm */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -74,13 +74,13 @@
 		B45ABFAFBAB9891CD9EE7771 /* Pods-Runner.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Runner.release.xcconfig"; path = "Target Support Files/Pods-Runner/Pods-Runner.release.xcconfig"; sourceTree = "<group>"; };
 		C495C3A30809A8343F173FBF /* Pods-Runner.profile.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Runner.profile.xcconfig"; path = "Target Support Files/Pods-Runner/Pods-Runner.profile.xcconfig"; sourceTree = "<group>"; };
 		CFCFD96052303ADB4E6C9EAA /* Pods-RunnerTests.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-RunnerTests.debug.xcconfig"; path = "Target Support Files/Pods-RunnerTests/Pods-RunnerTests.debug.xcconfig"; sourceTree = "<group>"; };
-		FC491D776105D38BE9C68E51 /* Pods-Runner.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Runner.debug.xcconfig"; path = "Target Support Files/Pods-Runner/Pods-Runner.debug.xcconfig"; sourceTree = "<group>"; };
 		D1E2F3A61CF9000F007C1003 /* GameTexturePlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameTexturePlugin.swift; sourceTree = "<group>"; };
 		D1E2F3A71CF9000F007C1004 /* game_texture_upload.cc */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = game_texture_upload.cc; path = ../native/game_texture/src/game_texture_upload.cc; sourceTree = SOURCE_ROOT; };
 		D1E2F3A91CF9000F007C1006 /* GameTextureBridge.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = GameTextureBridge.mm; sourceTree = "<group>"; };
 		D1E2F3B11CF9000F007C2002 /* EmulatorLoop.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = EmulatorLoop.mm; sourceTree = "<group>"; };
-		D1E2F3B51CF9000F007C2006 /* GameAudioEngine.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = GameAudioEngine.mm; sourceTree = "<group>"; };
 		D1E2F3B31CF9000F007C2004 /* emulator_loop.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; name = emulator_loop.cpp; path = ../native/emulator_loop/src/emulator_loop.cpp; sourceTree = SOURCE_ROOT; };
+		D1E2F3B51CF9000F007C2006 /* GameAudioEngine.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = GameAudioEngine.mm; sourceTree = "<group>"; };
+		FC491D776105D38BE9C68E51 /* Pods-Runner.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Runner.debug.xcconfig"; path = "Target Support Files/Pods-Runner/Pods-Runner.debug.xcconfig"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -225,6 +225,7 @@
 				3B06AD1E1E4923F5004D2608 /* Thin Binary */,
 				E8F4A2B31CF9048500538489 /* Embed Libretro Cores */,
 				A3C06E1F9BE9EF5536AD2089 /* [CP] Copy Pods Resources */,
+				E6ABAEBD88C7623642F7A080 /* [CP] Embed Pods Frameworks */,
 			);
 			buildRules = (
 			);
@@ -377,22 +378,6 @@
 			shellPath = /bin/sh;
 			shellScript = "/bin/sh \"$FLUTTER_ROOT/packages/flutter_tools/bin/xcode_backend.sh\" build";
 		};
-		E8F4A2B31CF9048500538489 /* Embed Libretro Cores */ = {
-			isa = PBXShellScriptBuildPhase;
-			alwaysOutOfDate = 1;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputPaths = (
-				"${SRCROOT}/Runner/Frameworks",
-			);
-			name = "Embed Libretro Cores";
-			outputPaths = (
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "/bin/sh \"${SRCROOT}/Runner/embed_libretro_cores.sh\"\n";
-		};
 		A3C06E1F9BE9EF5536AD2089 /* [CP] Copy Pods Resources */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
@@ -409,6 +394,39 @@
 			shellPath = /bin/sh;
 			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-resources.sh\"\n";
 			showEnvVarsInLog = 0;
+		};
+		E6ABAEBD88C7623642F7A080 /* [CP] Embed Pods Frameworks */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-frameworks-${CONFIGURATION}-input-files.xcfilelist",
+			);
+			name = "[CP] Embed Pods Frameworks";
+			outputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-frameworks-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-frameworks.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+		E8F4A2B31CF9048500538489 /* Embed Libretro Cores */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"${SRCROOT}/Runner/Frameworks",
+			);
+			name = "Embed Libretro Cores";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "/bin/sh \"${SRCROOT}/Runner/embed_libretro_cores.sh\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

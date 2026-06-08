@@ -55,19 +55,19 @@ class EmulatorCoreResolver {
 
   static const nesExtensions = {'.nes', '.fc', '.fds', '.unf', '.unif'};
   static const gbaExtensions = {'.gba'};
-  static const gbExtensions = {'.gb', '.gbc'};
   static const arcadeExtensions = {'.zip', '.7z'};
 
   static const _gba = EmulatorCoreConfig(
     system: EmulatorSystem.gba,
-    androidLibraryName: 'libmgba_libretro.so',
-    iosLibraryName: 'mgba_libretro_ios.dylib',
+    androidLibraryName: 'libgpsp_libretro.so',
+    iosLibraryName: 'gpsp_libretro_ios.dylib',
     defaultWidth: 240,
     defaultHeight: 160,
     desktopFileNames: [
-      'mgba_libretro_ios.dylib',
-      'mgba_libretro.dylib',
-      'libmgba_libretro.dylib',
+      'gpsp_libretro_ios.dylib',
+      'gpsp_libretro.dylib',
+      'libgpsp_libretro.dylib',
+      'libgpsp_libretro.so',
     ],
   );
 
@@ -102,7 +102,6 @@ class EmulatorCoreResolver {
   /// All ROM extensions allowed in the game library file picker.
   static List<String> get supportedRomExtensions => [
     ...gbaExtensions,
-    ...gbExtensions,
     ...nesExtensions,
     ...arcadeExtensions,
   ];
@@ -124,7 +123,7 @@ class EmulatorCoreResolver {
     if (arcadeExtensions.contains(ext)) {
       return _fbneo;
     }
-    if (gbaExtensions.contains(ext) || gbExtensions.contains(ext)) {
+    if (gbaExtensions.contains(ext)) {
       return _gba;
     }
     throw UnsupportedError('不支持的 ROM 格式: $ext');
@@ -133,7 +132,6 @@ class EmulatorCoreResolver {
   static bool _isKnownExtension(String ext) {
     return nesExtensions.contains(ext) ||
         gbaExtensions.contains(ext) ||
-        gbExtensions.contains(ext) ||
         arcadeExtensions.contains(ext);
   }
 
@@ -153,7 +151,7 @@ class EmulatorCoreResolver {
 
   /// Human-readable list for import errors / empty states.
   static String get supportedFormatsHint =>
-      'GBA (.gba)、GB/GBC (.gb/.gbc)、FC/NES (.nes/.fc 等)、街机（FBNeo ROM set 的 .zip/.7z）';
+      'GBA (.gba)、FC/NES (.nes/.fc 等)、街机（FBNeo ROM set 的 .zip/.7z）';
 
   static Future<String?> resolveCorePath(
     String romPath, {

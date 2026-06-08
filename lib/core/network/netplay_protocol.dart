@@ -10,6 +10,7 @@ abstract final class NetplayMessageType {
   static const readyStatus = 'READY_STATUS';
   static const requestRom = 'REQUEST_ROM';
   static const romBegin = 'ROM_BEGIN';
+  static const romChunk = 'ROM_CHUNK';
   static const romEnd = 'ROM_END';
   static const startGame = 'START_GAME';
   static const leave = 'LEAVE';
@@ -19,6 +20,7 @@ abstract final class NetplayMessageType {
   static const roomState = 'ROOM_STATE';
   static const lockstepReady = 'LOCKSTEP_READY';
   static const lockstepStart = 'LOCKSTEP_START';
+  static const lockstepStartAck = 'LOCKSTEP_START_ACK';
   static const frameInput = 'FRAME_INPUT';
   static const frameBundle = 'FRAME_BUNDLE';
   static const saveStateBegin = 'SAVE_STATE_BEGIN';
@@ -26,6 +28,9 @@ abstract final class NetplayMessageType {
   static const gameExit = 'GAME_EXIT';
   static const hostPromote = 'HOST_PROMOTE';
   static const gameSpeed = 'GAME_SPEED';
+  static const gbaNetpacket = 'GBA_NETPACKET';
+  static const romProgress = 'ROM_PROGRESS';
+  static const latencyReport = 'LATENCY_REPORT';
 }
 
 class NetplayMessage {
@@ -69,6 +74,7 @@ class NetplayMessage {
     required String fileName,
     required String md5,
     String? dataB64,
+    bool chunked = false,
   }) {
     final safeName = NetplayWire.safeFileName(fileName);
     return NetplayMessage(NetplayMessageType.romBegin, {
@@ -77,11 +83,20 @@ class NetplayMessage {
       'fileNameEncoding': 'base64',
       'md5': md5.toLowerCase(),
       if (dataB64 != null) ...{'encoding': 'base64', 'data': dataB64},
+      if (chunked) 'transferEncoding': 'chunks',
     });
   }
 
   static NetplayMessage romEnd() =>
       const NetplayMessage(NetplayMessageType.romEnd);
+
+  static NetplayMessage romChunk({
+    required int offset,
+    required Uint8List bytes,
+  }) => NetplayMessage(NetplayMessageType.romChunk, {
+    'offset': offset,
+    'data': base64Encode(bytes),
+  });
 
   static NetplayMessage startGame({
     required String gameMd5,
@@ -117,6 +132,9 @@ class NetplayMessage {
     'inputDelay': inputDelayFrames,
   });
 
+  static NetplayMessage lockstepStartAck() =>
+      const NetplayMessage(NetplayMessageType.lockstepStartAck);
+
   static NetplayMessage frameInput({
     required int frame,
     required int slot,
@@ -135,8 +153,17 @@ class NetplayMessage {
     'inputs': inputs.map((slot, mask) => MapEntry('$slot', mask)),
   });
 
-  static NetplayMessage saveStateBegin({required int size}) =>
-      NetplayMessage(NetplayMessageType.saveStateBegin, {'size': size});
+  static NetplayMessage saveStateBegin({
+    required int size,
+    String purpose = 'initial',
+    int? frame,
+  }) {
+    final payload = <String, dynamic>{'size': size, 'purpose': purpose};
+    if (frame != null) {
+      payload['frame'] = frame;
+    }
+    return NetplayMessage(NetplayMessageType.saveStateBegin, payload);
+  }
 
   static NetplayMessage saveStateEnd() =>
       const NetplayMessage(NetplayMessageType.saveStateEnd);
@@ -148,15 +175,39 @@ class NetplayMessage {
     required Map<String, dynamic> room,
     required String playerName,
     int gameSpeed = 1,
+    Map<String, dynamic>? internetDirectInvite,
   }) => NetplayMessage(NetplayMessageType.hostPromote, {
     'room': room,
     'playerName': playerName,
     'gameSpeed': gameSpeed.clamp(1, 3),
+    // ignore: use_null_aware_elements
+    if (internetDirectInvite != null)
+      'internetDirectInvite': internetDirectInvite,
   });
 
   static NetplayMessage gameSpeed({required int speed}) => NetplayMessage(
     NetplayMessageType.gameSpeed,
     {'speed': speed.clamp(1, 3)},
+  );
+
+  static NetplayMessage gbaNetpacket({
+    required int sourceClientId,
+    required int targetClientId,
+    required int flags,
+    required Uint8List bytes,
+  }) => NetplayMessage(NetplayMessageType.gbaNetpacket, {
+    'sourceClientId': sourceClientId.clamp(0, 0xFFFF),
+    'targetClientId': targetClientId.clamp(0, 0xFFFF),
+    'flags': flags,
+    'data': base64Encode(bytes),
+  });
+
+  static NetplayMessage romProgress({required int received}) =>
+      NetplayMessage(NetplayMessageType.romProgress, {'received': received});
+
+  static NetplayMessage latencyReport({required int latency}) => NetplayMessage(
+    NetplayMessageType.latencyReport,
+    {'latency': latency.clamp(0, 60000)},
   );
 }
 
@@ -208,18 +259,24 @@ abstract final class NetplayWire {
     final data = payload['data'];
     return data is String && data.isNotEmpty;
   }
+
+  static bool isChunkedRomTransfer(Map<String, dynamic> payload) {
+    return payload['transferEncoding'] == 'chunks';
+  }
 }
 
 /// Parses newline JSON control messages and fixed-size ROM binary payloads.
 class NetplayStreamParser {
   final List<int> _buffer = [];
   bool _receivingRom = false;
+  bool get isReceivingBinary => _receivingRom || _receivingSaveState;
   int _romBytesRemaining = 0;
   NetplayMessage? _activeRomBegin;
   final BytesBuilder _romBuffer = BytesBuilder(copy: false);
 
   bool _receivingSaveState = false;
   int _saveStateBytesRemaining = 0;
+  NetplayMessage? _activeSaveStateBegin;
   final BytesBuilder _saveStateBuffer = BytesBuilder(copy: false);
 
   void feed(
@@ -227,7 +284,10 @@ class NetplayStreamParser {
     required void Function(NetplayMessage message) onMessage,
     required void Function(Uint8List bytes, NetplayMessage beginMeta)
     onRomComplete,
-    void Function(Uint8List bytes)? onSaveStateComplete,
+    void Function(int received, int total, NetplayMessage beginMeta)?
+    onRomProgress,
+    void Function(Uint8List bytes, NetplayMessage beginMeta)?
+    onSaveStateComplete,
   }) {
     _buffer.addAll(chunk);
     while (_buffer.isNotEmpty) {
@@ -238,7 +298,11 @@ class NetplayStreamParser {
         _saveStateBytesRemaining -= take;
         if (_saveStateBytesRemaining == 0) {
           _receivingSaveState = false;
-          onSaveStateComplete?.call(_saveStateBuffer.takeBytes());
+          final meta = _activeSaveStateBegin;
+          _activeSaveStateBegin = null;
+          if (meta != null) {
+            onSaveStateComplete?.call(_saveStateBuffer.takeBytes(), meta);
+          }
         }
         continue;
       }
@@ -248,9 +312,15 @@ class NetplayStreamParser {
         _romBuffer.add(_buffer.sublist(0, take));
         _buffer.removeRange(0, take);
         _romBytesRemaining -= take;
+        final meta = _activeRomBegin;
+        if (meta != null) {
+          final total = (meta.payload['size'] as num?)?.toInt() ?? 0;
+          if (total > 0) {
+            onRomProgress?.call(total - _romBytesRemaining, total, meta);
+          }
+        }
         if (_romBytesRemaining == 0) {
           _receivingRom = false;
-          final meta = _activeRomBegin;
           _activeRomBegin = null;
           if (meta != null) {
             onRomComplete(_romBuffer.takeBytes(), meta);
@@ -285,7 +355,8 @@ class NetplayStreamParser {
       }
 
       if (message.type == NetplayMessageType.romBegin) {
-        if (!NetplayWire.hasInlineRomData(message.payload)) {
+        if (!NetplayWire.hasInlineRomData(message.payload) &&
+            !NetplayWire.isChunkedRomTransfer(message.payload)) {
           _receivingRom = true;
           _activeRomBegin = message;
           _romBytesRemaining = (message.payload['size'] as num?)?.toInt() ?? 0;
@@ -297,6 +368,7 @@ class NetplayStreamParser {
 
       if (message.type == NetplayMessageType.saveStateBegin) {
         _receivingSaveState = true;
+        _activeSaveStateBegin = message;
         _saveStateBytesRemaining =
             (message.payload['size'] as num?)?.toInt() ?? 0;
         _saveStateBuffer.clear();
@@ -315,9 +387,10 @@ class NetplayStreamParser {
     _romBytesRemaining = 0;
     _saveStateBytesRemaining = 0;
     _activeRomBegin = null;
+    _activeSaveStateBegin = null;
   }
 }
 
 abstract final class NetplayRomTransfer {
-  static const chunkSize = 64 * 1024;
+  static const chunkSize = 32 * 1024;
 }

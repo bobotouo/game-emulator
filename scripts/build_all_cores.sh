@@ -1,13 +1,13 @@
 #!/bin/bash
 
-# Build all bundled libretro cores (mGBA + FCEUmm + FBNeo)
+# Build all bundled libretro cores (gpSP + FCEUmm + FBNeo)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLATFORM="${1:-android}"
 
-echo "=== Building mGBA (GBA/GB/GBC) ==="
-"$SCRIPT_DIR/build_mgba_libretro.sh" "$PLATFORM"
+echo "=== Building gpSP (GBA) ==="
+"$SCRIPT_DIR/build_gpsp_libretro.sh" "$PLATFORM"
 
 echo ""
 echo "=== Building FCEUmm (NES/FC) ==="
