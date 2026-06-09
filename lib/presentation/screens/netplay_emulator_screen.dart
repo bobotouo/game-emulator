@@ -74,7 +74,7 @@ class _NetplayEmulatorScreenState extends State<NetplayEmulatorScreen> {
     } else if (widget.netplayService.isHost) {
       widget.netplayService.exitGameAndHandoffHost();
     } else {
-      widget.netplayService.exitGameAndLeaveRoom();
+      widget.netplayService.exitGameAndLeave();
     }
     super.dispose();
   }

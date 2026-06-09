@@ -1,9 +1,8 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:qr_flutter/qr_flutter.dart';
 
 import '../../core/network/internet_direct_code.dart';
 import '../../core/network/lan_service.dart';
@@ -43,6 +42,7 @@ class _RoomScreenState extends State<RoomScreen> {
   late final GameLibraryService _gameLibrary =
       widget.gameLibrary ?? GameLibraryService();
   final _roomNameController = TextEditingController();
+  final _internetPasswordController = TextEditingController();
   PageController? _pageController;
   final _players = <PlayerInfo>[];
 
@@ -78,6 +78,7 @@ class _RoomScreenState extends State<RoomScreen> {
   StreamSubscription<List<GameRom>>? _gamesSub;
   StreamSubscription<NetplayRoomState>? _roomStateSub;
   StreamSubscription<RoomInfo>? _hostPromotedSub;
+  Future<void> _romSendQueue = Future<void>.value();
 
   RoomInfo? get _room =>
       widget.netplayService.hostedRoom ??
@@ -117,8 +118,13 @@ class _RoomScreenState extends State<RoomScreen> {
 
   bool get _hasTeammate => _playablePlayers.any((player) => !player.isHost);
 
-  bool get _teammateReady =>
-      _playablePlayers.any((player) => !player.isHost && player.isReady);
+  bool get _teammateReady {
+    final teammates = _playablePlayers.where((player) => !player.isHost);
+    if (teammates.isEmpty) {
+      return false;
+    }
+    return teammates.every((player) => player.isReady);
+  }
 
   bool get _canStartGame => _hasTeammate && _teammateReady;
 
@@ -206,6 +212,7 @@ class _RoomScreenState extends State<RoomScreen> {
   @override
   void dispose() {
     _roomNameController.dispose();
+    _internetPasswordController.dispose();
     _pageController?.dispose();
     _playerJoinedSub?.cancel();
     _playerUpdatedSub?.cancel();
@@ -266,7 +273,10 @@ class _RoomScreenState extends State<RoomScreen> {
     _messageSub = widget.netplayService.onMessage.listen(_onMessage);
     _romRequestSub = widget.netplayService.onRomRequested.listen((peerId) {
       if (_isRoomHost) {
-        unawaited(_sendRomToPeer(peerId: peerId));
+        _romSendQueue = _romSendQueue
+            .catchError((_) {})
+            .then((_) => _sendRomToPeer(peerId: peerId));
+        unawaited(_romSendQueue);
       }
     });
     _romProgressSub = widget.netplayService.onRomProgress.listen(
@@ -289,7 +299,7 @@ class _RoomScreenState extends State<RoomScreen> {
           mounted &&
           !_leaving &&
           !widget.netplayService.isHostPromotionPending) {
-        _leaveRoom(showDisconnectedSnack: true, notifyHost: false);
+        _leaveRoom(showDisconnectedSnack: !_isRoomHost, notifyHost: false);
       }
     });
     _hostPromotedSub = widget.netplayService.onHostPromoted.listen(
@@ -384,6 +394,9 @@ class _RoomScreenState extends State<RoomScreen> {
         ? (directCode = await widget.netplayService.createInternetDirectRoom(
                 roomTemplate: roomTemplate,
                 playerName: 'Player 1',
+                password: _internetPasswordController.text.trim().isEmpty
+                    ? null
+                    : _internetPasswordController.text.trim(),
               )) !=
               null
         : await widget.netplayService.createRoom(
@@ -727,16 +740,6 @@ class _RoomScreenState extends State<RoomScreen> {
       return;
     }
 
-    if (widget.netplayService.consumeExitingForReplacement()) {
-      if (_isRoomHost) {
-        widget.netplayService.exitGameAndHandoffHost();
-        if (mounted) {
-          Navigator.pop(context, true);
-        }
-        return;
-      }
-    }
-
     if (!widget.netplayService.isConnected) {
       if (mounted) {
         Navigator.pop(context, true);
@@ -898,12 +901,16 @@ class _RoomScreenState extends State<RoomScreen> {
                           if (_isRoomHost && !_roomLive) ...[
                             const SizedBox(height: 12),
                             _buildRoomModeSelector(context),
+                            if (_roomMode == NetplayRoomMode.internet) ...[
+                              const SizedBox(height: 12),
+                              _buildInternetPasswordField(context),
+                            ],
                             const SizedBox(height: 12),
                             _buildMaxPlayersSelector(context),
                           ],
                           if (_internetDirectCode != null && _roomLive) ...[
                             const SizedBox(height: 12),
-                            _buildInternetDirectCard(context),
+                            _buildInternetLobbyCard(context),
                           ],
                           const SizedBox(height: 12),
                           _buildGameCarousel(context),
@@ -943,7 +950,7 @@ class _RoomScreenState extends State<RoomScreen> {
               ),
               ButtonSegment(
                 value: NetplayRoomMode.internet,
-                icon: Icon(Icons.qr_code_2),
+                icon: Icon(Icons.public),
                 label: Text('互联网'),
               ),
             ],
@@ -957,12 +964,29 @@ class _RoomScreenState extends State<RoomScreen> {
     );
   }
 
-  Widget _buildInternetDirectCard(BuildContext context) {
+  Widget _buildInternetPasswordField(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: TextField(
+        controller: _internetPasswordController,
+        obscureText: true,
+        decoration: InputDecoration(
+          labelText: '房间密码（可选）',
+          hintText: '不填写则公开加入',
+          prefixIcon: const Icon(Icons.lock_outline),
+          filled: true,
+          fillColor: AppColors.surfaceContainerLow,
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInternetLobbyCard(BuildContext context) {
     final code = _internetDirectCode;
     if (code == null) {
       return const SizedBox.shrink();
     }
-    final raw = code.encode();
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16),
       child: Column(
@@ -974,50 +998,22 @@ class _RoomScreenState extends State<RoomScreen> {
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  '互联网二维码',
+                  '互联网大厅',
                   style: Theme.of(
                     context,
                   ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
                 ),
               ),
-              IconButton(
-                tooltip: '复制连接码',
-                visualDensity: VisualDensity.compact,
-                iconSize: 18,
-                onPressed: () {
-                  Clipboard.setData(ClipboardData(text: raw));
-                  _showSnack('已复制连接码');
-                },
-                icon: const Icon(Icons.copy),
-              ),
             ],
           ),
           const SizedBox(height: 8),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: [
-              QrImageView(
-                backgroundColor: Colors.white,
-                data: raw,
-
-                version: QrVersions.auto,
-                size: 120,
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    _buildInternetInfoLine(
-                      context,
-                      label: '游戏',
-                      value: code.gameTitle,
-                    ),
-                  ],
-                ),
-              ),
-            ],
+          _buildInternetInfoLine(
+            context,
+            label: '状态',
+            value: '已开放，其他玩家可在联机大厅搜索加入',
           ),
+          const SizedBox(height: 4),
+          _buildInternetInfoLine(context, label: '游戏', value: code.gameTitle),
         ],
       ),
     );

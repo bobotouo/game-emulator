@@ -28,13 +28,15 @@ class NetplayService {
   static const serviceType = '_retro-netplay._tcp';
   static const udpMagic = 'RETRO_NETPLAY:v1:';
   static const udpDiscover = 'RETRO_NETPLAY_DISCOVER';
-  static const _internetDirectPeerId = 'webrtc-peer';
   static const _binaryMagic0 = 0x4E; // N
   static const _binaryMagic1 = 0x50; // P
   static const _binaryMagic2 = 0x42; // B
   static const _binaryFrameInput = 1;
   static const _binaryFrameBundle = 2;
   static const _binaryRomChunk = 3;
+
+  /// Guest-side WebRTC peer id for the host connection.
+  static const internetHostPeerId = 'host';
 
   ServerSocket? _server;
   Socket? _clientSocket;
@@ -43,17 +45,20 @@ class NetplayService {
 
   RawDatagramSocket? _udpSocket;
   RawDatagramSocket? _udpResponderSocket;
-  InternetDirectWebRtcHost? _webrtcHost;
+  final Map<String, _InternetDirectHostPeer> _webrtcHostPeers = {};
   InternetDirectWebRtcGuest? _webrtcGuest;
   StreamSubscription<Uint8List>? _webrtcDataSub;
   StreamSubscription<Uint8List>? _webrtcRealtimeDataSub;
   StreamSubscription<bool>? _webrtcConnectedSub;
   NetplayStreamParser? _webrtcGuestParser;
-  Timer? _internetDirectAnswerPollTimer;
+  Timer? _internetDirectHeartbeatTimer;
+  Timer? _internetDirectJoinPollTimer;
   String? _internetDirectSignalRoomId;
   InternetDirectCode? _internetDirectInviteCode;
   bool _internetDirectMode = false;
-  bool _refreshingInternetDirectOffer = false;
+  bool _internetDirectJoinInFlight = false;
+  final Set<String> _internetDirectHandledJoinIds = {};
+  bool _disbandingRoom = false;
   int _debugInputLogCount = 0;
   Timer? _pingTimer;
   int _localLatency = 0;
@@ -226,6 +231,17 @@ class NetplayService {
   List<Socket> get clients =>
       _peers.values.map((peer) => peer.socket).whereType<Socket>().toList();
 
+  /// True when the host has at least one connected guest (LAN or WebRTC).
+  bool get hasActiveTeammates {
+    if (!_isHost) {
+      return false;
+    }
+    if (_internetDirectMode) {
+      return _peers.values.any((peer) => peer.playerSlot > 0);
+    }
+    return clients.isNotEmpty;
+  }
+
   /// First guest peer that has been assigned a player slot (for ROM transfer, etc.).
   String? get firstPlayablePeerId {
     for (final peer in _peers.values) {
@@ -366,8 +382,13 @@ class NetplayService {
     required RoomInfo roomTemplate,
     String? playerName,
     InternetDirectCode? reuseInviteCode,
+    String? password,
+    bool notifyDisconnectedOnReset = true,
   }) async {
-    await _resetConnections(keepDiscovery: false);
+    await _resetConnections(
+      keepDiscovery: false,
+      notifyDisconnected: notifyDisconnectedOnReset,
+    );
     _isHost = true;
     _internetDirectMode = true;
     _localPlayerName = playerName ?? 'Player 1';
@@ -375,48 +396,35 @@ class NetplayService {
     _localPlayerId = null;
 
     try {
-      _logInternetDirect('host requesting cloudflare ice');
-      final ice = await CloudflareIceService.generate().timeout(
-        CloudflareIceService.requestTimeout,
-      );
-      _logInternetDirect(
-        'host cloudflare ice servers=${ice.iceServers.length}',
-      );
-      _webrtcHost = InternetDirectWebRtcHost(
-        iceServers: ice.iceServers,
-        onLog: _logInternetDirect,
-      );
-      _logInternetDirect('host creating webrtc offer');
-      final offerSdp = await _webrtcHost!.createOffer().timeout(
-        const Duration(seconds: 20),
-      );
-      _logInternetDirect(
-        'host webrtc offer ready phase=${InternetDirectIcePhase.turn.name} '
-        'sdpBytes=${offerSdp.length}',
-      );
-      _attachWebRtcHostDataListener();
       final signalRoomInfo = roomTemplate.copyWith(
         hostIp: Uri.parse(CloudflareIceService.signalBaseUrl).host,
         port: 443,
+        internetDirect: true,
+        passwordRequired:
+            roomTemplate.passwordRequired ||
+            (password != null && password.isNotEmpty),
       );
-      _logInternetDirect('host publishing offer to worker');
+      _logInternetDirect('host publishing lobby room to worker');
+      final icePrefetch = CloudflareIceService.generate();
       final signalRoomId = reuseInviteCode?.signalRoomId;
-      if (signalRoomId != null && signalRoomId.isNotEmpty) {
-        await CloudflareIceService.updateRoom(
-          roomId: signalRoomId,
-          offerSdp: offerSdp,
-          roomInfo: signalRoomInfo,
-        ).timeout(CloudflareIceService.requestTimeout);
-      }
-      final createdSignalRoomId =
-          signalRoomId ??
-          await CloudflareIceService.createRoom(
-            offerSdp: offerSdp,
-            roomInfo: signalRoomInfo,
-          ).timeout(CloudflareIceService.requestTimeout);
+      final createdSignalRoomId = signalRoomId != null && signalRoomId.isNotEmpty
+          ? await CloudflareIceService.updateRoom(
+                  roomId: signalRoomId,
+                  offerSdp: '',
+                  roomInfo: signalRoomInfo,
+                )
+                .timeout(CloudflareIceService.requestTimeout)
+                .then((_) => signalRoomId)
+          : await CloudflareIceService.createRoom(
+              offerSdp: '',
+              roomInfo: signalRoomInfo,
+              password: password,
+            ).timeout(CloudflareIceService.requestTimeout);
+      await icePrefetch;
       _logInternetDirect('host worker room=$createdSignalRoomId');
       _internetDirectSignalRoomId = createdSignalRoomId;
-      _startInternetDirectAnswerPolling(createdSignalRoomId);
+      _startInternetDirectJoinPolling(createdSignalRoomId);
+      _startInternetDirectHeartbeat(createdSignalRoomId);
 
       _hostedRoom = signalRoomInfo.copyWith(currentPlayers: 1);
       _joinedRoom = null;
@@ -447,6 +455,7 @@ class NetplayService {
   Future<bool> joinInternetDirectRoom(
     InternetDirectCode code, {
     String? playerName,
+    String? password,
   }) async {
     await _resetConnections(keepDiscovery: false);
     _isHost = false;
@@ -459,37 +468,10 @@ class NetplayService {
     _internetDirectInviteCode = code;
 
     try {
-      _logInternetDirect('join loading worker room=${code.signalRoomId}');
-      final signalRoom = await CloudflareIceService.getRoom(
-        code.signalRoomId,
-      ).timeout(CloudflareIceService.requestTimeout);
-      _joinedRoom = signalRoom.roomInfo;
-      _internetDirectInviteCode = code;
       _logInternetDirect('join requesting cloudflare ice');
-      final ice = await CloudflareIceService.generate().timeout(
-        CloudflareIceService.requestTimeout,
-      );
-      _logInternetDirect(
-        'join cloudflare ice servers=${ice.iceServers.length}',
-      );
-
-      _webrtcGuest = InternetDirectWebRtcGuest(
-        iceServers: ice.iceServers,
-        onLog: _logInternetDirect,
-      );
-      _webrtcGuestParser = NetplayStreamParser();
-      _attachWebRtcGuestDataListener();
-
-      _logInternetDirect(
-        'join webrtc worker=${CloudflareIceService.signalBaseUrl} room=${code.signalRoomId}',
-      );
-
-      final connected = await _webrtcGuest!.connect(
-        offerSdp: signalRoom.offerSdp,
-        submitAnswer: (answerSdp) => CloudflareIceService.submitAnswer(
-          roomId: code.signalRoomId,
-          answerSdp: answerSdp,
-        ),
+      final connected = await _establishInternetDirectGuestConnection(
+        code,
+        password: password,
       );
       if (!connected) {
         _logInternetDirect('join webrtc failed');
@@ -497,36 +479,7 @@ class NetplayService {
         return false;
       }
 
-      final completer = Completer<bool>();
-      late StreamSubscription<int> slotSub;
-      Timer? retryTimer;
-      slotSub = onPlayerSlotAssigned.listen((slot) {
-        if (slot > 0 && !completer.isCompleted) {
-          _logInternetDirect('join received slot=$slot');
-          completer.complete(true);
-        }
-      });
-      void sendJoin() {
-        _sendInternetDirect(NetplayMessage.join(playerName: _localPlayerName!));
-        _sendInternetDirect(
-          NetplayMessage.ping(DateTime.now().millisecondsSinceEpoch),
-        );
-      }
-
-      sendJoin();
-      retryTimer = Timer.periodic(const Duration(milliseconds: 400), (_) {
-        if (completer.isCompleted) {
-          return;
-        }
-        sendJoin();
-      });
-
-      final ok = await completer.future.timeout(
-        const Duration(seconds: 12),
-        onTimeout: () => false,
-      );
-      await slotSub.cancel();
-      retryTimer.cancel();
+      final ok = await _waitForJoinSlotAssignment();
       if (!ok) {
         _logInternetDirect('join timeout waiting JOIN_ACK over webrtc');
         await _resetConnections();
@@ -541,6 +494,129 @@ class NetplayService {
       await _resetConnections();
       return false;
     }
+  }
+
+  Future<bool> _establishInternetDirectGuestConnection(
+    InternetDirectCode code, {
+    String? password,
+  }) async {
+    for (var attempt = 1; attempt <= 5; attempt += 1) {
+      if (attempt > 1) {
+        await Future<void>.delayed(Duration(milliseconds: 500 * attempt));
+        _logInternetDirect('join retry creating request attempt=$attempt');
+      }
+
+      _logInternetDirect(
+        'join creating request room=${code.signalRoomId} attempt=$attempt',
+      );
+      final parallel = await Future.wait<Object>([
+        CloudflareIceService.generate().timeout(
+          CloudflareIceService.requestTimeout,
+        ),
+        CloudflareIceService.createJoinRequest(
+          roomId: code.signalRoomId,
+          password: password,
+          playerName: _localPlayerName,
+        ).timeout(CloudflareIceService.requestTimeout),
+      ]);
+      final ice = parallel[0] as CloudflareIceCredentials;
+      final ticket = parallel[1] as InternetJoinTicket;
+      _joinedRoom = ticket.roomInfo;
+      _internetDirectInviteCode = code;
+      _logInternetDirect(
+        'join ice servers=${ice.iceServers.length} join=${ticket.joinId}',
+      );
+
+      InternetSignalRoom? signalRoom;
+      final offerDeadline = DateTime.now().add(const Duration(seconds: 24));
+      while (DateTime.now().isBefore(offerDeadline)) {
+        signalRoom = await CloudflareIceService.getJoinOffer(
+          roomId: code.signalRoomId,
+          joinId: ticket.joinId,
+        ).timeout(CloudflareIceService.pollRequestTimeout);
+        if (signalRoom != null) {
+          _joinedRoom = signalRoom.roomInfo;
+          break;
+        }
+        await Future<void>.delayed(CloudflareIceService.signalPollInterval);
+      }
+      if (signalRoom == null) {
+        _logInternetDirect('join timeout waiting offer join=${ticket.joinId}');
+        continue;
+      }
+
+      await _resetInternetDirectGuestPeer();
+      _webrtcGuest = InternetDirectWebRtcGuest(
+        iceServers: ice.iceServers,
+        onLog: _logInternetDirect,
+      );
+      _webrtcGuestParser = NetplayStreamParser();
+      _attachWebRtcGuestDataListener();
+
+      _logInternetDirect(
+        'join webrtc worker=${CloudflareIceService.signalBaseUrl} '
+        'room=${code.signalRoomId} join=${ticket.joinId} attempt=$attempt',
+      );
+
+      final connected = await _webrtcGuest!.connect(
+        offerSdp: signalRoom.offerSdp,
+        submitAnswer: (answerSdp) => CloudflareIceService.submitJoinAnswer(
+          roomId: code.signalRoomId,
+          joinId: ticket.joinId,
+          answerSdp: answerSdp,
+        ),
+      );
+      if (connected) {
+        unawaited(
+          CloudflareIceService.completeJoin(
+            roomId: code.signalRoomId,
+            joinId: ticket.joinId,
+          ),
+        );
+        return true;
+      }
+      _logInternetDirect('join webrtc attempt=$attempt failed');
+    }
+    return false;
+  }
+
+  Future<bool> _waitForJoinSlotAssignment({
+    Duration timeout = const Duration(seconds: 12),
+  }) async {
+    if (_localPlayerSlot > 0) {
+      return true;
+    }
+
+    final completer = Completer<bool>();
+    late StreamSubscription<int> slotSub;
+    Timer? retryTimer;
+    slotSub = onPlayerSlotAssigned.listen((slot) {
+      if (slot > 0 && !completer.isCompleted) {
+        _logInternetDirect('join received slot=$slot');
+        completer.complete(true);
+      }
+    });
+    void sendJoin() {
+      if (_localPlayerName == null) {
+        return;
+      }
+      _sendInternetDirect(NetplayMessage.join(playerName: _localPlayerName!));
+      _sendInternetDirect(
+        NetplayMessage.ping(DateTime.now().millisecondsSinceEpoch),
+      );
+    }
+
+    sendJoin();
+    retryTimer = Timer.periodic(const Duration(milliseconds: 200), (_) {
+      if (!completer.isCompleted) {
+        sendJoin();
+      }
+    });
+
+    final ok = await completer.future.timeout(timeout, onTimeout: () => false);
+    await slotSub.cancel();
+    retryTimer.cancel();
+    return ok;
   }
 
   void startDiscovery() {
@@ -857,7 +933,7 @@ class NetplayService {
           total: bytes.length,
           chunk: chunk,
         );
-        final sent = _webrtcHost?.send(packet) ?? false;
+        final sent = _sendInternetDirectBytesToPeer(peerId, packet);
         if (!sent) {
           debugPrint('[Netplay] ROM send failed at offset=$offset');
           return false;
@@ -1068,7 +1144,35 @@ class NetplayService {
     _publishGameSpeed(speed, broadcast: false);
   }
 
-  /// Host left the game UI — hand off hosting if others remain, else disband.
+  /// Host left the game UI but stays in the team room — return to lobby, keep host.
+  void exitGameToTeamLobby() {
+    if (!_isHost) {
+      return;
+    }
+
+    _stopLockstep();
+    _awaitingReplacement = false;
+    for (final peer in _peers.values) {
+      if (peer.playerSlot > 0) {
+        peer.isReady = false;
+      }
+    }
+    if (_hostedRoom != null) {
+      _hostedRoom = _hostedRoom!.copyWith(
+        inGame: false,
+        awaitingReplacement: false,
+      );
+    }
+    _setStatus(NetplayStatus.inLobby);
+    emu_loop.clearInputs();
+    _gameSpeed = 1;
+    _broadcastRoomState();
+    if (_internetDirectMode) {
+      unawaited(_publishInternetDirectRoomState());
+    }
+  }
+
+  /// Host left the team room or crashed — hand off hosting if others remain.
   void exitGameAndHandoffHost() {
     if (!_isHost) {
       return;
@@ -1119,6 +1223,7 @@ class NetplayService {
         awaitingReplacement: false,
       );
     }
+    _awaitingReplacement = false;
     if (_status == NetplayStatus.gaming) {
       _setStatus(NetplayStatus.inLobby);
     }
@@ -1190,7 +1295,10 @@ class NetplayService {
     for (var offset = 0; offset < bytes.length; offset += chunkSize) {
       final end = min(offset + chunkSize, bytes.length);
       if (_internetDirectMode) {
-        _webrtcHost?.send(Uint8List.sublistView(bytes, offset, end));
+        _sendInternetDirectBytesToPeer(
+          peerId,
+          Uint8List.sublistView(bytes, offset, end),
+        );
         await Future<void>.delayed(const Duration(milliseconds: 40));
         continue;
       }
@@ -1506,22 +1614,26 @@ class NetplayService {
     _disbandRoom();
   }
 
-  void _disbandRoom() {
+  void _disbandRoom({bool notifyDisconnected = false}) {
     if (!_isHost) {
       return;
     }
+    if (_disbandingRoom) {
+      return;
+    }
+    _disbandingRoom = true;
     final roomSnapshot = _hostedRoom;
     _udpAnnounceTimer?.cancel();
     _udpAnnounceTimer = null;
-    unawaited(_disposeInternetDirectWebRtc());
-    _internetDirectMode = false;
     _closeUdpResponder();
     _broadcast(NetplayMessage.leave());
     unawaited(_repeatRoomClosedAnnouncement(roomSnapshot));
     unawaited(
       Future<void>(() async {
         await Future<void>.delayed(const Duration(milliseconds: 300));
-        await _resetConnections(notifyDisconnected: false);
+        await _disposeInternetDirectWebRtc();
+        _internetDirectMode = false;
+        await _resetConnections(notifyDisconnected: notifyDisconnected);
       }),
     );
   }
@@ -1564,21 +1676,24 @@ class NetplayService {
       );
     }
 
-    _sendToPeer(
-      peerId,
-      NetplayMessage.hostPromote(
-        room: room
-            .copyWith(
-              inGame: resumePlay,
-              awaitingReplacement: resumePlay,
-              currentPlayers: 1,
-            )
-            .toJson(),
-        playerName: peer.playerName,
-        gameSpeed: _gameSpeed,
-        internetDirectInvite: _internetDirectInviteCode?.toJson(),
-      ),
+    final promote = NetplayMessage.hostPromote(
+      room: room
+          .copyWith(
+            inGame: resumePlay,
+            awaitingReplacement: resumePlay,
+            currentPlayers: 1,
+          )
+          .toJson(),
+      playerName: peer.playerName,
+      gameSpeed: _gameSpeed,
+      internetDirectInvite: _internetDirectInviteCode?.toJson(),
+      targetPlayerId: peerId,
     );
+    if (_internetDirectMode) {
+      _broadcast(promote);
+    } else {
+      _sendToPeer(peerId, promote);
+    }
 
     await Future<void>.delayed(const Duration(milliseconds: 150));
     if (_internetDirectMode) {
@@ -1588,6 +1703,17 @@ class NetplayService {
   }
 
   Future<void> _handleHostPromote(NetplayMessage message) async {
+    final targetPlayerId = message.payload['targetPlayerId'] as String?;
+    if (targetPlayerId != null &&
+        targetPlayerId.isNotEmpty &&
+        targetPlayerId != _localPlayerId) {
+      if (_internetDirectMode) {
+        await _reconnectInternetDirectAfterHostPromote(message);
+        return;
+      }
+      await _resetConnections(keepDiscovery: false, notifyDisconnected: true);
+      return;
+    }
     final roomRaw = message.payload['room'];
     if (roomRaw is! Map) {
       return;
@@ -1619,6 +1745,7 @@ class NetplayService {
                 roomTemplate: roomTemplate,
                 playerName: playerName,
                 reuseInviteCode: internetInvite,
+                notifyDisconnectedOnReset: false,
               ) !=
               null
         : await createRoom(roomTemplate: roomTemplate, playerName: playerName);
@@ -1656,7 +1783,16 @@ class NetplayService {
     if (notifyHost) {
       _safeSendToHost(NetplayMessage.leave());
     }
-    unawaited(_resetConnections(notifyDisconnected: false));
+    if (_internetDirectMode && notifyHost) {
+      unawaited(
+        Future<void>(() async {
+          await Future<void>.delayed(const Duration(milliseconds: 180));
+          await _resetConnections(notifyDisconnected: false);
+        }),
+      );
+    } else {
+      unawaited(_resetConnections(notifyDisconnected: false));
+    }
   }
 
   /// 被动断开（房主解散/连接已断）时只清理本地状态，不再通知对端。
@@ -1695,111 +1831,208 @@ class NetplayService {
     _statusController.add(status);
   }
 
-  void _attachWebRtcHostDataListener() {
-    final host = _webrtcHost;
-    if (host == null) {
-      return;
-    }
-    _webrtcDataSub?.cancel();
-    _webrtcDataSub = host.onData.listen((data) {
-      final existingParser = _peers[_internetDirectPeerId]?.parser;
+  String _internetPeerIdForJoin(String joinId) => 'webrtc-$joinId';
+
+  void _attachWebRtcHostDataListener({
+    required String peerId,
+    required InternetDirectWebRtcHost host,
+  }) {
+    unawaited(_webrtcHostPeers[peerId]?.dispose());
+    late final _InternetDirectHostPeer holder;
+    final dataSub = host.onData.listen((data) {
+      final existingParser = _peers[peerId]?.parser;
       if (existingParser == null || !existingParser.isReceivingBinary) {
-        if (_handleInternetDirectBinary(_internetDirectPeerId, data)) {
+        if (_handleInternetDirectBinary(peerId, data)) {
           return;
         }
       }
       _peers.putIfAbsent(
-        _internetDirectPeerId,
-        () => _PeerConnection(
-          id: _internetDirectPeerId,
-          parser: NetplayStreamParser(),
-        ),
+        peerId,
+        () => _PeerConnection(id: peerId, parser: NetplayStreamParser()),
       );
-      _handlePeerData(_peers[_internetDirectPeerId]!, data);
+      _handlePeerData(_peers[peerId]!, data);
     });
-    _webrtcRealtimeDataSub?.cancel();
-    _webrtcRealtimeDataSub = host.onRealtimeData.listen((data) {
-      _handleInternetDirectBinary(_internetDirectPeerId, data);
+    final realtimeSub = host.onRealtimeData.listen((data) {
+      _handleInternetDirectBinary(peerId, data);
     });
-    _webrtcConnectedSub?.cancel();
-    _webrtcConnectedSub = host.onConnected.listen((connected) {
+    final connectedSub = host.onConnected.listen((connected) {
       if (!connected && _isHost && _internetDirectMode) {
-        _handlePeerClosed(_internetDirectPeerId);
+        _handlePeerClosed(peerId);
       }
     });
+    holder = _InternetDirectHostPeer(
+      id: peerId,
+      host: host,
+      dataSub: dataSub,
+      realtimeSub: realtimeSub,
+      connectedSub: connectedSub,
+    );
+    _webrtcHostPeers[peerId] = holder;
   }
 
-  Future<void> _refreshInternetDirectOffer() async {
-    if (_refreshingInternetDirectOffer || !_isHost || !_internetDirectMode) {
+  void _startInternetDirectJoinPolling(String signalRoomId) {
+    _internetDirectJoinPollTimer?.cancel();
+    if (!_isHost || !_internetDirectMode) {
       return;
     }
-    final signalRoomId = _internetDirectSignalRoomId;
-    final room = _hostedRoom;
-    if (signalRoomId == null || signalRoomId.isEmpty || room == null) {
-      return;
-    }
-    _refreshingInternetDirectOffer = true;
-    try {
-      _logInternetDirect('host refreshing worker offer room=$signalRoomId');
-      final host =
-          _webrtcHost ??
-          InternetDirectWebRtcHost(
-            iceServers: (await CloudflareIceService.generate()).iceServers,
-            onLog: _logInternetDirect,
-          );
-      _webrtcHost = host;
-      final offerSdp = await host.createOffer().timeout(
-        const Duration(seconds: 20),
-      );
-      _attachWebRtcHostDataListener();
-      await CloudflareIceService.updateRoom(
-        roomId: signalRoomId,
-        offerSdp: offerSdp,
-        roomInfo: room,
-      ).timeout(CloudflareIceService.requestTimeout);
-      _startInternetDirectAnswerPolling(signalRoomId);
-      _logInternetDirect('host refreshed worker offer');
-    } catch (e) {
-      _logInternetDirect('host refresh offer failed: $e');
-    } finally {
-      _refreshingInternetDirectOffer = false;
-    }
-  }
 
-  void _startInternetDirectAnswerPolling(String signalRoomId) {
-    _internetDirectAnswerPollTimer?.cancel();
-    var applying = false;
     Future<void> pollOnce() async {
-      if (applying || !_internetDirectMode || !_isHost) {
+      if (_internetDirectJoinInFlight ||
+          !_isHost ||
+          !_internetDirectMode ||
+          signalRoomId != _internetDirectSignalRoomId) {
         return;
       }
-      applying = true;
+      final room = _hostedRoom;
+      if (room == null ||
+          _peers.values.where((peer) => peer.playerSlot > 0).length >=
+              room.maxPlayers - 1) {
+        return;
+      }
+      _internetDirectJoinInFlight = true;
       try {
-        final answer = await CloudflareIceService.getAnswer(signalRoomId);
-        if (answer == null || answer.isEmpty) {
-          return;
-        }
-        _logInternetDirect('host received answer via worker');
-        _internetDirectAnswerPollTimer?.cancel();
-        _internetDirectAnswerPollTimer = null;
-        final ok = await _webrtcHost?.applyAnswer(answer) ?? false;
-        if (!ok) {
-          _logInternetDirect('host apply answer failed');
-        } else {
-          _startPingTimer();
+        final joins = await CloudflareIceService.listJoinRequests(
+          roomId: signalRoomId,
+        ).timeout(const Duration(seconds: 8));
+        for (final join in joins) {
+          if (_internetDirectHandledJoinIds.contains(join.joinId)) {
+            continue;
+          }
+          _internetDirectHandledJoinIds.add(join.joinId);
+          await _handleInternetDirectJoinRequest(signalRoomId, join);
+          break;
         }
       } catch (e) {
-        _logInternetDirect('host answer poll failed: $e');
+        _logInternetDirect('host join poll failed: $e');
       } finally {
-        applying = false;
+        _internetDirectJoinInFlight = false;
       }
     }
 
     unawaited(pollOnce());
-    _internetDirectAnswerPollTimer = Timer.periodic(
-      const Duration(milliseconds: 700),
+    _internetDirectJoinPollTimer = Timer.periodic(
+      CloudflareIceService.hostJoinPollInterval,
       (_) => unawaited(pollOnce()),
     );
+  }
+
+  Future<void> _handleInternetDirectJoinRequest(
+    String signalRoomId,
+    InternetJoinRequest join,
+  ) async {
+    final room = _hostedRoom;
+    if (room == null || !_isHost || !_internetDirectMode) {
+      return;
+    }
+    _logInternetDirect('host preparing offer join=${join.joinId}');
+    try {
+      final peerId = _internetPeerIdForJoin(join.joinId);
+      final ice = await CloudflareIceService.generate();
+      await _resetInternetDirectHostPeer(peerId);
+      final host = InternetDirectWebRtcHost(
+        iceServers: ice.iceServers,
+        onLog: _logInternetDirect,
+      );
+      final offerSdp = await host.createOffer().timeout(
+        const Duration(seconds: 20),
+      );
+      _attachWebRtcHostDataListener(peerId: peerId, host: host);
+      await CloudflareIceService.submitJoinOffer(
+        roomId: signalRoomId,
+        joinId: join.joinId,
+        offerSdp: offerSdp,
+      ).timeout(CloudflareIceService.requestTimeout);
+
+      final deadline = DateTime.now().add(const Duration(seconds: 24));
+      String? answer;
+      while (DateTime.now().isBefore(deadline)) {
+        answer = await CloudflareIceService.getJoinAnswer(
+          roomId: signalRoomId,
+          joinId: join.joinId,
+        ).timeout(CloudflareIceService.pollRequestTimeout);
+        if (answer != null && answer.isNotEmpty) {
+          break;
+        }
+        await Future<void>.delayed(CloudflareIceService.signalPollInterval);
+      }
+      if (answer == null || answer.isEmpty) {
+        _logInternetDirect('host timeout waiting answer join=${join.joinId}');
+        _internetDirectHandledJoinIds.remove(join.joinId);
+        await _resetInternetDirectHostPeer(peerId);
+        return;
+      }
+
+      final ok = await host.applyAnswer(answer);
+      if (!ok) {
+        _logInternetDirect('host apply join answer failed join=${join.joinId}');
+        _internetDirectHandledJoinIds.remove(join.joinId);
+        await _resetInternetDirectHostPeer(peerId);
+        return;
+      }
+      _logInternetDirect('host join connected join=${join.joinId}');
+      _startPingTimer();
+      unawaited(
+        CloudflareIceService.completeJoin(
+          roomId: signalRoomId,
+          joinId: join.joinId,
+        ),
+      );
+    } catch (e) {
+      _logInternetDirect('host handle join failed join=${join.joinId}: $e');
+      _internetDirectHandledJoinIds.remove(join.joinId);
+      await _resetInternetDirectHostPeer(_internetPeerIdForJoin(join.joinId));
+    }
+  }
+
+  void _startInternetDirectHeartbeat(String signalRoomId) {
+    _internetDirectHeartbeatTimer?.cancel();
+    if (!_isHost || !_internetDirectMode) {
+      return;
+    }
+
+    Future<void> pulse() async {
+      final room = _hostedRoom;
+      if (!_isHost ||
+          !_internetDirectMode ||
+          room == null ||
+          signalRoomId != _internetDirectSignalRoomId) {
+        return;
+      }
+      try {
+        await CloudflareIceService.heartbeatRoom(
+          roomId: signalRoomId,
+          roomInfo: room,
+        ).timeout(CloudflareIceService.requestTimeout);
+      } catch (e) {
+        _logInternetDirect('host heartbeat failed: $e');
+      }
+    }
+
+    unawaited(pulse());
+    _internetDirectHeartbeatTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => unawaited(pulse()),
+    );
+  }
+
+  Future<void> _publishInternetDirectRoomState() async {
+    final signalRoomId = _internetDirectSignalRoomId;
+    final room = _hostedRoom;
+    if (!_isHost ||
+        !_internetDirectMode ||
+        signalRoomId == null ||
+        signalRoomId.isEmpty ||
+        room == null) {
+      return;
+    }
+    try {
+      await CloudflareIceService.heartbeatRoom(
+        roomId: signalRoomId,
+        roomInfo: room,
+      ).timeout(const Duration(seconds: 8));
+    } catch (e) {
+      _logInternetDirect('host publish room state failed: $e');
+    }
   }
 
   void _attachWebRtcGuestDataListener() {
@@ -1811,18 +2044,19 @@ class NetplayService {
     _webrtcDataSub?.cancel();
     _webrtcDataSub = guest.onData.listen((data) {
       if (!parser.isReceivingBinary) {
-        if (_handleInternetDirectBinary('host', data)) {
+        if (_handleInternetDirectBinary(internetHostPeerId, data)) {
           return;
         }
       }
       parser.feed(
         data,
-        onMessage: (message) => _handleMessage('host', message),
+        onMessage: (message) =>
+            _handleMessage(internetHostPeerId, message),
         onRomComplete: (bytes, beginMeta) {
           debugPrint(
             '[Netplay] guest ROM complete via parser bytes=${bytes.length}',
           );
-          _handleRomComplete('host', bytes, beginMeta);
+          _handleRomComplete(internetHostPeerId, bytes, beginMeta);
         },
         onRomProgress: (received, total, _) {
           _emitRomReceiveProgress(received, total);
@@ -1838,7 +2072,13 @@ class NetplayService {
     });
     _webrtcRealtimeDataSub?.cancel();
     _webrtcRealtimeDataSub = guest.onRealtimeData.listen((data) {
-      _handleInternetDirectBinary('host', data);
+      _handleInternetDirectBinary(internetHostPeerId, data);
+    });
+    _webrtcConnectedSub?.cancel();
+    _webrtcConnectedSub = guest.onConnected.listen((connected) {
+      if (!connected && !_isHost && _internetDirectMode) {
+        _handlePeerClosed(internetHostPeerId);
+      }
     });
   }
 
@@ -1847,7 +2087,9 @@ class NetplayService {
         _encodeInternetDirectBinary(message) ??
         NetplayLineCodec.encode(message);
     if (_isHost) {
-      _webrtcHost?.send(bytes);
+      for (final peerId in _peers.keys.toList()) {
+        _sendInternetDirectBytesToPeer(peerId, bytes);
+      }
     } else {
       _webrtcGuest?.send(bytes);
     }
@@ -1860,10 +2102,38 @@ class NetplayService {
       return;
     }
     if (_isHost) {
-      _webrtcHost?.sendRealtime(bytes);
+      for (final peerId in _peers.keys.toList()) {
+        _sendInternetDirectBytesToPeer(peerId, bytes, realtime: true);
+      }
     } else {
       _webrtcGuest?.sendRealtime(bytes);
     }
+  }
+
+  bool _sendInternetDirectToPeer(String peerId, NetplayMessage message) {
+    final bytes =
+        _encodeInternetDirectBinary(message) ??
+        NetplayLineCodec.encode(message);
+    return _sendInternetDirectBytesToPeer(
+      peerId,
+      bytes,
+      realtime: _isRealtimeNetplayMessage(message),
+    );
+  }
+
+  bool _sendInternetDirectBytesToPeer(
+    String peerId,
+    List<int> bytes, {
+    bool realtime = false,
+  }) {
+    final host = _webrtcHostPeers[peerId]?.host;
+    if (host == null) {
+      return false;
+    }
+    if (realtime) {
+      return host.sendRealtime(bytes);
+    }
+    return host.send(bytes);
   }
 
   bool _handleInternetDirectBinary(String peerId, Uint8List data) {
@@ -1876,6 +2146,38 @@ class NetplayService {
     }
     _handleMessage(peerId, message);
     return true;
+  }
+
+  Future<void> _resetInternetDirectGuestPeer() async {
+    await _webrtcDataSub?.cancel();
+    _webrtcDataSub = null;
+    await _webrtcRealtimeDataSub?.cancel();
+    _webrtcRealtimeDataSub = null;
+    await _webrtcConnectedSub?.cancel();
+    _webrtcConnectedSub = null;
+    final guest = _webrtcGuest;
+    _webrtcGuest = null;
+    _webrtcGuestParser = null;
+    if (guest != null) {
+      await guest.dispose();
+    }
+  }
+
+  Future<void> _resetInternetDirectHostPeer(String peerId) async {
+    final hostPeer = _webrtcHostPeers.remove(peerId);
+    _peers.remove(peerId);
+    if (hostPeer != null) {
+      await hostPeer.dispose();
+    }
+  }
+
+  Future<void> _resetInternetDirectHostPeers() async {
+    final peers = List<_InternetDirectHostPeer>.from(_webrtcHostPeers.values);
+    _webrtcHostPeers.clear();
+    for (final peer in peers) {
+      _peers.remove(peer.id);
+      await peer.dispose();
+    }
   }
 
   Uint8List _encodeInternetDirectRomChunk({
@@ -2068,9 +2370,20 @@ class NetplayService {
     if (!_internetDirectMode) {
       return;
     }
-    final stats = _isHost
-        ? await _webrtcHost?.getStats()
-        : await _webrtcGuest?.getStats();
+    InternetDirectStats? stats;
+    if (_isHost) {
+      for (final hostPeer in _webrtcHostPeers.values) {
+        final candidate = await hostPeer.host.getStats();
+        if (candidate?.rttMs == null) {
+          continue;
+        }
+        if (stats == null || candidate!.rttMs! > stats.rttMs!) {
+          stats = candidate;
+        }
+      }
+    } else {
+      stats = await _webrtcGuest?.getStats();
+    }
     if (stats == null || stats.rttMs == null) {
       return;
     }
@@ -2116,8 +2429,12 @@ class NetplayService {
   }
 
   Future<void> _disposeInternetDirectWebRtc() async {
-    _internetDirectAnswerPollTimer?.cancel();
-    _internetDirectAnswerPollTimer = null;
+    _internetDirectHeartbeatTimer?.cancel();
+    _internetDirectHeartbeatTimer = null;
+    _internetDirectJoinPollTimer?.cancel();
+    _internetDirectJoinPollTimer = null;
+    _internetDirectJoinInFlight = false;
+    _internetDirectHandledJoinIds.clear();
     final signalRoomId = _internetDirectSignalRoomId;
     _internetDirectSignalRoomId = null;
     await _webrtcDataSub?.cancel();
@@ -2127,8 +2444,7 @@ class NetplayService {
     await _webrtcConnectedSub?.cancel();
     _webrtcConnectedSub = null;
     _webrtcGuestParser = null;
-    await _webrtcHost?.dispose();
-    _webrtcHost = null;
+    await _resetInternetDirectHostPeers();
     await _webrtcGuest?.dispose();
     _webrtcGuest = null;
     if (signalRoomId != null && signalRoomId.isNotEmpty) {
@@ -2186,6 +2502,7 @@ class NetplayService {
     _lastLockstepStartConfig = null;
     _exitingForReplacement = false;
     _hostPromotionExit = false;
+    _disbandingRoom = false;
     _stashedResumeSaveState = null;
     _receivedResumeSaveState = null;
     _stopLockstep();
@@ -2283,6 +2600,7 @@ class NetplayService {
   }
 
   void _applyRoomState(NetplayRoomState state) {
+    final wasGaming = _status == NetplayStatus.gaming;
     _roomState = state;
     if (_hostedRoom != null) {
       _hostedRoom = _hostedRoom!.copyWith(
@@ -2297,6 +2615,12 @@ class NetplayService {
         inGame: state.inGame,
         awaitingReplacement: state.awaitingReplacement,
       );
+    }
+    if (!_isHost && wasGaming && (state.awaitingReplacement || !state.inGame)) {
+      if (_status == NetplayStatus.gaming) {
+        _setStatus(NetplayStatus.inLobby);
+      }
+      _gameplayPeerLeftController.add(null);
     }
     _roomStateController.add(state);
   }
@@ -2513,7 +2837,7 @@ class NetplayService {
         _handleFrameBundle(message);
       case NetplayMessageType.gameExit:
         if (_isHost && _status == NetplayStatus.gaming) {
-          _handleGameplayPeerLeft(peerId);
+          _handleGameplayPeerExit(peerId);
         }
       case NetplayMessageType.gameSpeed:
         final speed = (message.payload['speed'] as num?)?.toInt() ?? 1;
@@ -2534,7 +2858,11 @@ class NetplayService {
       case NetplayMessageType.ping:
         final sentAt = message.payload['sentAt'] as int? ?? 0;
         if (_internetDirectMode) {
-          _sendInternetDirect(NetplayMessage.pong(sentAt));
+          if (_isHost) {
+            _sendToPeer(peerId, NetplayMessage.pong(sentAt));
+          } else {
+            _sendInternetDirect(NetplayMessage.pong(sentAt));
+          }
         } else {
           _sendToPeer(peerId, NetplayMessage.pong(sentAt));
         }
@@ -2545,7 +2873,7 @@ class NetplayService {
           _localLatency = latency;
         }
         final peer = _peers[peerId];
-        if (peer != null && !_internetDirectMode) {
+        if (peer != null) {
           peer.latency = latency;
         }
         _playerUpdatedController.add(
@@ -2798,7 +3126,151 @@ class NetplayService {
     }
   }
 
+  bool _isHostPeer(String peerId) {
+    if (_internetDirectMode && !_isHost) {
+      return peerId == internetHostPeerId;
+    }
+    return peerId == _joinedRoom?.hostIp;
+  }
+
+  bool _shouldSelfPromoteAfterHostGone() {
+    final mySlot = _localPlayerSlot;
+    if (mySlot <= 0) {
+      return false;
+    }
+    final state = _roomState;
+    if (state == null) {
+      return true;
+    }
+    var minGuestSlot = 999;
+    for (final player in state.players) {
+      if (!player.isHost && player.slot > 0 && player.slot < minGuestSlot) {
+        minGuestSlot = player.slot;
+      }
+    }
+    return mySlot == minGuestSlot;
+  }
+
+  Future<void> _rejoinInternetDirectAfterHostLost() async {
+    final invite = _internetDirectInviteCode;
+    if (invite == null || _isHost) {
+      await _resetConnections();
+      return;
+    }
+    if (_hostPromotionPending) {
+      return;
+    }
+
+    final playerName = _localPlayerName ?? 'Player 2';
+    final savedRoom = _joinedRoom;
+    _internetDirectMode = true;
+    _isHost = false;
+    _localPlayerName = playerName;
+    _joinedRoom = savedRoom;
+
+    for (var attempt = 1; attempt <= 8; attempt++) {
+      await Future<void>.delayed(Duration(milliseconds: 400 * attempt));
+      if (_isHost || _hostPromotionPending) {
+        return;
+      }
+      _logInternetDirect('rejoin after host lost attempt=$attempt');
+      try {
+        final connected = await _establishInternetDirectGuestConnection(invite);
+        if (!connected) {
+          continue;
+        }
+        final ok = await _waitForJoinSlotAssignment();
+        if (ok) {
+          _setStatus(NetplayStatus.inLobby);
+          _connectionStateController.add(true);
+          _startPingTimer();
+          return;
+        }
+      } catch (e) {
+        _logInternetDirect('rejoin after host lost failed: $e');
+      }
+    }
+    await _resetConnections();
+  }
+
+  Future<void> _reconnectInternetDirectAfterHostPromote(
+    NetplayMessage message,
+  ) async {
+    final inviteRaw = message.payload['internetDirectInvite'];
+    if (inviteRaw is! Map) {
+      await _resetConnections(notifyDisconnected: true);
+      return;
+    }
+    final invite = InternetDirectCode.fromJson(
+      Map<String, dynamic>.from(inviteRaw),
+    );
+    if (invite == null) {
+      await _resetConnections(notifyDisconnected: true);
+      return;
+    }
+    final roomRaw = message.payload['room'];
+    if (roomRaw is! Map) {
+      await _resetConnections(notifyDisconnected: true);
+      return;
+    }
+
+    final parsed = RoomInfo.fromJson(
+      Map<String, dynamic>.from(roomRaw),
+      hostIp: Uri.parse(CloudflareIceService.signalBaseUrl).host,
+    );
+    final wasGaming = _status == NetplayStatus.gaming;
+    final playerName = _localPlayerName ?? 'Player 2';
+    final resumeSave = _receivedResumeSaveState;
+
+    _hostPromotionPending = true;
+    try {
+      await _resetInternetDirectGuestPeer();
+      _peers.clear();
+      _localPlayerSlot = 0;
+      _localPlayerId = null;
+      _isHost = false;
+      _internetDirectMode = true;
+      _internetDirectInviteCode = invite;
+      _joinedRoom = parsed;
+      _awaitingReplacement = parsed.awaitingReplacement;
+      _localPlayerName = playerName;
+
+      await Future<void>.delayed(const Duration(milliseconds: 900));
+
+      final connected = await _establishInternetDirectGuestConnection(invite);
+      if (!connected) {
+        await _resetConnections(notifyDisconnected: true);
+        return;
+      }
+      final ok = await _waitForJoinSlotAssignment();
+      if (!ok) {
+        await _resetConnections(notifyDisconnected: true);
+        return;
+      }
+      _setStatus(NetplayStatus.inLobby);
+      _connectionStateController.add(true);
+      _startPingTimer();
+      if (resumeSave != null && resumeSave.isNotEmpty) {
+        _receivedResumeSaveState = Uint8List.fromList(resumeSave);
+      }
+      if (wasGaming && parsed.awaitingReplacement) {
+        _gameplayPeerLeftController.add(null);
+      }
+    } finally {
+      _hostPromotionPending = false;
+    }
+  }
+
   void _handlePeerClosed(String peerId) {
+    if (_disbandingRoom) {
+      return;
+    }
+    if (_isHost && _internetDirectMode) {
+      final hostPeer = _webrtcHostPeers.remove(peerId);
+      if (hostPeer != null) {
+        unawaited(hostPeer.dispose());
+      }
+    }
     if (_isHost && _status == NetplayStatus.gaming) {
       _handleGameplayPeerLeft(peerId);
       return;
@@ -2809,12 +3281,100 @@ class NetplayService {
       _syncHostedRoomCounts();
       _broadcastRoomState();
       if (_internetDirectMode) {
-        unawaited(_refreshInternetDirectOffer());
+        unawaited(_publishInternetDirectRoomState());
       }
     }
-    if (!_isHost && peerId == _joinedRoom?.hostIp && !_hostPromotionPending) {
-      unawaited(_resetConnections());
+    if (!_isHost && _isHostPeer(peerId) && !_hostPromotionPending) {
+      if (_internetDirectMode) {
+        unawaited(_promoteInternetDirectSelfAfterHostGone());
+      } else {
+        unawaited(_resetConnections());
+      }
     }
+  }
+
+  Future<void> _promoteInternetDirectSelfAfterHostGone() async {
+    if (_isHost || _hostPromotionPending) {
+      return;
+    }
+    final invite = _internetDirectInviteCode;
+    final joined = _joinedRoom;
+    if (invite == null || joined == null) {
+      await _resetConnections();
+      return;
+    }
+    if (!_shouldSelfPromoteAfterHostGone()) {
+      await _rejoinInternetDirectAfterHostLost();
+      return;
+    }
+
+    _hostPromotionPending = true;
+    try {
+      final resumePlay =
+          _status == NetplayStatus.gaming ||
+          joined.inGame ||
+          _awaitingReplacement;
+      final roomTemplate = joined.copyWith(
+        currentPlayers: 1,
+        inGame: resumePlay,
+        awaitingReplacement: resumePlay,
+      );
+      final playerName = _localPlayerName ?? 'Player 1';
+      final resumeSave = _receivedResumeSaveState;
+      await _resetConnections(keepDiscovery: false, notifyDisconnected: false);
+      final ok =
+          await createInternetDirectRoom(
+            roomTemplate: roomTemplate,
+            playerName: playerName,
+            reuseInviteCode: invite,
+            notifyDisconnectedOnReset: false,
+          ) !=
+          null;
+      if (!ok) {
+        return;
+      }
+      _awaitingReplacement = roomTemplate.awaitingReplacement;
+      if (_hostedRoom != null && roomTemplate.awaitingReplacement) {
+        _hostedRoom = _hostedRoom!.copyWith(
+          inGame: roomTemplate.inGame,
+          awaitingReplacement: true,
+        );
+        _broadcastRoomState();
+      }
+      if (resumeSave != null && resumeSave.isNotEmpty) {
+        _stashedResumeSaveState = Uint8List.fromList(resumeSave);
+      }
+      enterLobby();
+      final hosted = _hostedRoom;
+      if (hosted != null) {
+        _hostPromotedController.add(hosted);
+      }
+    } finally {
+      _hostPromotionPending = false;
+    }
+  }
+
+  void _handleGameplayPeerExit(String peerId) {
+    final peer = _peers[peerId];
+    if (peer != null) {
+      peer.isReady = false;
+    }
+    _stopLockstep();
+    _awaitingReplacement = false;
+    if (_hostedRoom != null) {
+      _hostedRoom = _hostedRoom!.copyWith(
+        inGame: false,
+        awaitingReplacement: false,
+      );
+    }
+    if (_status == NetplayStatus.gaming) {
+      _setStatus(NetplayStatus.inLobby);
+    }
+    _broadcastRoomState();
+    if (_internetDirectMode) {
+      unawaited(_publishInternetDirectRoomState());
+    }
+    _gameplayPeerLeftController.add(null);
   }
 
   void _handleGameplayPeerLeft(String peerId) {
@@ -2833,15 +3393,16 @@ class NetplayService {
       _setStatus(NetplayStatus.inLobby);
     }
     _broadcastRoomState();
+    if (_internetDirectMode) {
+      unawaited(_publishInternetDirectRoomState());
+    }
     _gameplayPeerLeftController.add(null);
   }
 
   void _broadcast(NetplayMessage message) {
     if (_internetDirectMode && _isHost) {
-      if (_isRealtimeNetplayMessage(message)) {
-        _sendInternetDirectRealtime(message);
-      } else {
-        _sendInternetDirect(message);
+      for (final peer in _peers.values) {
+        _sendInternetDirectToPeer(peer.id, message);
       }
       return;
     }
@@ -2860,12 +3421,11 @@ class NetplayService {
       return;
     }
     if (_internetDirectMode) {
-      if (excludedPeerId != _internetDirectPeerId) {
-        if (_isRealtimeNetplayMessage(message)) {
-          _sendInternetDirectRealtime(message);
-        } else {
-          _sendInternetDirect(message);
+      for (final peer in _peers.values) {
+        if (peer.id == excludedPeerId) {
+          continue;
         }
+        _sendInternetDirectToPeer(peer.id, message);
       }
       return;
     }
@@ -2879,12 +3439,8 @@ class NetplayService {
   }
 
   void _sendToPeer(String peerId, NetplayMessage message) {
-    if (_internetDirectMode && _isHost && peerId == _internetDirectPeerId) {
-      if (_isRealtimeNetplayMessage(message)) {
-        _sendInternetDirectRealtime(message);
-      } else {
-        _sendInternetDirect(message);
-      }
+    if (_internetDirectMode && _isHost) {
+      _sendInternetDirectToPeer(peerId, message);
       return;
     }
     final bytes = NetplayLineCodec.encode(message);
@@ -2930,7 +3486,7 @@ class NetplayService {
       return;
     }
     if (_internetDirectMode && _isHost) {
-      _webrtcHost?.send(bytes);
+      _sendInternetDirectBytesToPeer(peer.id, bytes);
       return;
     }
     _safeSocketAdd(peer.socket, bytes);
@@ -3167,6 +3723,29 @@ class NetplayService {
         txt[segment.substring(0, eq)] = segment.substring(eq + 1);
       }
     }
+  }
+}
+
+class _InternetDirectHostPeer {
+  _InternetDirectHostPeer({
+    required this.id,
+    required this.host,
+    required this.dataSub,
+    required this.realtimeSub,
+    required this.connectedSub,
+  });
+
+  final String id;
+  final InternetDirectWebRtcHost host;
+  final StreamSubscription<Uint8List> dataSub;
+  final StreamSubscription<Uint8List> realtimeSub;
+  final StreamSubscription<bool> connectedSub;
+
+  Future<void> dispose() async {
+    await dataSub.cancel();
+    await realtimeSub.cancel();
+    await connectedSub.cancel();
+    await host.dispose();
   }
 }
 

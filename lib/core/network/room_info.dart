@@ -16,6 +16,9 @@ class RoomInfo {
     this.awaitingReplacement = false,
     this.closed = false,
     this.pingMs,
+    this.internetDirect = false,
+    this.passwordRequired = false,
+    this.signalRoomId,
   });
 
   final String roomId;
@@ -31,6 +34,9 @@ class RoomInfo {
   final bool awaitingReplacement;
   final bool closed;
   final int? pingMs;
+  final bool internetDirect;
+  final bool passwordRequired;
+  final String? signalRoomId;
 
   String get code => roomId;
 
@@ -67,6 +73,9 @@ class RoomInfo {
     bool? awaitingReplacement,
     bool? closed,
     int? pingMs,
+    bool? internetDirect,
+    bool? passwordRequired,
+    String? signalRoomId,
   }) {
     return RoomInfo(
       roomId: roomId ?? this.roomId,
@@ -82,19 +91,22 @@ class RoomInfo {
       awaitingReplacement: awaitingReplacement ?? this.awaitingReplacement,
       closed: closed ?? this.closed,
       pingMs: pingMs ?? this.pingMs,
+      internetDirect: internetDirect ?? this.internetDirect,
+      passwordRequired: passwordRequired ?? this.passwordRequired,
+      signalRoomId: signalRoomId ?? this.signalRoomId,
     );
   }
 
   Map<String, String> toTxtRecord() => {
-        'roomId': roomId,
-        'roomName': roomName,
-        'gameCode': gameCode,
-        'gameTitle': gameTitle,
-        'gameMd5': gameMd5,
-        'players': '$currentPlayers/$maxPlayers',
-        'inGame': inGame ? '1' : '0',
-        'awaitingReplacement': awaitingReplacement ? '1' : '0',
-      };
+    'roomId': roomId,
+    'roomName': roomName,
+    'gameCode': gameCode,
+    'gameTitle': gameTitle,
+    'gameMd5': gameMd5,
+    'players': '$currentPlayers/$maxPlayers',
+    'inGame': inGame ? '1' : '0',
+    'awaitingReplacement': awaitingReplacement ? '1' : '0',
+  };
 
   factory RoomInfo.fromTxtRecord({
     required String hostIp,
@@ -120,10 +132,14 @@ class RoomInfo {
           txt['awaitingReplacement'] == '1' ||
           txt['awaitingReplacement'] == 'true',
       pingMs: pingMs,
+      internetDirect: false,
     );
   }
 
-  factory RoomInfo.fromJson(Map<String, dynamic> json, {required String hostIp}) {
+  factory RoomInfo.fromJson(
+    Map<String, dynamic> json, {
+    required String hostIp,
+  }) {
     return RoomInfo(
       roomId: json['roomId'] as String? ?? '',
       roomName: json['roomName'] as String? ?? '联机房间',
@@ -138,23 +154,30 @@ class RoomInfo {
       awaitingReplacement: json['awaitingReplacement'] as bool? ?? false,
       closed: json['closed'] as bool? ?? false,
       pingMs: json['pingMs'] as int?,
+      internetDirect: json['internetDirect'] as bool? ?? false,
+      passwordRequired: json['passwordRequired'] as bool? ?? false,
+      signalRoomId: json['signalRoomId'] as String?,
     );
   }
 
   Map<String, dynamic> toJson() => {
-        'roomId': roomId,
-        'roomName': roomName,
-        'hostIp': hostIp,
-        'port': port,
-        'gameCode': gameCode,
-        'gameTitle': gameTitle,
-        'gameMd5': gameMd5,
-        'currentPlayers': currentPlayers,
-        'maxPlayers': maxPlayers,
-        'inGame': inGame,
-        'awaitingReplacement': awaitingReplacement,
-        if (closed) 'closed': true,
-      };
+    'roomId': roomId,
+    'roomName': roomName,
+    'hostIp': hostIp,
+    'port': port,
+    'gameCode': gameCode,
+    'gameTitle': gameTitle,
+    'gameMd5': gameMd5,
+    'currentPlayers': currentPlayers,
+    'maxPlayers': maxPlayers,
+    'inGame': inGame,
+    'awaitingReplacement': awaitingReplacement,
+    if (closed) 'closed': true,
+    if (internetDirect) 'internetDirect': true,
+    if (passwordRequired) 'passwordRequired': true,
+    if (signalRoomId != null && signalRoomId!.isNotEmpty)
+      'signalRoomId': signalRoomId,
+  };
 
   String toUdpPayload() => jsonEncode(toJson());
 

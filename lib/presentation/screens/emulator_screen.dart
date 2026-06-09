@@ -80,6 +80,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   bool _isLoading = true;
   bool _isFullscreen = false;
   bool _showFullscreenNavigation = false;
+  bool _endingSession = false;
   String? _errorMessage;
   final ValueNotifier<double> _fps = ValueNotifier(0);
   final ValueNotifier<int> _remoteLatency = ValueNotifier(0);
@@ -106,6 +107,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   NetplayRollbackRunner? _rollbackRunner;
   StreamSubscription<LockstepStartConfig>? _lockstepStartSub;
   StreamSubscription<void>? _gameplayPeerLeftSub;
+  StreamSubscription<RoomInfo>? _hostPromotedSub;
   StreamSubscription<int>? _gameSpeedSub;
   StreamSubscription<GbaNetpacketEvent>? _gbaNetpacketSub;
   StreamSubscription<RoomInfo>? _gbaAutoRoomFoundSub;
@@ -262,13 +264,35 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       ) {
         unawaited(_handleGameplayPeerLeft());
       });
+      _hostPromotedSub = widget.netplayService!.onHostPromoted.listen((_) {
+        unawaited(_handlePromotedToHostDuringNetplay());
+      });
     }
   }
 
   Future<void> _handleGameplayPeerLeft() async {
-    if (!mounted || !widget.isNetplayHost) {
+    if (!mounted || _endingSession) {
       return;
     }
+    _endingSession = true;
+    if (widget.isNetplayHost) {
+      final state = await _emulatorService.saveState(persistToDisk: false);
+      if (state != null && state.isNotEmpty) {
+        widget.netplayService?.stashResumeSaveState(state);
+      }
+    }
+    await _endSession();
+    widget.netplayService?.markDeferGameExitToRoomScreen();
+    if (mounted) {
+      Navigator.of(context).pop(false);
+    }
+  }
+
+  Future<void> _handlePromotedToHostDuringNetplay() async {
+    if (!mounted || widget.isNetplayHost || _endingSession) {
+      return;
+    }
+    _endingSession = true;
     final state = await _emulatorService.saveState(persistToDisk: false);
     if (state != null && state.isNotEmpty) {
       widget.netplayService?.stashResumeSaveState(state);
@@ -305,6 +329,8 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
     _lockstepStartSub = null;
     _gameplayPeerLeftSub?.cancel();
     _gameplayPeerLeftSub = null;
+    _hostPromotedSub?.cancel();
+    _hostPromotedSub = null;
     _gameSpeedSub?.cancel();
     _gameSpeedSub = null;
     _gbaNetpacketSub?.cancel();
@@ -331,6 +357,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   @override
   void dispose() {
     _gameplayPeerLeftSub?.cancel();
+    _hostPromotedSub?.cancel();
     _gameSpeedSub?.cancel();
     _gbaNetpacketSub?.cancel();
     _gbaAutoRoomFoundSub?.cancel();
@@ -567,10 +594,7 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
       return;
     }
 
-    final initialSlots = <int>{1};
-    for (var slot = 2; slot <= session.maxPlayers; slot++) {
-      initialSlots.add(slot);
-    }
+    final initialSlots = session.activeSlots;
 
     if (_usesRollbackNetplay && core.serializeStateSize > 0) {
       _rollbackRunner = NetplayRollbackRunner(
@@ -1102,16 +1126,20 @@ class _EmulatorScreenState extends State<EmulatorScreen> {
   }
 
   Future<void> _exitGame() async {
+    if (_endingSession) {
+      return;
+    }
+    _endingSession = true;
     if (_isNetplay && widget.netplayService != null) {
       final netplay = widget.netplayService!;
-      if (_isNetplayHost && netplay.clients.isNotEmpty) {
+      if (_isNetplayHost && netplay.hasActiveTeammates) {
         final state = await _emulatorService.saveState(persistToDisk: false);
         if (state != null && state.isNotEmpty) {
           netplay.stashResumeSaveState(state);
         }
-        netplay.markExitingForReplacement();
+        netplay.exitGameToTeamLobby();
       } else if (!_isNetplayHost) {
-        netplay.exitGameAndLeaveRoom();
+        netplay.exitGameAndLeave();
       } else {
         netplay.endGame();
       }

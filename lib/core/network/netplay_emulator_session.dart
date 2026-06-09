@@ -15,6 +15,20 @@ class NetplayEmulatorSession {
   /// Index `0` = P1 … `maxPlayers-1` = Pn; `null` = empty slot.
   final List<PlayerInfo?> slotPlayers;
 
+  Set<int> get activeSlots {
+    final slots = <int>{};
+    for (final player in slotPlayers) {
+      final slot = player?.slot ?? 0;
+      if (slot > 0 && slot <= maxPlayers) {
+        slots.add(slot);
+      }
+    }
+    if (slots.isEmpty) {
+      slots.add(localPlayerSlot.clamp(1, maxPlayers).toInt());
+    }
+    return slots;
+  }
+
   factory NetplayEmulatorSession.fromNetplay({
     required NetplayService netplay,
     required bool isHost,

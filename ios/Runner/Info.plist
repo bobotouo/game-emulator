@@ -28,8 +28,6 @@
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>用于在同一 WiFi 下搜索和加入局域网联机房间。</string>
-	<key>NSCameraUsageDescription</key>
-	<string>用于扫描互联网直连房间二维码。</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_retro-netplay._tcp</string>

@@ -176,10 +176,13 @@ class NetplayMessage {
     required String playerName,
     int gameSpeed = 1,
     Map<String, dynamic>? internetDirectInvite,
+    String? targetPlayerId,
   }) => NetplayMessage(NetplayMessageType.hostPromote, {
     'room': room,
     'playerName': playerName,
     'gameSpeed': gameSpeed.clamp(1, 3),
+    if (targetPlayerId != null && targetPlayerId.isNotEmpty)
+      'targetPlayerId': targetPlayerId,
     // ignore: use_null_aware_elements
     if (internetDirectInvite != null)
       'internetDirectInvite': internetDirectInvite,

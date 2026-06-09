@@ -2,13 +2,13 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import '../../core/network/cloudflare_ice_service.dart';
 import '../../core/network/internet_direct_code.dart';
 import '../../core/network/lan_service.dart';
 import '../../core/settings/app_settings_service.dart';
 import '../../features/game_library/game_library_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/immersive_scroll_page.dart';
-import 'internet_direct_scan_screen.dart';
 import 'room_screen.dart';
 
 class MultiplayerLobbyScreen extends StatefulWidget {
@@ -22,8 +22,12 @@ class MultiplayerLobbyScreen extends StatefulWidget {
 }
 
 class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
-  static const _scanInterval = Duration(seconds: 5);
-  static const _roomStaleTimeout = Duration(seconds: 6);
+  static const _scanInterval = Duration(seconds: 3);
+
+  String _defaultGuestPlayerName() =>
+      'Player ${DateTime.now().millisecondsSinceEpoch % 10000}';
+  static const _roomStaleTimeout = Duration(seconds: 18);
+  static const _internetLobbyTimeout = Duration(seconds: 8);
 
   final NetplayService _netplay = NetplayService();
   final GameLibraryService _gameLibrary = GameLibraryService();
@@ -37,6 +41,7 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
   String _searchQuery = '';
   Timer? _lobbyRefreshTimer;
   bool _joiningRoom = false;
+  bool _internetRefreshInFlight = false;
 
   StreamSubscription<RoomInfo>? _roomSubscription;
 
@@ -136,6 +141,9 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
     final activeRoom = _netplay.activeRoom;
     final deadRoomIds = <String>{};
     for (final room in _rooms) {
+      if (room.internetDirect) {
+        continue;
+      }
       if (activeRoom != null &&
           room.hostIp == activeRoom.hostIp &&
           room.port == activeRoom.port) {
@@ -190,6 +198,47 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
       }
     } else {
       _pauseDiscovery();
+    }
+
+    await _refreshInternetRooms();
+  }
+
+  Future<void> _refreshInternetRooms() async {
+    if (!AppSettingsService.instance.networkEnabled || !mounted) {
+      return;
+    }
+    if (_internetRefreshInFlight) {
+      return;
+    }
+    _internetRefreshInFlight = true;
+    try {
+      unawaited(CloudflareIceService.prefetchIce());
+      final rooms = await CloudflareIceService.listRooms().timeout(
+        _internetLobbyTimeout,
+      );
+      if (!mounted) {
+        return;
+      }
+      final liveRoomIds = rooms.map((room) => room.roomId).toSet();
+      final signalHost = Uri.parse(CloudflareIceService.signalBaseUrl).host;
+      setState(() {
+        _rooms.removeWhere(
+          (room) => room.internetDirect && !liveRoomIds.contains(room.roomId),
+        );
+        _roomLastSeen.removeWhere((key, _) {
+          final parts = key.split('|');
+          final roomId = parts.isNotEmpty ? parts.first : '';
+          final host = parts.length > 1 ? parts[1] : '';
+          return host == signalHost && !liveRoomIds.contains(roomId);
+        });
+      });
+      for (final room in rooms) {
+        await _onRoomDiscovered(room);
+      }
+    } catch (e) {
+      debugPrint('[InternetLobby] refresh failed: $e');
+    } finally {
+      _internetRefreshInFlight = false;
     }
   }
 
@@ -273,11 +322,6 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
       return;
     }
 
-    if (!(_network?.canUseLanLobby ?? false)) {
-      _showWideAreaMessage();
-      return;
-    }
-
     setState(() {
       _rooms.clear();
       _localRomCache.clear();
@@ -288,6 +332,7 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
     } else {
       _netplay.pulseDiscovery();
     }
+    unawaited(_refreshInternetRooms());
   }
 
   Future<void> _openCreateRoom() async {
@@ -321,7 +366,7 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
     }
   }
 
-  Future<void> _scanInternetDirectRoom() async {
+  Future<void> _joinInternetDirectRoom(RoomInfo room) async {
     if (_joiningRoom) {
       return;
     }
@@ -330,29 +375,32 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
       return;
     }
 
-    final raw = await Navigator.push<String>(
-      context,
-      MaterialPageRoute(builder: (context) => const InternetDirectScanScreen()),
-    );
-    if (!mounted || raw == null) {
-      return;
-    }
-
-    final code = InternetDirectCode.tryDecode(raw);
-    if (code == null) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('无效的直连二维码（请使用最新版房主二维码）')));
-      return;
-    }
-
-    final extension = netplayExtensionFromPath(code.gameCode);
+    final extension = netplayExtensionFromPath(room.gameCode);
     if (!isHostAuthoritativeNetplayExtension(extension)) {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(const SnackBar(content: Text('互联网直连暂仅支持 FC/NES 和街机游戏')));
       return;
     }
+
+    final password = room.passwordRequired
+        ? await _promptInternetRoomPassword(room)
+        : null;
+    if (!mounted || (room.passwordRequired && password == null)) {
+      return;
+    }
+
+    final signalRoomId = room.signalRoomId ?? room.roomId;
+    final code = InternetDirectCode(
+      signalUrl: CloudflareIceService.signalBaseUrl,
+      signalRoomId: signalRoomId,
+      roomId: room.roomId,
+      roomName: room.roomName,
+      gameCode: room.gameCode,
+      gameTitle: room.gameTitle,
+      gameMd5: room.gameMd5,
+      maxPlayers: room.maxPlayers,
+    );
 
     _joiningRoom = true;
     var loadingVisible = false;
@@ -362,7 +410,8 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
 
       final success = await _netplay.joinInternetDirectRoom(
         code,
-        playerName: 'Player 2',
+        playerName: _defaultGuestPlayerName(),
+        password: password,
       );
       if (!mounted) {
         return;
@@ -372,7 +421,7 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
         loadingVisible = false;
         ScaffoldMessenger.of(
           context,
-        ).showSnackBar(const SnackBar(content: Text('互联网直连失败')));
+        ).showSnackBar(const SnackBar(content: Text('互联网房间加入失败')));
         return;
       }
 
@@ -403,6 +452,64 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
       }
       _joiningRoom = false;
     }
+  }
+
+  Future<String?> _promptInternetRoomPassword(RoomInfo room) async {
+    var password = '';
+    return showDialog<String>(
+      context: context,
+      builder: (context) {
+        final dialogWidth = (MediaQuery.sizeOf(context).width - 64)
+            .clamp(260.0, 360.0)
+            .toDouble();
+        return AlertDialog(
+          title: const Text('输入房间密码'),
+          content: SizedBox(
+            width: dialogWidth,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  room.roomName,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: AppColors.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  autofocus: true,
+                  obscureText: true,
+                  textInputAction: TextInputAction.done,
+                  decoration: const InputDecoration(
+                    labelText: '房间密码',
+                    hintText: '密码',
+                  ),
+                  onChanged: (value) {
+                    password = value;
+                  },
+                  onSubmitted: (value) {
+                    Navigator.of(context).pop(value.trim());
+                  },
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('取消'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(password.trim()),
+              child: const Text('加入'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   void _showInternetDirectJoiningDialog() {
@@ -490,7 +597,10 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
         return;
       }
 
-      final success = await _netplay.joinRoom(room, playerName: 'Player 2');
+      final success = await _netplay.joinRoom(
+        room,
+        playerName: _defaultGuestPlayerName(),
+      );
 
       if (!success) {
         if (!mounted) {
@@ -578,17 +688,11 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
     final bottomInset =
         kBottomNavigationBarHeight + MediaQuery.paddingOf(context).bottom + 88;
     final rooms = _filteredRooms;
-    final onLan = _network?.canUseLanLobby ?? false;
     final networkMessage = _network?.userMessage;
 
     return ImmersiveScrollPage(
       title: '联机大厅',
       actions: [
-        IconButton(
-          icon: const Icon(Icons.qr_code_scanner),
-          tooltip: '扫码加入',
-          onPressed: _scanInternetDirectRoom,
-        ),
         IconButton(
           icon: const Icon(Icons.refresh),
           tooltip: '重新搜索',
@@ -615,22 +719,6 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
               children: [
                 Row(
                   children: [
-                    Container(
-                      width: 12,
-                      height: 12,
-                      decoration: BoxDecoration(
-                        color: onLan ? AppColors.secondary : AppColors.error,
-                        shape: BoxShape.circle,
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      onLan ? '局域网 · 在线' : '非局域网',
-                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                        color: onLan ? AppColors.secondary : AppColors.error,
-                      ),
-                    ),
-                    const Spacer(),
                     Text(
                       '本机 IP: ${_network?.localIp ?? "获取中..."}',
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
@@ -715,7 +803,7 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
                 ),
                 const SizedBox(height: 16),
                 Text(
-                  onLan ? '暂未发现房间' : '请连接 WiFi 后再试',
+                  '暂未发现房间',
                   style: Theme.of(context).textTheme.bodyLarge?.copyWith(
                     color: AppColors.onSurfaceVariant,
                   ),
@@ -742,6 +830,11 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
       _showNetworkDisabledMessage();
       return;
     }
+    if (room.internetDirect) {
+      unawaited(_joinInternetDirectRoom(room));
+      return;
+    }
+
     if (!(_network?.canUseLanLobby ?? false)) {
       _showWideAreaMessage();
       return;
@@ -807,6 +900,15 @@ class _MultiplayerLobbyScreenState extends State<MultiplayerLobbyScreen> {
                     Row(
                       children: [
                         _buildInfoChip(Icons.people, room.occupancyLabel),
+                        const SizedBox(width: 8),
+                        _buildInfoChip(
+                          room.internetDirect ? Icons.public : Icons.wifi,
+                          room.internetDirect ? '互联网' : '局域网',
+                        ),
+                        if (room.passwordRequired) ...[
+                          const SizedBox(width: 8),
+                          _buildInfoChip(Icons.lock, '密码'),
+                        ],
                         if (room.pingMs != null) ...[
                           const SizedBox(width: 8),
                           _buildInfoChip(

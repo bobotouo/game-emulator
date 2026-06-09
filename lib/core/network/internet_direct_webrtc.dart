@@ -25,9 +25,9 @@ class InternetDirectStats {
 abstract final class InternetDirectWebRtc {
   static const dataChannelLabel = 'retro-netplay';
   static const realtimeDataChannelLabel = 'retro-netplay-rt';
-  static const _connectTimeout = Duration(seconds: 20);
+  static const _connectTimeout = Duration(seconds: 15);
   static const _operationTimeout = Duration(seconds: 8);
-  static const _gatherTimeout = Duration(seconds: 12);
+  static const _gatherTimeout = Duration(seconds: 4);
 
   static Map<String, dynamic> iceConfig({
     required List<Map<String, dynamic>> iceServers,
@@ -35,7 +35,7 @@ abstract final class InternetDirectWebRtc {
     return {
       'sdpSemantics': 'unified-plan',
       'iceServers': iceServers,
-      'iceCandidatePoolSize': 4,
+      'iceCandidatePoolSize': 8,
     };
   }
 
@@ -362,10 +362,12 @@ class InternetDirectWebRtcGuest {
   RTCDataChannel? _realtimeDataChannel;
   final _dataController = StreamController<Uint8List>.broadcast();
   final _realtimeDataController = StreamController<Uint8List>.broadcast();
+  final _connectedController = StreamController<bool>.broadcast();
   bool _disposed = false;
 
   Stream<Uint8List> get onData => _dataController.stream;
   Stream<Uint8List> get onRealtimeData => _realtimeDataController.stream;
+  Stream<bool> get onConnected => _connectedController.stream;
   int get bufferedAmount => _dataChannel?.bufferedAmount ?? 0;
   Future<InternetDirectStats?> getStats() =>
       InternetDirectWebRtc.getSelectedStats(_peerConnection);
@@ -410,6 +412,18 @@ class InternetDirectWebRtcGuest {
     };
     pc.onIceConnectionState = (state) {
       onLog('webrtc guest iceState=$state');
+      if (_disposed) {
+        return;
+      }
+      if (state == RTCIceConnectionState.RTCIceConnectionStateConnected ||
+          state == RTCIceConnectionState.RTCIceConnectionStateCompleted) {
+        _connectedController.add(true);
+      } else if (state ==
+              RTCIceConnectionState.RTCIceConnectionStateDisconnected ||
+          state == RTCIceConnectionState.RTCIceConnectionStateFailed ||
+          state == RTCIceConnectionState.RTCIceConnectionStateClosed) {
+        _connectedController.add(false);
+      }
     };
 
     await pc
@@ -434,10 +448,10 @@ class InternetDirectWebRtcGuest {
       return false;
     }
     try {
-      await dataChannelOpen.future.timeout(const Duration(seconds: 4));
+      await dataChannelOpen.future.timeout(const Duration(seconds: 3));
       try {
         await realtimeDataChannelOpen.future.timeout(
-          const Duration(seconds: 2),
+          const Duration(seconds: 1),
         );
       } on TimeoutException {
         onLog('webrtc guest rtDc open timeout');
@@ -460,6 +474,12 @@ class InternetDirectWebRtcGuest {
         return;
       }
       onLog('webrtc guest dcState=$state');
+      if (state == RTCDataChannelState.RTCDataChannelOpen) {
+        _connectedController.add(true);
+      } else if (state == RTCDataChannelState.RTCDataChannelClosed ||
+          state == RTCDataChannelState.RTCDataChannelClosing) {
+        _connectedController.add(false);
+      }
     };
   }
 
@@ -530,5 +550,6 @@ class InternetDirectWebRtcGuest {
     _peerConnection = null;
     await _dataController.close();
     await _realtimeDataController.close();
+    await _connectedController.close();
   }
 }
